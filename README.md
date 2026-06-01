@@ -1,6 +1,7 @@
 # trade-xquant
 
-`trade-xquant` 是 Xquant 的 Windows QMT / MiniQMT 交易网关。
+`trade-xquant` 是 [Xquant](https://xquant.shop) 的 Windows QMT /
+MiniQMT 交易网关。
 
 它运行在安装并登录了国金 QMT / MiniQMT 的 Windows 机器上，负责：
 
@@ -105,7 +106,8 @@ runtime:
 关键配置说明：
 
 - `xquant.base_url`
-  Xquant API 地址。生产默认值是 `https://xquant.shop/api/v1`。
+  Xquant API 地址。Xquant 官网是 [https://xquant.shop](https://xquant.shop)，
+  生产 API 默认值是 `https://xquant.shop/api/v1`。
 
 - `xquant.api_token`
   首次使用保持 `null`。通过 `login` 登录后，token 会写入
@@ -134,6 +136,9 @@ runtime:
 这些文件已经在 `.gitignore` 中。
 
 ## 登录 Xquant
+
+先打开 [https://xquant.shop](https://xquant.shop) 确认账号、订阅组合和
+绑定证券账户状态。
 
 使用 Xquant 账号绑定的手机号或邮箱登录。
 
