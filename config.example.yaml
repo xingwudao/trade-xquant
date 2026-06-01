@@ -1,0 +1,39 @@
+xquant:
+  base_url: "https://xquant.shop/api/v1"
+  product_code: null
+  api_token: null
+  timeout_seconds: 15
+  trust_env: false
+
+qmt:
+  userdata_mini_path: "C:\\Apps\\QMT\\国金证券QMT交易端\\userdata_mini"
+  account_id: "replace-with-qmt-account-id"
+  session_id: null
+  session_id_strategy: "auto"
+  order_price_type: "fix"
+  strategy_name: "trade_xquant"
+  cancel_after_order: false
+
+runtime:
+  poll_interval_seconds: 30
+  allow_real_order: false
+  dry_run_default: true
+  broker_adapter: "qmt"
+  simulate_real_orders: false
+  mock_submit_dry_run_orders: false
+  mock_order_behavior: "filled"
+  mock_partial_fill_ratio: 0.5
+  mock_total_asset: 100000
+  mock_cash: 100000
+  mock_prices:
+    513100.SH: 1.0
+    510300.SH: 4.0
+  db_path: "data/trade_xquant.db"
+  log_path: "logs/trade_xquant.jsonl"
+
+risk:
+  max_single_order_amount: 50000
+  min_order_amount: 1000
+  max_turnover_ratio: 0.8
+  cash_buffer_ratio: 0.002
+  timezone: "Asia/Shanghai"

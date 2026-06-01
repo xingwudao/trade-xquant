@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trade-xquant"
+version = "0.1.0"
+description = "Windows QMT/MiniQMT trading gateway for Xquant target-weight tasks"
+requires-python = ">=3.10"
+dependencies = [
+  "httpx>=0.25",
+  "pydantic>=2",
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+qmt = ["xtquant"]
+
+[project.scripts]
+trade-xquant = "trade_xquant.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
