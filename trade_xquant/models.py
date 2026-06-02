@@ -130,6 +130,9 @@ class ExecutionResult(BaseModel):
     submitted_orders: list[SubmittedOrder] = Field(default_factory=list)
     trades: list[dict[str, Any]] = Field(default_factory=list)
     events: list[dict[str, Any]] = Field(default_factory=list)
+    holdings: list[dict[str, Any]] = Field(default_factory=list)
+    cash: float | None = None
+    total_asset: float | None = None
     errors: list[str] = Field(default_factory=list)
     meta: dict[str, Any] = Field(default_factory=dict)
 

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from trade_xquant.config import Settings
 from trade_xquant.execution_engine import ExecutionEngine
+from trade_xquant.models import AccountSnapshot, ExecutionResult, Position, RebalanceTask
 from trade_xquant.mock_qmt_adapter import MockBrokerAdapter
 from trade_xquant.portfolio_engine import PortfolioEngine
 from trade_xquant.qmt_adapter import QmtAdapter
@@ -68,6 +70,7 @@ class GatewayService:
         for task in tasks:
             if force_dry_run:
                 task.mode = "dry_run"
+            prices: dict[str, float] = {}
             try:
                 self.storage.claim_task(task)
                 prices = self.qmt.get_prices([target.symbol for target in task.targets] + [p.symbol for p in positions])
@@ -77,6 +80,7 @@ class GatewayService:
                 if not using_signal_endpoint:
                     self.xquant.report_plan(task.task_id, plan.model_dump(mode="json"))
                 result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
+                attach_account_snapshot(result, account, positions, prices, task)
                 self.storage.record_execution_result(result)
                 status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
                 self.storage.mark_task_result(task.task_id, status, result.model_dump(mode="json"))
@@ -85,7 +89,16 @@ class GatewayService:
                 results.append({"task_id": task.task_id, "status": status})
             except Exception as exc:  # noqa: BLE001 - each task must be audited
                 logger.exception("task failed: %s", task.task_id)
-                payload = {"error": str(exc)}
+                payload = {
+                    "mode": task.mode,
+                    "planned_orders": [],
+                    "submitted_orders": [],
+                    "trades": [],
+                    "events": [],
+                    **account_result_snapshot(account, positions, prices, task),
+                    "errors": [str(exc)],
+                    "meta": {"error": str(exc)},
+                }
                 self.storage.mark_task_result(task.task_id, "failed", payload)
                 if not using_signal_endpoint:
                     try:
@@ -110,3 +123,43 @@ class GatewayService:
         )
         if event.event_type == "stock_trade":
             self.storage.record_trade_event(event.payload, order_id=event.order_id, symbol=event.symbol)
+
+
+def attach_account_snapshot(
+    result: ExecutionResult,
+    account: AccountSnapshot,
+    positions: list[Position],
+    prices: dict[str, float],
+    task: RebalanceTask,
+) -> None:
+    snapshot = account_result_snapshot(account, positions, prices, task)
+    result.cash = snapshot["cash"]
+    result.total_asset = snapshot["total_asset"]
+    result.holdings = snapshot["holdings"]
+
+
+def account_result_snapshot(
+    account: AccountSnapshot,
+    positions: list[Position],
+    prices: dict[str, float],
+    task: RebalanceTask,
+) -> dict[str, Any]:
+    target_weights = {target.symbol: target.target_weight for target in task.targets}
+    holdings = []
+    for position in positions:
+        reference_price = prices.get(position.symbol)
+        market_value = position.market_value
+        if not market_value and reference_price is not None:
+            market_value = position.quantity * reference_price
+        weight = market_value / account.total_asset if account.total_asset > 0 else None
+        holdings.append(
+            {
+                "symbol": position.symbol,
+                "shares": position.quantity,
+                "reference_price": reference_price,
+                "market_value": market_value,
+                "weight": weight,
+                "target_weight": target_weights.get(position.symbol),
+            }
+        )
+    return {"cash": account.cash, "total_asset": account.total_asset, "holdings": holdings}

@@ -20,6 +20,9 @@ qmt = ["xtquant"]
 [project.scripts]
 trade-xquant = "trade_xquant.cli:main"
 
+[tool.setuptools]
+packages = ["trade_xquant"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

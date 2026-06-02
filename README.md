@@ -42,16 +42,35 @@ MiniQMT 交易网关。
 
 Windows QMT 机器上安装：
 
-```bash
+```powershell
 python -m venv .venv
-.venv\Scripts\activate
+.\.venv\Scripts\Activate.ps1
 python -m pip install -U pip
 python -m pip install -e ".[dev]"
 python -m pip install xtquant
 ```
 
 如果你的环境无法从 PyPI 安装 `xtquant`，请使用 QMT 自带的 Python SDK。
-安装后运行 `doctor`，确认当前 Python 环境可以导入 `xtquant`。
+`xtquant` 必须安装在当前激活的 `.venv` 里，只装在系统 Python 里不够。
+安装后运行 `doctor`，确认当前 Python 环境可以导入 `xtquant`：
+
+```powershell
+trade-xquant doctor --config config.yaml
+```
+
+如果 PowerShell 提示无法识别 `trade-xquant`：
+
+- 先确认提示符前面有 `(.venv)`。
+- 重新运行 `python -m pip install -e ".[dev]"`。
+- 临时诊断可用 `python -m trade_xquant.cli doctor --config config.yaml`。
+
+如果 editable install 报错：
+
+```text
+Multiple top-level packages discovered in a flat-layout
+```
+
+说明本地代码还没有包含打包发现规则修复，先更新到最新代码后重新安装。
 
 QMT 安装和 hello 验证记录见：
 
@@ -89,7 +108,9 @@ notepad config.yaml
 ```yaml
 xquant:
   base_url: "https://xquant.shop/api/v1"
+  product_code: null
   api_token: null
+  trust_env: false
 
 qmt:
   userdata_mini_path: "C:\\Apps\\QMT\\国金证券QMT交易端\\userdata_mini"
@@ -112,6 +133,14 @@ runtime:
 - `xquant.api_token`
   首次使用保持 `null`。通过 `login` 登录后，token 会写入
   `config.yaml` 同目录下的 `xquant-token.json`。
+
+- `xquant.product_code`
+  正式 Windows 交易网关必须保持 `null`。这样 CLI 才会调用
+  `/trading-gateway/tasks` 领取 Xquant 下发的任务。
+  如果设置成某个产品代码，CLI 会走最新信号 fallback，不会领取正式任务。
+
+- `xquant.trust_env`
+  建议保持 `false`，避免 Windows 机器上的代理环境变量影响生产 API 请求。
 
 - `qmt.userdata_mini_path`
   Windows 上 QMT 的 `userdata_mini` 目录。
@@ -177,11 +206,25 @@ trade-xquant register-account --config config.yaml
 ```
 
 这个命令是幂等的，可以重复运行。修改账户信息或风控参数后，也可以再次运行。
+如果要让 Xquant 后续生成实盘任务，注册时明确设置：
+
+```bash
+trade-xquant register-account --config config.yaml --default-mode real
+```
+
+风险参数是在任务生成时固化到任务里的。修改 `risk` 后，应先重新
+`register-account`，再在 Xquant 生成新任务；旧任务不会自动套用新参数。
 
 发送一次心跳：
 
 ```bash
 trade-xquant heartbeat --config config.yaml
+```
+
+如果刚刚已经确认 QMT 连接正常，可以带上连接状态：
+
+```bash
+trade-xquant heartbeat --config config.yaml --qmt-connected
 ```
 
 心跳会让 Xquant 看到：
@@ -210,6 +253,9 @@ trade-xquant doctor --config config.yaml
 
 Mac / Linux 上 `xtquant_importable=false` 是正常的，除非你安装了兼容 SDK。
 Windows QMT 机器上应当为 `true`。
+
+同时检查 `doctor` 输出里的 `executable`。它应当指向当前项目的
+`.venv`，否则说明命令没有运行在你准备交易的 Python 环境里。
 
 ## 不连接 QMT，先测试 Xquant API
 
@@ -408,16 +454,16 @@ runtime:
   allow_real_order: true
 ```
 
-第二，在运行终端设置环境变量：
+第二，在运行终端设置环境变量。Windows PowerShell 使用：
 
-```bash
-set TRADE_XQUANT_ENABLE_REAL_ORDER=1
+```powershell
+$env:TRADE_XQUANT_ENABLE_REAL_ORDER = "1"
 ```
 
-然后再运行：
+然后只处理一条指定实盘任务：
 
-```bash
-trade-xquant poll-once --config config.yaml
+```powershell
+trade-xquant poll-once --config config.yaml --task-id replace-with-task-id --verbose
 ```
 
 即使两个安全门都打开，网关仍会阻止以下情况：
@@ -433,14 +479,50 @@ trade-xquant poll-once --config config.yaml
 - 总换手超过阈值。
 - 无法保留现金 buffer。
 
-真实下单必须在有人值守的交易时间执行。建议顺序是：
+如果 Xquant 页面里能看到任务，但 CLI 输出 `no pending tasks`，优先检查：
+
+- `xquant.product_code` 是否为 `null`。
+- Xquant 任务是否属于同一个证券账户。
+- 任务是否已经到有效时间；页面上的产品任务列表可能会展示未来生效任务。
+- 任务是否仍是 `pending`，且没有被其他网关领取。
+- 本地 SQLite 是否已经把同一个 `task_id` 记录为终态。
+
+如果本地已经把某个 `task_id` 记录为 `failed`、`submitted` 或
+`dry_run_success`，CLI 不会重复处理它。重新测试时应在 Xquant 生成新任务，
+或仅在本地测试环境换一个新的 `runtime.db_path`。
+
+执行结果会回传 `cash`、`total_asset` 和 `holdings`，用于 Xquant 展示
+当前资金和持仓快照。持仓快照来自 QMT 查询结果和本次取到的行情价格。
+
+真实下单必须在有人值守的交易时间执行。A 股交易时段保护为：
+
+```text
+09:30-11:30
+13:00-14:57
+```
+
+建议顺序是：
 
 1. `doctor`
 2. `check-qmt`
-3. `dry-run`
-4. 人工确认计划
-5. 打开真实下单安全门
-6. `poll-once`
+3. 用单独的 dry-run 任务测试链路
+4. 在 Xquant 生成一条实盘任务
+5. 人工确认任务和风控参数
+6. 打开真实下单安全门
+7. `poll-once --task-id replace-with-task-id`
+
+不要对同一个实盘任务先运行 `dry-run`。`dry-run` 命令会强制按 dry-run
+处理并回传结果，可能让这个任务进入终态，之后不能再用来真实下单。
+
+首单测试完成后关闭环境变量：
+
+```powershell
+Remove-Item Env:\TRADE_XQUANT_ENABLE_REAL_ORDER
+```
+
+首单小额测试可以把 `risk.max_single_order_amount` 设得很小，例如 `1000`。
+这会显著降低误下单金额，但也可能因为 100 股整数手、最小订单金额或标的价格，
+导致计划为空或被本地风控拦截。正常调仓前再把它调到适合账户规模的数值。
 
 ## CLI 快查
 
