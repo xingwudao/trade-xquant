@@ -70,6 +70,158 @@ def test_gateway_poll_once_reads_local_task_file_and_arms_condition_orders(tmp_p
     assert [order.condition_id for order in service.storage.list_active_condition_orders()] == ["cond-1"]
 
 
+def test_local_json_can_arm_all_single_instrument_methods(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    conditions = [
+        {
+            "condition_id": "static-sl",
+            "symbol": "513100.SH",
+            "purpose": "stop_loss",
+            "method": "static_pct",
+            "reference_price": 1.0,
+            "params": {"stop_loss_pct": 0.05},
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+        {
+            "condition_id": "static-tp",
+            "symbol": "513100.SH",
+            "purpose": "take_profit",
+            "method": "static_pct",
+            "reference_price": 1.0,
+            "params": {"take_profit_pct": 0.1},
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+        {
+            "condition_id": "trail-sl",
+            "symbol": "513100.SH",
+            "purpose": "stop_loss",
+            "method": "trailing_pct",
+            "reference_price": 1.0,
+            "params": {"trail_pct": 0.08},
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+        {
+            "condition_id": "trail-tp",
+            "symbol": "513100.SH",
+            "purpose": "take_profit",
+            "method": "trailing_pct",
+            "reference_price": 1.0,
+            "params": {"trail_pct": 0.08, "activation_profit_pct": 0.12},
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+        {
+            "condition_id": "atr-sl",
+            "symbol": "513100.SH",
+            "purpose": "stop_loss",
+            "method": "atr_trailing",
+            "reference_price": 1.0,
+            "params": {
+                "atr_window": 3,
+                "atr_multiple": 2.0,
+                "bar_interval": "1d",
+            },
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+        {
+            "condition_id": "atr-tp",
+            "symbol": "513100.SH",
+            "purpose": "take_profit",
+            "method": "atr_trailing",
+            "reference_price": 1.0,
+            "params": {
+                "activation_profit_pct": 0.12,
+                "atr_window": 3,
+                "atr_multiple": 2.0,
+                "bar_interval": "1d",
+            },
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+        {
+            "condition_id": "hv-sl",
+            "symbol": "513100.SH",
+            "purpose": "stop_loss",
+            "method": "hv_log_trailing",
+            "reference_price": 1.0,
+            "params": {
+                "hv_window": 3,
+                "hv_annualization": 252,
+                "lambda": 1.0,
+                "bar_interval": "1d",
+            },
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+        {
+            "condition_id": "hv-tp",
+            "symbol": "513100.SH",
+            "purpose": "take_profit",
+            "method": "hv_log_trailing",
+            "reference_price": 1.0,
+            "params": {
+                "activation_profit_pct": 0.12,
+                "hv_window": 3,
+                "hv_annualization": 252,
+                "lambda": 1.0,
+                "bar_interval": "1d",
+            },
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+        {
+            "condition_id": "std-sl",
+            "symbol": "513100.SH",
+            "purpose": "stop_loss",
+            "method": "std_trailing",
+            "reference_price": 1.0,
+            "params": {
+                "std_window": 3,
+                "std_multiple": 1.5,
+                "bar_interval": "1d",
+            },
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+        {
+            "condition_id": "std-tp",
+            "symbol": "513100.SH",
+            "purpose": "take_profit",
+            "method": "std_trailing",
+            "reference_price": 1.0,
+            "params": {
+                "activation_profit_pct": 0.12,
+                "std_window": 3,
+                "std_multiple": 1.5,
+                "bar_interval": "1d",
+            },
+            "action": {"type": "sell_pct", "pct": 1.0},
+        },
+    ]
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-all-conditions",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+                        "constraints": {"condition_orders": conditions},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+
+    service.poll_once(force_dry_run=True)
+
+    active = service.storage.list_active_condition_orders()
+    assert sorted(order.condition_id for order in active) == sorted(
+        item["condition_id"] for item in conditions
+    )
+
+
 def test_gateway_poll_once_validates_condition_orders_before_execution(tmp_path) -> None:
     task_file = tmp_path / "tasks.json"
     task_file.write_text(

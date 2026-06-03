@@ -124,26 +124,24 @@ condition orders live under `constraints.condition_orders`.
 }
 ```
 
-## Supported MVP Rules
+## Supported Single-Instrument Rules
 
-`static_pct` with `purpose: "stop_loss"`
-- Trigger price:
-  `reference_price * (1 - params.stop_loss_pct)`
-- Trigger condition:
-  latest price is less than or equal to trigger price.
+Local JSON may mock every Xquant single-instrument sell-side condition rule:
 
-`static_pct` with `purpose: "take_profit"`
-- Trigger price:
-  `reference_price * (1 + params.take_profit_pct)`
-- Trigger condition:
-  latest price is greater than or equal to trigger price.
+- `static_pct` with `purpose: "stop_loss"`
+- `static_pct` with `purpose: "take_profit"`
+- `trailing_pct` with `purpose: "stop_loss"`
+- `trailing_pct` with `purpose: "take_profit"`
+- `atr_trailing` with `purpose: "stop_loss"`
+- `atr_trailing` with `purpose: "take_profit"`
+- `hv_log_trailing` with `purpose: "stop_loss"`
+- `hv_log_trailing` with `purpose: "take_profit"`
+- `std_trailing` with `purpose: "stop_loss"`
+- `std_trailing` with `purpose: "take_profit"`
 
-`trailing_pct`
-- High-water price is updated locally when latest price makes a new high.
-- Trigger price:
-  `high_water_price * (1 - params.trail_pct)`
-- Trigger condition:
-  latest price is less than or equal to trigger price.
+The JSON file mocks Xquant task payloads only. It does not store high-water
+state, activation state, indicator snapshots, trigger evidence, or execution
+audits. Those are stored in SQLite.
 
 ## Execution
 
