@@ -4,6 +4,7 @@ import time
 from typing import Any, Callable
 
 from trade_xquant.broker import QmtGatewayEvent
+from trade_xquant.condition_indicators import PriceBar
 from trade_xquant.config import QmtConfig
 from trade_xquant.models import AccountSnapshot, PlannedOrder, Position
 
@@ -103,6 +104,11 @@ class QmtAdapter:
                 raise RuntimeError(f"cannot fetch valid price for {symbol}")
             prices[symbol] = float(price)
         return prices
+
+    def get_price_bars(
+        self, symbol: str, interval: str, window: int
+    ) -> list[PriceBar]:
+        raise NotImplementedError("QMT historical price bars are not wired yet")
 
     def place_order(self, order: PlannedOrder) -> int:
         self._ensure_connected()
