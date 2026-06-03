@@ -17,8 +17,6 @@ for idempotency, cross-checking, and debugging.
 - Registers the account and sends periodic heartbeat data.
 - Pulls pending target-weight tasks from `/trading-gateway/tasks`.
 - Reports order plans, submitted orders, events, trades, and final results.
-- Supports the temporary latest-signal endpoint only when
-  `xquant.product_code` is set.
 
 `QmtAdapter`
 - Wraps `xtquant.xttrader.XtQuantTrader`.
@@ -76,15 +74,9 @@ new signal. The task remains valid until Xquant supersedes it with the next
 signal or returns it in a terminal state. `expires_at` may be `null` in this
 formal contract.
 
-For the current transitional environment, setting `xquant.product_code`
-switches the adapter to:
-
-```text
-GET /api/v1/internal/products/{product_code}/signal/latest
-```
-
-That fallback constructs a local dry-run task and does not report plan/result
-to Xquant.
+`poll-once` always uses the formal gateway task API. Legacy
+`xquant.product_code` configuration is ignored so every executed task can
+report plan/result back to Xquant.
 
 ## Source References
 

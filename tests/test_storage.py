@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from trade_xquant.models import RebalanceTask, TargetPosition
@@ -55,3 +57,30 @@ def test_dry_run_success_and_submitted_are_terminal(tmp_path) -> None:
 
     assert storage.is_terminal_task("dry-task") is True
     assert storage.is_terminal_task("submitted-task") is True
+
+
+def test_storage_closes_sqlite_connections_after_operations(tmp_path, monkeypatch) -> None:
+    original_connect = sqlite3.connect
+    connections = []
+
+    class TrackingConnection(sqlite3.Connection):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            super().close()
+
+    def connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs, factory=TrackingConnection)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr("trade_xquant.storage.sqlite3.connect", connect)
+    storage = Storage(tmp_path / "audit.db")
+
+    storage.initialize()
+
+    assert connections
+    assert all(connection.closed for connection in connections)

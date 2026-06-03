@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from pydantic import BaseModel
 
-from trade_xquant.models import ExecutionResult, OrderPlan, RebalanceTask
+from trade_xquant.models import ExecutionResult, OrderPlan, PlannedOrder, RebalanceTask, SubmittedOrder
 
 
 class Storage:
@@ -17,7 +18,7 @@ class Storage:
 
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.executescript(
                 """
                 PRAGMA journal_mode=WAL;
@@ -101,7 +102,7 @@ class Storage:
 
     def record_task_received(self, task: RebalanceTask, status: str = "received") -> None:
         now = utc_now()
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO tasks (
@@ -140,7 +141,7 @@ class Storage:
 
     def record_plan(self, plan: OrderPlan) -> None:
         now = utc_now()
-        with self._connect() as conn:
+        with self._connection() as conn:
             for order in plan.orders:
                 conn.execute(
                     """
@@ -162,7 +163,7 @@ class Storage:
 
     def record_execution_result(self, result: ExecutionResult) -> None:
         now = utc_now()
-        with self._connect() as conn:
+        with self._connection() as conn:
             for order in result.submitted_orders:
                 conn.execute(
                     """
@@ -194,7 +195,7 @@ class Storage:
         order_id: str | None = None,
         symbol: str | None = None,
     ) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO order_events (
@@ -214,7 +215,7 @@ class Storage:
         quantity = payload.get("quantity", payload.get("traded_volume", payload.get("m_nVolumeTraded", 0)))
         price = payload.get("price", payload.get("trade_price", 0))
         amount = payload.get("amount", payload.get("trade_amount", payload.get("m_dTradeAmount", 0)))
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO trades (
@@ -235,7 +236,7 @@ class Storage:
 
     def mark_task_result(self, task_id: str, status: str, payload: dict[str, Any]) -> None:
         now = utc_now()
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO task_results (task_id, status, payload_json, created_at)
@@ -253,15 +254,73 @@ class Storage:
             )
 
     def is_terminal_task(self, task_id: str) -> bool:
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT status FROM task_results WHERE task_id=?",
                 (task_id,),
             ).fetchone()
         return bool(row and row["status"] in {"success", "failed", "dry_run", "dry_run_success", "submitted"})
 
+    def list_syncable_task_ids(self, task_id: str | None = None, status: str = "all") -> list[str]:
+        statuses = ["submitted", "success", "failed", "partial"]
+        if status != "all":
+            statuses = [status]
+        placeholders = ", ".join("?" for _ in statuses)
+        params: list[str] = list(statuses)
+        task_filter = ""
+        if task_id:
+            task_filter = " AND task_id=?"
+            params.append(task_id)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT task_id
+                FROM task_results
+                WHERE status IN ({placeholders})
+                  AND EXISTS (
+                    SELECT 1 FROM submitted_orders
+                    WHERE submitted_orders.task_id = task_results.task_id
+                  )
+                  {task_filter}
+                ORDER BY created_at ASC
+                """,
+                params,
+            ).fetchall()
+        return [row["task_id"] for row in rows]
+
+    def list_submitted_task_ids(self, task_id: str | None = None) -> list[str]:
+        return self.list_syncable_task_ids(task_id=task_id, status="submitted")
+
+    def load_task_mode(self, task_id: str) -> str:
+        with self._connection() as conn:
+            row = conn.execute("SELECT mode FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        return str(row["mode"]) if row else "real"
+
+    def load_task(self, task_id: str) -> RebalanceTask | None:
+        with self._connection() as conn:
+            row = conn.execute("SELECT raw_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        return RebalanceTask.model_validate_json(row["raw_json"])
+
+    def load_planned_orders(self, task_id: str) -> list[PlannedOrder]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT raw_json FROM planned_orders WHERE task_id=? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
+        return [PlannedOrder.model_validate_json(row["raw_json"]) for row in rows]
+
+    def load_submitted_orders(self, task_id: str) -> list[SubmittedOrder]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT raw_json FROM submitted_orders WHERE task_id=? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
+        return [SubmittedOrder.model_validate_json(row["raw_json"]) for row in rows]
+
     def reset_task(self, task_id: str) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM task_results WHERE task_id=?", (task_id,))
             conn.execute(
                 "UPDATE tasks SET status='reset', updated_at=? WHERE task_id=?",
@@ -269,7 +328,7 @@ class Storage:
             )
 
     def status_summary(self) -> dict[str, Any]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             tasks = conn.execute("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status").fetchall()
             recent = conn.execute(
                 "SELECT task_id, status, updated_at FROM tasks ORDER BY updated_at DESC LIMIT 10"
@@ -283,6 +342,15 @@ class Storage:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
 
 def utc_now() -> str:

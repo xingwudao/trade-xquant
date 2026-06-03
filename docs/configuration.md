@@ -21,12 +21,9 @@ Copy `config.example.yaml` to `config.yaml`.
 - Contains the Xquant JWT returned by `/api/v1/auth/login`.
 
 `xquant.product_code`
-- Leave `null` for the formal gateway task API:
-  `GET /api/v1/trading-gateway/tasks`.
-- Set only for the temporary signal fallback:
-  `GET /api/v1/internal/products/{product_code}/signal/latest`.
-- In fallback mode, the local gateway creates a dry-run-compatible task
-  from the latest signal and skips Xquant plan/result reports.
+- Legacy key. `poll-once` ignores it and always uses the formal gateway
+  task API: `GET /api/v1/trading-gateway/tasks`.
+- Do not set this in new production configs.
 
 `xquant.timeout_seconds`
 - HTTP request timeout.

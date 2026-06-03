@@ -99,87 +99,6 @@ def test_404_error_exposes_status_code() -> None:
     assert exc.value.status_code == 404
 
 
-def test_fetch_latest_signal_task_from_internal_product_signal_contract() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/v1/internal/products/prod_global_rotation_etf/signal/latest"
-        assert request.headers["authorization"] == "Bearer token"
-        return httpx.Response(
-            200,
-            json={
-                "product_code": "prod_global_rotation_etf",
-                "as_of_date": "2026-05-27",
-                "effective_date": "2026-05-27",
-                "target_weights": {"513100.SH": 0.5, "510300.SH": 0.5, "CASH": 0.0},
-            },
-        )
-
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://xquant")
-    adapter = XquantAdapter("http://xquant/api/v1", api_token="token", client=client)
-
-    task = adapter.fetch_latest_signal_task(
-        product_code="prod_global_rotation_etf",
-        account_id="acct",
-        mode="dry_run",
-    )
-
-    assert task.task_id == "signal_prod_global_rotation_etf_2026-05-27"
-    assert task.portfolio_id == "prod_global_rotation_etf"
-    assert task.account_id == "acct"
-    assert str(task.signal_as_of_date) == "2026-05-27"
-    assert str(task.signal_effective_date) == "2026-05-27"
-    assert [(target.symbol, target.target_weight) for target in task.targets] == [
-        ("513100.SH", 0.5),
-        ("510300.SH", 0.5),
-    ]
-
-
-def test_fetch_latest_signal_task_normalizes_ss_to_sh() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "product_code": "prod",
-                "as_of_date": "2026-05-27",
-                "target_weights": {"513100.SS": 0.5, "510300.SS": 0.5},
-            },
-        )
-
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://xquant")
-    adapter = XquantAdapter("http://xquant/api/v1", client=client)
-
-    task = adapter.fetch_latest_signal_task("prod", account_id="acct")
-
-    assert [target.symbol for target in task.targets] == ["513100.SH", "510300.SH"]
-
-
-def test_fetch_latest_signal_task_falls_back_to_public_product_signal() -> None:
-    seen: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request.url.path)
-        if request.url.path.startswith("/api/v1/internal/"):
-            return httpx.Response(404, json={"detail": "Not Found"})
-        return httpx.Response(
-            200,
-            json={
-                "product_code": "prod",
-                "as_of_date": "2026-05-27",
-                "target_weights": {"513100.SS": 1.0},
-            },
-        )
-
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://xquant")
-    adapter = XquantAdapter("http://xquant/api/v1", client=client)
-
-    task = adapter.fetch_latest_signal_task("prod", account_id="acct")
-
-    assert task is not None
-    assert seen == [
-        "/api/v1/internal/products/prod/signal/latest",
-        "/api/v1/products/prod/signal/latest",
-    ]
-
-
 def test_fetch_pending_tasks_accepts_null_expires_at() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -238,12 +157,27 @@ def test_register_account_and_heartbeat_contracts() -> None:
         qmt_connected=True,
         xtquant_importable=True,
         last_error=None,
+        cash=98000.0,
+        total_asset=100000.0,
+        holdings=[
+            {
+                "symbol": "510300.SH",
+                "shares": 1000,
+                "reference_price": 4.2,
+                "market_value": 4200.0,
+                "weight": 0.042,
+                "target_weight": None,
+            }
+        ],
     )
 
     assert account["id"] == "gwacct_1"
     assert heartbeat["ok"] is True
     assert seen[0][1] == "/api/v1/trading-gateway/accounts"
     assert seen[1][1] == "/api/v1/trading-gateway/accounts/acct/heartbeat"
+    assert seen[1][2]["cash"] == 98000.0
+    assert seen[1][2]["total_asset"] == 100000.0
+    assert seen[1][2]["holdings"][0]["symbol"] == "510300.SH"
 
 
 def test_default_client_ignores_environment_proxy(monkeypatch) -> None:

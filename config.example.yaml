@@ -1,6 +1,5 @@
 xquant:
   base_url: "https://xquant.shop/api/v1"
-  product_code: null
   api_token: null
   timeout_seconds: 15
   trust_env: false

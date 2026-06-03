@@ -75,6 +75,31 @@ def test_min_order_amount_filters_small_orders() -> None:
     assert plan.orders == []
 
 
+def test_plan_amounts_are_serialized_with_server_decimal_precision() -> None:
+    account = AccountSnapshot(account_id="acct", total_asset=100_000, cash=100_000)
+    task = make_task(
+        cash_buffer_ratio=0,
+        targets=[TargetPosition(symbol="513100.SH", target_weight=0.01)],
+        constraints={
+            "max_turnover_ratio": 0.8,
+            "max_single_order_amount": 50_000,
+            "min_order_amount": 0,
+        },
+    )
+
+    plan = PortfolioEngine().build_plan(
+        task,
+        account,
+        holdings=[],
+        prices={"513100.SH": 9.876},
+    )
+
+    payload = plan.model_dump(mode="json")
+
+    assert payload["orders"][0]["amount"] == 987.6
+    assert payload["turnover_amount"] == 987.6
+
+
 def test_rejects_weights_above_one() -> None:
     account = AccountSnapshot(account_id="acct", total_asset=100_000, cash=100_000)
     task = make_task(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -8,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 
 TaskMode = Literal["dry_run", "real"]
 OrderSide = Literal["buy", "sell"]
+MONEY_QUANT = Decimal("0.0001")
 
 
 class TargetPosition(BaseModel):
@@ -79,6 +81,11 @@ class PlannedOrder(BaseModel):
     price_type: str = "fix"
     remark: str | None = None
 
+    @field_validator("price", "amount")
+    @classmethod
+    def round_money_fields(cls, value: float) -> float:
+        return round_money(value)
+
     @property
     def qmt_order_type(self) -> int:
         return 23 if self.side == "buy" else 24
@@ -99,6 +106,11 @@ class OrderPlan(BaseModel):
     turnover_amount: float
     turnover_ratio: float
     orders: list[PlannedOrder]
+
+    @field_validator("total_asset", "turnover_amount")
+    @classmethod
+    def round_money_fields(cls, value: float) -> float:
+        return round_money(value)
 
     @property
     def total_buy_amount(self) -> float:
@@ -121,6 +133,11 @@ class SubmittedOrder(BaseModel):
     status: str = "submitted"
     raw: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("price", "amount")
+    @classmethod
+    def round_money_fields(cls, value: float) -> float:
+        return round_money(value)
+
 
 class ExecutionResult(BaseModel):
     task_id: str
@@ -142,3 +159,7 @@ def normalize_symbol(value: str) -> str:
     if symbol.endswith(".SS"):
         return f"{symbol[:-3]}.SH"
     return symbol
+
+
+def round_money(value: float) -> float:
+    return float(Decimal(str(value)).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP))

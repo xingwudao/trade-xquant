@@ -108,7 +108,6 @@ notepad config.yaml
 ```yaml
 xquant:
   base_url: "https://xquant.shop/api/v1"
-  product_code: null
   api_token: null
   trust_env: false
 
@@ -133,11 +132,6 @@ runtime:
 - `xquant.api_token`
   首次使用保持 `null`。通过 `login` 登录后，token 会写入
   `config.yaml` 同目录下的 `xquant-token.json`。
-
-- `xquant.product_code`
-  正式 Windows 交易网关必须保持 `null`。这样 CLI 才会调用
-  `/trading-gateway/tasks` 领取 Xquant 下发的任务。
-  如果设置成某个产品代码，CLI 会走最新信号 fallback，不会领取正式任务。
 
 - `xquant.trust_env`
   建议保持 `false`，避免 Windows 机器上的代理环境变量影响生产 API 请求。
@@ -481,7 +475,6 @@ trade-xquant poll-once --config config.yaml --task-id replace-with-task-id --ver
 
 如果 Xquant 页面里能看到任务，但 CLI 输出 `no pending tasks`，优先检查：
 
-- `xquant.product_code` 是否为 `null`。
 - Xquant 任务是否属于同一个证券账户。
 - 任务是否已经到有效时间；页面上的产品任务列表可能会展示未来生效任务。
 - 任务是否仍是 `pending`，且没有被其他网关领取。

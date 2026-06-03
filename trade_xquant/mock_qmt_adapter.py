@@ -41,6 +41,12 @@ class MockBrokerAdapter:
     def get_positions(self) -> list[Position]:
         return []
 
+    def get_orders(self) -> list[dict[str, object]]:
+        return [dict(event.payload) for event in self.events if event.event_type == "stock_order"]
+
+    def get_trades(self) -> list[dict[str, object]]:
+        return [dict(event.payload) for event in self.events if event.event_type == "stock_trade"]
+
     def get_prices(self, symbols: list[str]) -> dict[str, float]:
         missing = [symbol for symbol in symbols if normalize_symbol(symbol) not in self.prices]
         if missing:

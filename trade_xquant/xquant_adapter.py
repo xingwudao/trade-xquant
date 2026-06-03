@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import httpx
 
-from trade_xquant.models import ExecutionResult, RebalanceTask, TargetPosition, normalize_symbol
+from trade_xquant.models import ExecutionResult, RebalanceTask
 
 
 class XquantAdapterError(RuntimeError):
@@ -42,58 +40,6 @@ class XquantAdapter:
         data = self._handle(response)
         raw_tasks = data.get("tasks", data if isinstance(data, list) else [])
         return [RebalanceTask.model_validate({**task, "raw": task}) for task in raw_tasks]
-
-    def fetch_latest_signal_task(
-        self,
-        product_code: str,
-        account_id: str,
-        mode: str = "dry_run",
-        cash_buffer_ratio: float = 0.002,
-    ) -> RebalanceTask | None:
-        response = self.client.get(
-            self._url(f"/internal/products/{product_code}/signal/latest"),
-            headers=self._headers(),
-        )
-        if response.status_code == 404:
-            response = self.client.get(
-                self._url(f"/products/{product_code}/signal/latest"),
-                headers=self._headers(),
-            )
-        if response.status_code == 404:
-            return None
-        data = self._handle(response)
-        if not data:
-            return None
-
-        raw_weights = data.get("target_weights") or data.get("weights") or {}
-        targets = [
-            TargetPosition(symbol=normalize_symbol(symbol), target_weight=float(weight))
-            for symbol, weight in raw_weights.items()
-            if symbol.upper() != "CASH" and float(weight) > 0
-        ]
-        if not targets:
-            return None
-
-        as_of_date = str(data.get("as_of_date") or data.get("effective_date") or datetime.now().date())
-        created_at = _date_to_datetime(as_of_date, hour=9, minute=35)
-        now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        expires_at = _date_to_datetime(str(data.get("effective_date") or as_of_date), hour=14, minute=50)
-        if expires_at <= now:
-            expires_at = now + timedelta(days=1)
-
-        return RebalanceTask(
-            task_id=f"signal_{product_code}_{as_of_date}",
-            portfolio_id=product_code,
-            account_id=account_id,
-            mode=mode,  # type: ignore[arg-type]
-            signal_as_of_date=data.get("as_of_date"),
-            signal_effective_date=data.get("effective_date"),
-            created_at=created_at,
-            expires_at=expires_at,
-            cash_buffer_ratio=cash_buffer_ratio,
-            targets=targets,
-            raw=data,
-        )
 
     def send_otp(
         self,
@@ -157,16 +103,26 @@ class XquantAdapter:
         qmt_connected: bool,
         xtquant_importable: bool,
         last_error: str | None = None,
+        cash: float | None = None,
+        total_asset: float | None = None,
+        holdings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "client_version": client_version,
+            "hostname": hostname,
+            "qmt_connected": qmt_connected,
+            "xtquant_importable": xtquant_importable,
+            "last_error": last_error,
+        }
+        if cash is not None:
+            payload["cash"] = cash
+        if total_asset is not None:
+            payload["total_asset"] = total_asset
+        if holdings is not None:
+            payload["holdings"] = holdings
         response = self.client.post(
             self._url(f"/trading-gateway/accounts/{account_id}/heartbeat"),
-            json={
-                "client_version": client_version,
-                "hostname": hostname,
-                "qmt_connected": qmt_connected,
-                "xtquant_importable": xtquant_importable,
-                "last_error": last_error,
-            },
+            json=payload,
             headers=self._headers(),
         )
         return self._handle(response)
@@ -241,18 +197,3 @@ class XquantAdapter:
         if not response.content:
             return {}
         return response.json()
-
-
-def _date_to_datetime(value: str, hour: int, minute: int) -> datetime:
-    if "T" in value:
-        parsed = datetime.fromisoformat(value)
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
-    date_part = datetime.fromisoformat(value).date()
-    return datetime(
-        date_part.year,
-        date_part.month,
-        date_part.day,
-        hour,
-        minute,
-        tzinfo=ZoneInfo("Asia/Shanghai"),
-    )

@@ -56,6 +56,26 @@ def test_mock_qmt_partial_fill_emits_partial_trade() -> None:
     assert trade.payload["quantity"] == 250
 
 
+def test_mock_qmt_query_orders_and_trades_after_partial_fill() -> None:
+    adapter = MockBrokerAdapter(
+        account_id="acct",
+        total_asset=100_000,
+        cash=100_000,
+        prices={"513100.SH": 1.23},
+        order_behavior="partial_fill",
+        partial_fill_ratio=0.25,
+    )
+
+    adapter.place_order(order())
+
+    orders = adapter.get_orders()
+    trades = adapter.get_trades()
+    assert orders[0]["status"] == "partial_filled"
+    assert orders[0]["traded_volume"] == 250
+    assert trades[0]["status"] == "partial_filled"
+    assert trades[0]["quantity"] == 250
+
+
 def test_mock_qmt_reject_emits_order_error_and_raises() -> None:
     events = []
     adapter = MockBrokerAdapter(

@@ -38,6 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
     dry.add_argument("--task-id")
     mock = sub.add_parser("mock-run", parents=[common])
     mock.add_argument("--task-id")
+    sync = sub.add_parser("sync-results", parents=[common])
+    sync.add_argument("--task-id")
+    sync.add_argument("--status", choices=["all", "submitted", "success", "failed", "partial"], default="all")
     sub.add_parser("show-status", parents=[common])
     return parser
 
@@ -110,6 +113,12 @@ def main(argv: list[str] | None = None) -> int:
         settings.runtime.simulate_real_orders = True
         return _run_gateway_command(
             lambda: GatewayService(settings).poll_once(force_dry_run=True, task_id=args.task_id)
+        )
+    if args.command == "sync-results":
+        from trade_xquant.daemon import GatewayService
+
+        return _run_gateway_command(
+            lambda: GatewayService(settings).sync_results(task_id=args.task_id, status=args.status)
         )
     if args.command == "daemon":
         from trade_xquant.daemon import GatewayService
@@ -233,11 +242,13 @@ def heartbeat_command(
     qmt_connected: bool,
     last_error: str | None,
     client=None,
+    broker=None,
 ):
     import socket
 
     from trade_xquant import __version__
     from trade_xquant.config import load_settings
+    from trade_xquant.daemon import account_result_snapshot
     from trade_xquant.xquant_adapter import XquantAdapter
 
     settings = load_settings(config_path)
@@ -254,6 +265,18 @@ def heartbeat_command(
         xtquant_importable = True
     except ImportError:
         xtquant_importable = False
+    snapshot: dict | None = None
+    if qmt_connected:
+        try:
+            broker = broker or _build_broker_adapter(settings)
+            broker.connect()
+            account = broker.get_account_snapshot()
+            positions = broker.get_positions()
+            symbols = sorted({position.symbol for position in positions})
+            prices = broker.get_prices(symbols) if symbols else {}
+            snapshot = account_result_snapshot(account, positions, prices)
+        except Exception as exc:  # noqa: BLE001 - heartbeat should still reach Xquant
+            last_error = _append_last_error(last_error, f"heartbeat snapshot failed: {exc}")
     return adapter.heartbeat(
         account_id=settings.qmt.account_id,
         client_version=__version__,
@@ -261,7 +284,32 @@ def heartbeat_command(
         qmt_connected=qmt_connected,
         xtquant_importable=xtquant_importable,
         last_error=last_error,
+        cash=snapshot["cash"] if snapshot else None,
+        total_asset=snapshot["total_asset"] if snapshot else None,
+        holdings=snapshot["holdings"] if snapshot else None,
     )
+
+
+def _build_broker_adapter(settings):
+    from trade_xquant.mock_qmt_adapter import MockBrokerAdapter
+    from trade_xquant.qmt_adapter import QmtAdapter
+
+    if settings.runtime.broker_adapter == "mock":
+        return MockBrokerAdapter(
+            account_id=settings.qmt.account_id,
+            total_asset=settings.runtime.mock_total_asset,
+            cash=settings.runtime.mock_cash,
+            prices=settings.runtime.mock_prices,
+            order_behavior=settings.runtime.mock_order_behavior,
+            partial_fill_ratio=settings.runtime.mock_partial_fill_ratio,
+        )
+    if settings.runtime.broker_adapter == "qmt":
+        return QmtAdapter(settings.qmt)
+    raise ValueError("runtime.broker_adapter must be 'qmt' or 'mock'")
+
+
+def _append_last_error(last_error: str | None, error: str) -> str:
+    return f"{last_error}; {error}" if last_error else error
 
 
 def _run_gateway_command(callback) -> int:
@@ -270,13 +318,17 @@ def _run_gateway_command(callback) -> int:
         return 0
     except Exception as exc:  # noqa: BLE001 - CLI should show actionable diagnostics
         status_code = getattr(exc, "status_code", None)
-        hint = None
+        hint = getattr(exc, "hint", None)
         if status_code == 404:
             hint = (
                 "Xquant server does not expose /trading-gateway/tasks yet. "
-                "Deploy the trading-gateway API contract or add a signal-latest fallback."
+                "Deploy the trading-gateway API contract before polling tasks."
             )
-        print_json({"ok": False, "error": str(exc), "status_code": status_code, "hint": hint})
+        payload = {"ok": False, "error": str(exc), "status_code": status_code, "hint": hint}
+        results = getattr(exc, "results", None)
+        if results is not None:
+            payload["results"] = results
+        print_json(payload)
         return 1
 
 
