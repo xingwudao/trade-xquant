@@ -8,7 +8,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from trade_xquant import __version__
-from trade_xquant.condition_orders import ConditionEngine, extract_condition_orders
+from trade_xquant.condition_orders import (
+    ConditionEngine,
+    ConditionOrder,
+    extract_condition_orders,
+)
 from trade_xquant.config import Settings
 from trade_xquant.execution_engine import ExecutionEngine
 from trade_xquant.local_task_file import LocalTaskFileAdapter
@@ -103,6 +107,7 @@ class GatewayService:
             prices: dict[str, float] = {}
             try:
                 self.storage.claim_task(task)
+                condition_orders = extract_condition_orders(task)
                 prices = self.qmt.get_prices([target.symbol for target in task.targets] + [p.symbol for p in positions])
                 plan = self.portfolio.build_plan(task, account, positions, prices)
                 self.risk.validate(task, account, plan, known_symbols=set(prices))
@@ -121,7 +126,7 @@ class GatewayService:
                 status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
                 self.storage.mark_task_result(task.task_id, status, result.model_dump(mode="json"))
                 if status in {"dry_run_success", "submitted"}:
-                    self._arm_condition_orders(task)
+                    self._arm_condition_orders(task, condition_orders)
                 if should_report_gateway:
                     self.xquant.report_result(task.task_id, status, result)
                 results.append({"task_id": task.task_id, "status": status})
@@ -388,8 +393,11 @@ class GatewayService:
                 result.meta["account_price_error"] = str(exc)
         attach_account_snapshot(result, account, positions, prices, task)
 
-    def _arm_condition_orders(self, task: RebalanceTask) -> None:
-        condition_orders = extract_condition_orders(task)
+    def _arm_condition_orders(
+        self,
+        task: RebalanceTask,
+        condition_orders: list[ConditionOrder],
+    ) -> None:
         if not condition_orders:
             return
         self.storage.upsert_condition_orders(condition_orders)

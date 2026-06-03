@@ -106,6 +106,22 @@ def test_required_condition_params_are_method_and_purpose_specific() -> None:
     ]
 
 
+def test_legacy_pct_alias_satisfies_static_and_trailing_validation() -> None:
+    cases = [
+        condition("static_pct", "stop_loss", {"pct": 0.05}),
+        condition("static_pct", "take_profit", {"pct": 0.10}),
+        condition("trailing_pct", "stop_loss", {"pct": 0.08}),
+        condition(
+            "trailing_pct",
+            "take_profit",
+            {"pct": 0.08, "activation_profit_pct": 0.12},
+        ),
+    ]
+
+    for order in cases:
+        assert validate_condition_hyperparameters(order) == []
+
+
 def test_missing_reference_price_is_reported() -> None:
     order = condition("static_pct", "stop_loss", {"stop_loss_pct": 0.05})
     order = order.model_copy(update={"reference_price": None})

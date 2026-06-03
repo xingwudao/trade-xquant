@@ -67,6 +67,49 @@ def test_gateway_poll_once_reads_local_task_file_and_arms_condition_orders(tmp_p
     assert [order.condition_id for order in service.storage.list_active_condition_orders()] == ["cond-1"]
 
 
+def test_gateway_poll_once_validates_condition_orders_before_execution(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "condition_id": "cond-invalid",
+                                    "symbol": "513100.SH",
+                                    "purpose": "stop_loss",
+                                    "method": "trailing_pct",
+                                    "reference_price": 1.0,
+                                    "params": {},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result[0]["task_id"] == "task-1"
+    assert result[0]["status"] == "failed"
+    assert "cond-invalid" in str(result[0]["error"])
+    assert "trail_pct" in str(result[0]["error"])
+    assert service.qmt.submitted_orders == []
+
+
 def test_gateway_condition_poll_once_executes_triggered_condition_order(tmp_path) -> None:
     service = GatewayService(settings_for(tmp_path))
     service.storage.initialize()

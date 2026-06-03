@@ -279,3 +279,50 @@ def test_extract_condition_orders_rejects_missing_required_params() -> None:
         match="condition cond-missing missing condition params: trail_pct",
     ):
         extract_condition_orders(task)
+
+
+def test_extract_condition_orders_skips_disabled_false_like_rules() -> None:
+    task = RebalanceTask.model_validate(
+        {
+            "task_id": "task-1",
+            "portfolio_id": "prod",
+            "account_id": "acct",
+            "mode": "dry_run",
+            "created_at": "2026-06-03T09:35:00+08:00",
+            "expires_at": None,
+            "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+            "constraints": {
+                "condition_orders": [
+                    {
+                        "condition_id": "cond-disabled-0",
+                        "symbol": "513100.SH",
+                        "purpose": "stop_loss",
+                        "method": "trailing_pct",
+                        "reference_price": 1.0,
+                        "enabled": 0,
+                        "params": {},
+                    },
+                    {
+                        "condition_id": "cond-disabled-false",
+                        "symbol": "513100.SH",
+                        "purpose": "stop_loss",
+                        "method": "trailing_pct",
+                        "reference_price": 1.0,
+                        "enabled": "false",
+                        "params": {},
+                    },
+                    {
+                        "condition_id": "cond-disabled-string-0",
+                        "symbol": "513100.SH",
+                        "purpose": "stop_loss",
+                        "method": "trailing_pct",
+                        "reference_price": 1.0,
+                        "enabled": "0",
+                        "params": {},
+                    },
+                ]
+            },
+        }
+    )
+
+    assert extract_condition_orders(task) == []

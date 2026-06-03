@@ -27,6 +27,11 @@ ConditionMethod = Literal[
     "std_trailing",
 ]
 DEFERRED_CONDITION_METHODS = {"atr_trailing", "hv_log_trailing", "std_trailing"}
+CONDITION_PARAM_ALIASES = {
+    "stop_loss_pct": ("pct",),
+    "take_profit_pct": ("pct",),
+    "trail_pct": ("pct",),
+}
 ConditionStatus = Literal[
     "received",
     "armed",
@@ -236,7 +241,7 @@ def extract_condition_orders(task: RebalanceTask) -> list[ConditionOrder]:
                 raw_specs = maybe_specs
     orders: list[ConditionOrder] = []
     for spec in raw_specs:
-        if not isinstance(spec, dict) or spec.get("enabled", True) is False:
+        if not isinstance(spec, dict):
             continue
         order = ConditionOrder.model_validate(
             {
@@ -249,6 +254,8 @@ def extract_condition_orders(task: RebalanceTask) -> list[ConditionOrder]:
                 "status": spec.get("status", "armed"),
             }
         )
+        if not order.enabled:
+            continue
         missing = validate_condition_hyperparameters(order)
         if missing:
             missing_keys = ", ".join(missing)
@@ -286,13 +293,22 @@ def validate_condition_hyperparameters(order: ConditionOrder) -> list[str]:
             alternatives = key.split("|")
             if not any(order.params.get(name) is not None for name in alternatives):
                 missing.append(key)
-        elif order.params.get(key) is None:
+        elif not _has_condition_param(order, key):
             missing.append(key)
     if order.scope != "instrument":
         missing.append("scope:instrument")
     if order.reference_price is None:
         missing.append("reference_price")
     return missing
+
+
+def _has_condition_param(order: ConditionOrder, key: str) -> bool:
+    if order.params.get(key) is not None:
+        return True
+    return any(
+        order.params.get(alias) is not None
+        for alias in CONDITION_PARAM_ALIASES.get(key, ())
+    )
 
 
 def _param(order: ConditionOrder, primary: str, fallback: str) -> float:
