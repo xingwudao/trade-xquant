@@ -129,6 +129,16 @@ def test_legacy_pct_alias_satisfies_static_and_trailing_validation() -> None:
         assert validate_condition_hyperparameters(order) == []
 
 
+def test_pct_alias_does_not_satisfy_deferred_method_params() -> None:
+    order = condition(
+        "atr_trailing",
+        "stop_loss",
+        {"pct": 0.08, "atr_window": 3, "bar_interval": "1d"},
+    )
+
+    assert validate_condition_hyperparameters(order) == ["atr_multiple"]
+
+
 def test_missing_reference_price_is_reported() -> None:
     order = condition("static_pct", "stop_loss", {"stop_loss_pct": 0.05})
     order = order.model_copy(update={"reference_price": None})

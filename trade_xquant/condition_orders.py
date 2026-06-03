@@ -323,7 +323,9 @@ def _has_condition_param(order: ConditionOrder, key: str) -> bool:
 
 
 def _param(order: ConditionOrder, primary: str, fallback: str) -> float:
-    value = order.params.get(primary, order.params.get(fallback))
+    value = order.params.get(primary)
+    if value is None:
+        value = order.params.get(fallback)
     if value is None:
         raise ValueError(f"condition {order.condition_id} missing {primary}")
     return float(value)

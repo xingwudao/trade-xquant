@@ -146,6 +146,48 @@ def test_condition_engine_updates_trailing_high_water_before_trigger(tmp_path) -
     assert stored.status == "armed"
 
 
+def test_condition_engine_uses_pct_when_trailing_pct_is_none(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-trailing",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="trailing_pct",
+                reference_price=1.0,
+                high_water_price=1.0,
+                params={"trail_pct": None, "pct": 0.08},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=AccountSnapshot(account_id="acct", total_asset=100_000, cash=90_000),
+        positions=[
+            Position(
+                symbol="513100.SH",
+                quantity=1000,
+                sellable_quantity=1000,
+                market_value=1200,
+                cost_price=1.0,
+            )
+        ],
+        prices={"513100.SH": 1.2},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert plans == []
+    assert storage.get_condition_order("cond-trailing").trigger_price == 1.104
+
+
 def test_deferred_methods_do_not_reuse_trailing_pct_trigger_logic() -> None:
     engine = ConditionEngine(storage=None)
     order = ConditionOrder(
