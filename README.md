@@ -398,6 +398,10 @@ trade-xquant poll-once --config config.yaml
 trade-xquant daemon --config config.yaml
 ```
 
+每轮 daemon 会先处理 pending task，再向 Xquant 发送一次 heartbeat。
+如果 QMT 可连接，heartbeat 会带上当前 `cash`、`total_asset` 和
+`holdings`，用于刷新页面上的在线状态和当前持仓结果。
+
 轮询间隔来自：
 
 ```yaml

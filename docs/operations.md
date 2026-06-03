@@ -41,11 +41,12 @@ is idempotent and can be run again after changing account metadata.
 ## Heartbeat
 
 ```bash
-trade-xquant heartbeat --config config.yaml
+trade-xquant heartbeat --config config.yaml --qmt-connected
 ```
 
 Sends account liveness and runtime metadata to Xquant. The daemon can also
-use the same contract for periodic liveness reporting.
+use the same contract for periodic liveness reporting. When QMT is connected,
+the heartbeat payload includes current `cash`, `total_asset`, and `holdings`.
 
 ## Check QMT
 
@@ -115,7 +116,10 @@ Processes currently pending tasks once.
 trade-xquant daemon --config config.yaml
 ```
 
-Runs the same poll loop every `runtime.poll_interval_seconds`.
+Runs the same poll loop every `runtime.poll_interval_seconds`. Each loop
+also sends a heartbeat to Xquant. If QMT can be queried, the heartbeat
+refreshes the account's current holdings in Xquant even when there are no
+pending tasks.
 
 ## Show Local Status
 

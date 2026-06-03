@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import socket
 import time
 from typing import Any
 
+from trade_xquant import __version__
 from trade_xquant.config import Settings
 from trade_xquant.execution_engine import ExecutionEngine
 from trade_xquant.models import AccountSnapshot, ExecutionResult, Position, RebalanceTask
@@ -130,8 +132,50 @@ class GatewayService:
 
     def run_forever(self) -> None:
         while True:
-            self.poll_once()
+            last_error = None
+            try:
+                self.poll_once()
+            except Exception as exc:  # noqa: BLE001 - daemon must keep reporting liveness
+                logger.exception("poll loop failed")
+                last_error = str(exc)
+            try:
+                self.heartbeat_once(last_error=last_error)
+            except Exception:  # noqa: BLE001 - heartbeat failure must not stop polling
+                logger.exception("failed to report heartbeat to Xquant")
             time.sleep(self.settings.runtime.poll_interval_seconds)
+
+    def heartbeat_once(self, last_error: str | None = None) -> dict[str, Any]:
+        snapshot: dict[str, Any] | None = None
+        qmt_connected = False
+        try:
+            self.qmt.connect()
+            qmt_connected = True
+            account = self.qmt.get_account_snapshot()
+            positions = self.qmt.get_positions()
+            price_symbols = sorted({position.symbol for position in positions})
+            prices: dict[str, float] = {}
+            if price_symbols:
+                try:
+                    prices = self.qmt.get_prices(price_symbols)
+                except Exception as exc:  # noqa: BLE001 - holdings can still use market_value
+                    logger.exception("failed to query account prices during heartbeat")
+                    last_error = _append_error(last_error, f"heartbeat price query failed: {exc}")
+            snapshot = account_result_snapshot(account, positions, prices)
+        except Exception as exc:  # noqa: BLE001 - liveness should still be reported
+            logger.exception("failed to query account snapshot during heartbeat")
+            last_error = _append_error(last_error, f"heartbeat snapshot failed: {exc}")
+
+        return self.xquant.heartbeat(
+            account_id=self.settings.qmt.account_id,
+            client_version=__version__,
+            hostname=socket.gethostname(),
+            qmt_connected=qmt_connected,
+            xtquant_importable=_xtquant_importable(),
+            last_error=last_error,
+            cash=snapshot["cash"] if snapshot else None,
+            total_asset=snapshot["total_asset"] if snapshot else None,
+            holdings=snapshot["holdings"] if snapshot else None,
+        )
 
     def sync_results(self, task_id: str | None = None, status: str = "all") -> list[dict[str, object]]:
         self.storage.initialize()
@@ -485,3 +529,15 @@ def _normalize_trade_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if order_id not in (None, ""):
         result["order_id"] = str(order_id)
     return result
+
+
+def _xtquant_importable() -> bool:
+    try:
+        import xtquant  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _append_error(last_error: str | None, error: str) -> str:
+    return f"{last_error}; {error}" if last_error else error

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import closing
 
+import pytest
+
 from trade_xquant.config import QmtConfig, RiskConfig, RuntimeConfig, Settings, XquantConfig
 from trade_xquant.daemon import GatewayService
 from trade_xquant.models import AccountSnapshot, Position, RebalanceTask
@@ -12,6 +14,7 @@ class FakeXquant:
         self.plans: list[dict] = []
         self.results: list[tuple[str, str, int, int, int]] = []
         self.result_bodies: list[dict] = []
+        self.heartbeats: list[dict] = []
 
     def fetch_pending_tasks(self, account_id: str):
         return [
@@ -43,6 +46,10 @@ class FakeXquant:
                 len(body.get("events", [])),
             )
         )
+
+    def heartbeat(self, account_id: str, **payload) -> dict:
+        self.heartbeats.append({"account_id": account_id, **payload})
+        return {"ok": True}
 
 
 def test_gateway_poll_once_can_use_mock_broker_without_qmt(tmp_path) -> None:
@@ -95,6 +102,76 @@ def test_gateway_poll_once_uses_task_endpoint_even_when_product_code_is_configur
     assert result == [{"task_id": "task-1", "status": "dry_run_success"}]
     assert fake_xquant.plans
     assert fake_xquant.results == [("task-1", "dry_run_success", 0, 0, 0)]
+
+
+def test_daemon_loop_sends_heartbeat_with_holdings_when_no_tasks(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="mock",
+            db_path=str(tmp_path / "audit.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(),
+    )
+    service = GatewayService(settings)
+    fake_xquant = FakeXquant()
+    fake_xquant.fetch_pending_tasks = lambda account_id: []  # type: ignore[method-assign]
+    service.xquant = fake_xquant  # type: ignore[assignment]
+
+    class SnapshotBroker:
+        def connect(self) -> None:
+            return None
+
+        def get_account_snapshot(self) -> AccountSnapshot:
+            return AccountSnapshot(
+                account_id="acct",
+                total_asset=100_000,
+                cash=98_000,
+                market_value=2_000,
+            )
+
+        def get_positions(self) -> list[Position]:
+            return [
+                Position(
+                    symbol="513100.SH",
+                    quantity=1000,
+                    sellable_quantity=1000,
+                    market_value=2000,
+                )
+            ]
+
+        def get_prices(self, symbols: list[str]) -> dict[str, float]:
+            return {symbol: 2.0 for symbol in symbols}
+
+    class StopDaemon(Exception):
+        pass
+
+    def stop_sleep(seconds: float) -> None:
+        raise StopDaemon()
+
+    monkeypatch.setattr("trade_xquant.daemon.time.sleep", stop_sleep)
+    service.qmt = SnapshotBroker()  # type: ignore[assignment]
+
+    with pytest.raises(StopDaemon):
+        service.run_forever()
+
+    assert fake_xquant.heartbeats
+    heartbeat = fake_xquant.heartbeats[0]
+    assert heartbeat["qmt_connected"] is True
+    assert heartbeat["cash"] == 98_000
+    assert heartbeat["total_asset"] == 100_000
+    assert heartbeat["holdings"] == [
+        {
+            "symbol": "513100.SH",
+            "shares": 1000,
+            "reference_price": 2.0,
+            "market_value": 2000,
+            "weight": 0.02,
+            "target_weight": None,
+        }
+    ]
 
 
 def test_gateway_mock_broker_records_events_trades_and_submitted_orders(tmp_path) -> None:

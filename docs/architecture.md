@@ -58,6 +58,8 @@ for idempotency, cross-checking, and debugging.
 7. Dry-run records the plan only; real-run submits orders through QMT.
 8. SQLite stores plans, submitted orders, callback events, and task result.
 9. Xquant receives plan and result reports.
+10. In daemon mode, each loop also sends a heartbeat. If QMT can be queried,
+    the heartbeat includes current `cash`, `total_asset`, and `holdings`.
 
 ## Xquant Task Mode
 
