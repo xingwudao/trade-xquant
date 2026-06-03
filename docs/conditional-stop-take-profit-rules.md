@@ -49,14 +49,16 @@ Current MVP implementation:
 - Sell-side conditional exits only.
 - `static_pct`.
 - `trailing_pct`.
+- `atr_trailing`.
+- `hv_log_trailing`.
+- `std_trailing`.
+- Activation gates for trailing take-profit.
 - Condition values under `constraints.condition_orders`.
+- Local SQLite condition state and audit storage.
+- Xquant condition-result audit reporting.
 
 Future implementation may add:
 - Portfolio-scope rules.
-- ATR trailing rules.
-- HV log-return volatility rules.
-- Standard-deviation trailing rules.
-- Activation gates for trailing take-profit.
 - Portfolio-level liquidation or partial de-risk actions.
 
 ## Core Concepts
@@ -815,6 +817,9 @@ For trade-xquant:
 - All numeric trading thresholds must come from the task payload.
 - The gateway can maintain runtime state, such as high-water price, only when
   the task contract allows it.
+- Condition-triggered execution must report the triggering rule, the Xquant
+  hyperparameter snapshot, the gateway market-derived state snapshot, and the
+  execution result back to Xquant for audit.
 - The gateway should report enough evidence for Xquant to audit why a
   condition triggered.
 
