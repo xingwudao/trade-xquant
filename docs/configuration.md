@@ -76,6 +76,10 @@ Copy `config.example.yaml` to `config.yaml`.
 `runtime.broker_adapter`
 - `qmt` for the real Windows MiniQMT adapter.
 - `mock` for Mac/local Xquant API tests without connecting to QMT.
+- Real `qmt` mode does not yet provide historical price bars to the condition
+  engine. Bar-based `atr_trailing`, `hv_log_trailing`, and `std_trailing`
+  conditions will record per-order evaluation errors in real QMT mode until
+  QMT bar history is wired.
 
 `runtime.local_task_file`
 - Optional local JSON task file.

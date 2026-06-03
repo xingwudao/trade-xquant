@@ -5,7 +5,7 @@ from datetime import datetime
 import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from trade_xquant.condition_indicators import ConditionIndicatorEngine, PriceBar
 from trade_xquant.models import (
@@ -50,8 +50,18 @@ ConditionStatus = Literal[
 
 
 class ConditionAction(BaseModel):
-    type: Literal["sell_pct", "clear"] = "sell_pct"
-    pct: float = Field(default=1.0, ge=0, le=1)
+    type: Literal["sell_pct", "clear"]
+    pct: float | None = None
+
+    @model_validator(mode="after")
+    def validate_action(self) -> "ConditionAction":
+        if self.type != "sell_pct":
+            return self
+        if self.pct is None:
+            raise ValueError("sell_pct action requires pct")
+        if not math.isfinite(self.pct) or self.pct <= 0 or self.pct > 1:
+            raise ValueError("sell_pct action pct must be finite and 0 < pct <= 1")
+        return self
 
 
 class ConditionOrder(BaseModel):
@@ -70,7 +80,7 @@ class ConditionOrder(BaseModel):
     high_water_price: float | None = Field(default=None, gt=0)
     trigger_price: float | None = Field(default=None, gt=0)
     params: dict[str, Any] = Field(default_factory=dict)
-    action: ConditionAction = Field(default_factory=ConditionAction)
+    action: ConditionAction
     enabled: bool = True
     valid_from: datetime | None = None
     expires_at: datetime | None = None
@@ -120,13 +130,13 @@ class ConditionEngine:
             latest_price: float | None = None
             try:
                 latest_price = self._latest_price(order, normalized_prices)
-                missing = validate_condition_hyperparameters(order)
-                if missing:
-                    missing_keys = ", ".join(missing)
+                invalid = validate_condition_hyperparameters(order)
+                if invalid:
+                    invalid_keys = ", ".join(invalid)
                     raise ValueError(
-                        f"condition {order.condition_id} missing condition params: "
-                        f"{missing_keys}"
-                )
+                        f"condition {order.condition_id} missing/invalid "
+                        f"condition params: {invalid_keys}"
+                    )
                 evaluated, market_state = self._with_market_state(order, latest_price, now)
             except (TypeError, ValueError) as exc:
                 reason = str(exc)
@@ -528,27 +538,47 @@ def extract_condition_orders(task: RebalanceTask) -> list[ConditionOrder]:
     for spec in raw_specs:
         if not isinstance(spec, dict):
             continue
-        order = ConditionOrder.model_validate(
-            {
-                **spec,
-                "task_id": task.task_id,
-                "portfolio_id": task.portfolio_id,
-                "account_id": task.account_id,
-                "mode": task.mode,
-                "raw": spec,
-                "status": spec.get("status", "armed"),
-            }
-        )
+        if _condition_spec_disabled(spec):
+            continue
+        try:
+            order = ConditionOrder.model_validate(
+                {
+                    **spec,
+                    "task_id": task.task_id,
+                    "portfolio_id": task.portfolio_id,
+                    "account_id": task.account_id,
+                    "mode": task.mode,
+                    "raw": spec,
+                    "status": spec.get("status", "armed"),
+                }
+            )
+        except ValidationError as exc:
+            condition_id = spec.get("condition_id", "<unknown>")
+            raise ValueError(
+                f"condition {condition_id} invalid condition order: {exc}"
+            ) from exc
         if not order.enabled:
             continue
-        missing = validate_condition_hyperparameters(order)
-        if missing:
-            missing_keys = ", ".join(missing)
+        invalid = validate_condition_hyperparameters(order)
+        if invalid:
+            invalid_keys = ", ".join(invalid)
             raise ValueError(
-                f"condition {order.condition_id} missing condition params: {missing_keys}"
+                f"condition {order.condition_id} missing/invalid "
+                f"condition params: {invalid_keys}"
             )
         orders.append(order)
     return orders
+
+
+def _condition_spec_disabled(spec: dict[str, Any]) -> bool:
+    value = spec.get("enabled", True)
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"0", "false", "no", "off"}
+    return False
 
 
 def required_condition_params(order: ConditionOrder) -> set[str]:
@@ -572,19 +602,32 @@ def required_condition_params(order: ConditionOrder) -> set[str]:
 
 
 def validate_condition_hyperparameters(order: ConditionOrder) -> list[str]:
-    missing: list[str] = []
+    invalid: list[str] = []
+    keys_to_validate: set[str] = set()
+
+    def add(key: str) -> None:
+        if key not in invalid:
+            invalid.append(key)
+
     for key in sorted(required_condition_params(order)):
         if "|" in key:
             alternatives = key.split("|")
-            if not any(order.params.get(name) is not None for name in alternatives):
-                missing.append(key)
+            present = [name for name in alternatives if order.params.get(name) is not None]
+            if not present:
+                add(key)
+            keys_to_validate.update(present)
         elif not _has_condition_param(order, key):
-            missing.append(key)
+            add(key)
+        else:
+            keys_to_validate.add(key)
+    for key in sorted(keys_to_validate):
+        if not _valid_condition_param(order, key):
+            add(key)
     if order.scope != "instrument":
-        missing.append("scope:instrument")
+        add("scope:instrument")
     if _requires_reference_price(order) and order.reference_price is None:
-        missing.append("reference_price")
-    return missing
+        add("reference_price")
+    return invalid
 
 
 def _requires_reference_price(order: ConditionOrder) -> bool:
@@ -605,6 +648,71 @@ def _has_condition_param(order: ConditionOrder, key: str) -> bool:
         order.params.get(alias) is not None
         for alias in CONDITION_PARAM_ALIASES.get(key, ())
     )
+
+
+def _condition_param_value(order: ConditionOrder, key: str) -> Any:
+    value = order.params.get(key)
+    if value is not None:
+        return value
+    for alias in CONDITION_PARAM_ALIASES.get(key, ()):
+        value = order.params.get(alias)
+        if value is not None:
+            return value
+    return None
+
+
+def _valid_condition_param(order: ConditionOrder, key: str) -> bool:
+    value = _condition_param_value(order, key)
+    if key in {"stop_loss_pct", "trail_pct"}:
+        return _finite_float_in_range(value, lower=0, upper=1)
+    if key in {
+        "take_profit_pct",
+        "activation_profit_pct",
+        "activation_price",
+        "atr_multiple",
+        "std_multiple",
+        "lambda",
+        "hv_annualization",
+    }:
+        return _finite_float_gt(value, 0)
+    if key in {"atr_window", "hv_window", "std_window"}:
+        return _positive_int(value)
+    if key == "bar_interval":
+        return isinstance(value, str) and bool(value.strip())
+    return True
+
+
+def _finite_float_gt(value: Any, lower: float) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > lower
+
+
+def _finite_float_in_range(value: Any, lower: float, upper: float) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and lower < number < upper
+
+
+def _positive_int(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return False
+        try:
+            parsed = int(stripped)
+        except ValueError:
+            return False
+        return stripped == str(parsed) and parsed > 0
+    return False
 
 
 def _param(order: ConditionOrder, primary: str, fallback: str) -> float:

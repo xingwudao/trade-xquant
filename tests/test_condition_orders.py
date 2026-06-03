@@ -145,6 +145,35 @@ def test_extract_condition_orders_from_task_constraints() -> None:
     assert orders[0].status == "armed"
 
 
+def test_extract_condition_orders_requires_explicit_action() -> None:
+    task = RebalanceTask.model_validate(
+        {
+            "task_id": "task-missing-action",
+            "portfolio_id": "prod",
+            "account_id": "acct",
+            "mode": "dry_run",
+            "created_at": "2026-06-03T09:35:00+08:00",
+            "expires_at": None,
+            "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+            "constraints": {
+                "condition_orders": [
+                    {
+                        "condition_id": "cond-missing-action",
+                        "symbol": "513100.SH",
+                        "purpose": "take_profit",
+                        "method": "static_pct",
+                        "reference_price": 1.0,
+                        "params": {"take_profit_pct": 0.1},
+                    }
+                ]
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="action"):
+        extract_condition_orders(task)
+
+
 def test_storage_persists_active_condition_orders(tmp_path) -> None:
     storage = Storage(tmp_path / "audit.db")
     storage.initialize()
@@ -1006,12 +1035,17 @@ def test_malformed_indicator_params_do_not_block_later_condition(tmp_path) -> No
     )
 
     assert [plan.order.condition_id for plan in plans] == ["cond-static"]
-    payload = condition_event_payload(storage, "cond-atr-malformed")
-    assert payload["method"] == "atr_trailing"
-    assert "int() argument" in payload["reason"]
+    reason = (
+        "condition cond-atr-malformed missing/invalid condition params: "
+        "atr_window"
+    )
+    assert condition_event_payload(storage, "cond-atr-malformed") == {
+        "method": "atr_trailing",
+        "reason": reason,
+    }
     state = storage.get_condition_market_state("cond-atr-malformed")
     assert state is not None
-    assert "int() argument" in state["state"]["evaluation_error"]
+    assert state["state"]["evaluation_error"] == reason
 
 
 def test_unwired_bar_provider_does_not_block_later_condition(tmp_path) -> None:
@@ -1160,6 +1194,64 @@ def test_invalid_latest_price_records_error_state_and_continues(
     assert state["state"]["evaluation_error"] == reason
 
 
+def test_invalid_stored_take_profit_param_records_error_and_continues(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-negative-take-profit",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": -0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static-second",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position(), second_position()],
+        prices={"513100.SH": 0.95, "159915.SZ": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
+    assert storage.get_condition_order("cond-negative-take-profit").status == "armed"
+    reason = (
+        "condition cond-negative-take-profit missing/invalid condition params: "
+        "take_profit_pct"
+    )
+    assert condition_event_payload(storage, "cond-negative-take-profit") == {
+        "method": "static_pct",
+        "reason": reason,
+    }
+    state = storage.get_condition_market_state("cond-negative-take-profit")
+    assert state is not None
+    assert state["trigger_price"] is None
+    assert state["state"]["evaluation_error"] == reason
+
+
 def test_extract_condition_orders_rejects_missing_required_params() -> None:
     task = RebalanceTask.model_validate(
         {
@@ -1179,6 +1271,7 @@ def test_extract_condition_orders_rejects_missing_required_params() -> None:
                         "method": "trailing_pct",
                         "reference_price": 1.0,
                         "params": {},
+                        "action": {"type": "sell_pct", "pct": 1.0},
                     }
                 ]
             },
@@ -1187,7 +1280,7 @@ def test_extract_condition_orders_rejects_missing_required_params() -> None:
 
     with pytest.raises(
         ValueError,
-        match="condition cond-missing missing condition params: trail_pct",
+        match="condition cond-missing missing/invalid condition params: trail_pct",
     ):
         extract_condition_orders(task)
 

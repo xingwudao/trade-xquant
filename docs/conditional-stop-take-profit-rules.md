@@ -57,6 +57,12 @@ Current MVP implementation:
 - Local SQLite condition state and audit storage.
 - Xquant condition-result audit reporting.
 
+Bar-based `atr_trailing`, `hv_log_trailing`, and `std_trailing` rules are
+implemented and testable through the engine and mock adapter. The real `qmt`
+adapter does not yet provide historical price bars. In production QMT mode,
+bar-based rules will record per-order evaluation errors until QMT historical
+bars are wired.
+
 Future implementation may add:
 - Portfolio-scope rules.
 - Portfolio-level liquidation or partial de-risk actions.
@@ -129,10 +135,8 @@ Recommended normalized fields:
   "symbol": "string for instrument scope",
   "reference_price": "number supplied by Xquant when scope is instrument",
   "reference_wealth": "number supplied by Xquant when scope is portfolio",
-  "high_water_price": "optional number supplied by Xquant or maintained locally",
-  "high_water_wealth": "optional number supplied by Xquant or maintained locally",
-  "params": {},
-  "action": {},
+  "params": {"hyperparameters": "numbers or strings required by the method"},
+  "action": {"type": "sell_pct", "pct": 1.0},
   "enabled": true
 }
 ```
@@ -140,9 +144,17 @@ Recommended normalized fields:
 Implementation notes:
 - JSON examples use strings above only to document shape.
 - Real task payloads must use typed values.
-- The gateway must reject rules whose required numeric parameters are missing.
-- If both Xquant and the gateway maintain high-water state, reconciliation
-  rules must be explicit before production use.
+- Xquant task payloads contain only hyperparameters, reference values, and the
+  explicit action.
+- The gateway owns runtime state in the current MVP: high-water values,
+  activation state, indicator snapshots, trigger evidence, and execution audit
+  payloads are stored in SQLite and condition audit reports.
+- The gateway must reject rules whose required parameters are missing,
+  malformed, or outside safe ranges.
+- `action.type` is required.
+- `sell_pct` requires `action.pct`, and `0 < pct <= 1`.
+- `clear` may omit `action.pct` because the action type already means full
+  clear of the sellable target position.
 
 ## Actions
 
@@ -214,13 +226,12 @@ Required task data:
 - `purpose: "stop_loss"`.
 - `method: "trailing_pct"`.
 - `reference_price`.
-- `high_water_price`, or permission for gateway-local high-water tracking.
 - `params.trail_pct`.
 
 Trigger line:
 
 ```text
-high_water_price = max(existing_high_water_price, P_t)
+high_water_price = max(gateway_stored_high_water_price, reference_price, P_t)
 trigger_price = high_water_price * (1 - params.trail_pct)
 ```
 
@@ -237,10 +248,10 @@ Applicable scenarios:
 Risks:
 - Tight parameters may exit during normal pullbacks.
 - If activated from entry, it can still close at a loss.
-- Local high-water tracking can diverge from Xquant if data sources differ.
+- Gateway high-water tracking can diverge from Xquant research assumptions if
+  market data sources differ.
 
 Validation requirements:
-- Define whether Xquant or gateway owns high-water state.
 - Backtest with slippage, fees, gaps, and symbol liquidity.
 - Validate repeated trigger prevention and idempotency.
 
@@ -253,10 +264,9 @@ Required task data:
 - `scope: "instrument"`.
 - `purpose: "stop_loss"`.
 - `method: "atr_trailing"`.
-- `high_water_price`.
 - `params.atr_window`.
 - `params.atr_multiple`.
-- `params.atr_smoothing`, if smoothing behavior is not fixed by Xquant.
+- `params.bar_interval`.
 
 True range:
 
@@ -311,10 +321,10 @@ Required task data:
 - `scope: "instrument"`.
 - `purpose: "stop_loss"`.
 - `method: "hv_log_trailing"`.
-- `high_water_price`.
 - `params.hv_window`.
 - `params.hv_annualization`.
 - `params.lambda`.
+- `params.bar_interval`.
 
 Trigger line:
 
@@ -350,9 +360,9 @@ Required task data:
 - `scope: "instrument"`.
 - `purpose: "stop_loss"`.
 - `method: "std_trailing"`.
-- `high_water_price`.
 - `params.std_window`.
 - `params.std_multiple`.
+- `params.bar_interval`.
 
 Trigger line:
 
@@ -428,13 +438,12 @@ Required task data:
 - `purpose: "stop_loss"`.
 - `method: "trailing_pct"`.
 - `reference_wealth`.
-- `high_water_wealth`, or permission for gateway-local tracking.
 - `params.trail_pct`.
 
 Trigger line:
 
 ```text
-high_water_wealth = max(existing_high_water_wealth, W_t)
+high_water_wealth = max(gateway_stored_high_water_wealth, reference_wealth, W_t)
 trigger_wealth = high_water_wealth * (1 - params.trail_pct)
 ```
 
@@ -453,7 +462,6 @@ Risks:
 - Local portfolio valuation can diverge from Xquant.
 
 Validation requirements:
-- Define ownership of high-water wealth state.
 - Define action granularity: partial de-risk, full liquidation, or target reset.
 
 ### Portfolio ATR, HV, And Standard-Deviation Stop-Loss
@@ -533,16 +541,14 @@ Required task data:
 - `purpose: "take_profit"`.
 - `method: "trailing_pct"`.
 - `reference_price`.
-- `high_water_price`, or permission for gateway-local tracking.
 - `params.trail_pct`.
-- One activation gate:
-  `params.activation_profit_pct`, `params.activation_price`, or an explicit
-  Xquant-side activation state.
+- One activation gate: `params.activation_profit_pct` or
+  `params.activation_price`.
 
 Trigger line after activation:
 
 ```text
-high_water_price = max(existing_high_water_price, P_t)
+high_water_price = max(gateway_stored_high_water_price, reference_price, P_t)
 trigger_price = high_water_price * (1 - params.trail_pct)
 ```
 
@@ -588,9 +594,13 @@ trigger_price = high_water_price - params.std_multiple * sigma_P_t
 ```
 
 Required task data follows the same parameter model:
-- Activation gate.
-- High-water state.
+- Activation gate supplied as a hyperparameter.
 - Method-specific volatility parameters.
+- `params.bar_interval`.
+
+Gateway runtime state stores activation, high-water, indicator snapshots, and
+trigger evidence. These fields are not parsed from current Xquant task
+payloads.
 
 Applicable scenarios:
 - Trend strategies.
@@ -645,8 +655,7 @@ Required task data:
 - `method: "trailing_pct"`, `atr_trailing`, `hv_log_trailing`, or
   `std_trailing`.
 - `reference_wealth`.
-- `high_water_wealth`, or permission for gateway-local tracking.
-- Activation gate.
+- Activation gate supplied as a hyperparameter.
 - Method-specific parameters.
 
 Trigger families:
@@ -815,8 +824,11 @@ For trade-xquant:
 - Implement only methods explicitly supported by code.
 - Unsupported methods must fail closed with a clear error.
 - All numeric trading thresholds must come from the task payload.
-- The gateway can maintain runtime state, such as high-water price, only when
-  the task contract allows it.
+- The gateway owns condition runtime state in the current MVP.
+- High-water values, activation state, indicator snapshots, trigger evidence,
+  and execution audit payloads are SQLite/audit data, not Xquant task inputs.
+- Real QMT historical bars are not wired yet. Bar-based ATR/HV/std methods are
+  currently production-blocked in real QMT mode by per-order evaluation errors.
 - Condition-triggered execution must report the triggering rule, the Xquant
   hyperparameter snapshot, the gateway market-derived state snapshot, and the
   execution result back to Xquant for audit.
@@ -827,6 +839,9 @@ For Xquant:
 
 - Determine parameter values by research and backtesting.
 - Send concrete values in each trading task.
+- Send explicit actions. `sell_pct` must include a safe `pct`; `clear` may
+  omit `pct`.
 - Own portfolio-level policy decisions and account-level priority rules.
-- Decide whether high-water state is owned by Xquant or delegated to the
-  gateway.
+- Treat high-water, activation state, indicator snapshots, trigger evidence,
+  and execution audit as gateway runtime/audit outputs in the current task
+  contract.

@@ -11,7 +11,7 @@ from trade_xquant.daemon import GatewayService
 from trade_xquant.models import AccountSnapshot, PlannedOrder, Position
 
 
-def settings_for(tmp_path, task_file=None) -> Settings:
+def settings_for(tmp_path, task_file=None, risk: RiskConfig | None = None) -> Settings:
     return Settings(
         xquant=XquantConfig(base_url="http://xquant/api/v1"),
         qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
@@ -25,7 +25,7 @@ def settings_for(tmp_path, task_file=None) -> Settings:
             log_path=str(tmp_path / "gateway.jsonl"),
             local_task_file=str(task_file) if task_file else None,
         ),
-        risk=RiskConfig(),
+        risk=risk or RiskConfig(),
     )
 
 
@@ -245,6 +245,7 @@ def test_gateway_poll_once_validates_condition_orders_before_execution(tmp_path)
                                     "method": "trailing_pct",
                                     "reference_price": 1.0,
                                     "params": {},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
                                 }
                             ]
                         },
@@ -263,6 +264,49 @@ def test_gateway_poll_once_validates_condition_orders_before_execution(tmp_path)
     assert "cond-invalid" in str(result[0]["error"])
     assert "trail_pct" in str(result[0]["error"])
     assert service.qmt.submitted_orders == []
+
+
+def test_gateway_poll_once_rejects_condition_without_action_before_arming(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-missing-action",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "condition_id": "cond-missing-action",
+                                    "symbol": "513100.SH",
+                                    "purpose": "take_profit",
+                                    "method": "static_pct",
+                                    "reference_price": 1.0,
+                                    "params": {"take_profit_pct": 0.1},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result[0]["task_id"] == "task-missing-action"
+    assert result[0]["status"] == "failed"
+    assert "cond-missing-action" in str(result[0]["error"])
+    assert "action" in str(result[0]["error"])
+    assert service.storage.list_active_condition_orders() == []
 
 
 def test_gateway_local_condition_audit_skips_xquant_report(tmp_path) -> None:
@@ -506,6 +550,68 @@ def test_gateway_xquant_audit_failure_does_not_repeat_trade(tmp_path) -> None:
     assert stored["xquant_report_status"] == "failed"
     assert stored["xquant_report_error"] == "xquant audit failed"
     assert service.storage.get_condition_order("cond-audit-fail").status == "needs_reconcile"
+
+
+def test_gateway_risk_rejection_records_and_reports_condition_audit(tmp_path) -> None:
+    service = GatewayService(
+        settings_for(
+            tmp_path,
+            risk=RiskConfig(max_single_order_amount=100),
+        )
+    )
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-risk-reject",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker()
+    service.qmt = broker  # type: ignore[assignment]
+    audit = AuditXquant()
+    service.xquant = audit  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [
+        {
+            "condition_id": "cond-risk-reject",
+            "status": "failed",
+            "error": "single order amount exceeds threshold",
+        }
+    ]
+    assert broker.submitted_orders == []
+    assert audit.payloads[0][0] == "task-1"
+    assert audit.payloads[0][1] == "cond-risk-reject"
+    payload = audit.payloads[0][2]
+    assert payload["status"] == "failed"
+    assert payload["rule"]["params"]["take_profit_pct"] == 0.1
+    assert payload["market_state"]["latest_price"] == 1.1
+    assert payload["trigger"]["trigger_price"] == 1.1
+    assert payload["execution_result"]["status"] == "failed"
+    assert payload["execution_result"]["errors"] == [
+        "single order amount exceeds threshold"
+    ]
+    assert payload["execution_result"]["planned_orders"][0]["amount"] == 1100.0
+    stored = service.storage.get_condition_trigger_audit("condition:cond-risk-reject")
+    assert stored is not None
+    assert stored["xquant_report_status"] == "success"
+    assert stored["execution_result"]["status"] == "failed"
+    assert stored["execution_result"]["errors"] == [
+        "single order amount exceeds threshold"
+    ]
+    assert service.storage.get_condition_order("cond-risk-reject").status == "failed"
 
 
 class PositionBroker:

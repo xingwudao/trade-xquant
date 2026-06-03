@@ -182,6 +182,37 @@ class GatewayService:
             condition_id = triggered.order.condition_id
             try:
                 self.risk.validate(triggered.task, account, triggered.plan, now=now, known_symbols=set(prices))
+            except Exception as exc:  # noqa: BLE001 - risk-blocked triggers still need audit
+                logger.exception("condition order blocked by risk: %s", condition_id)
+                result = self._failed_condition_execution_result(
+                    triggered,
+                    str(exc),
+                    account,
+                    positions,
+                    prices,
+                    failure_stage="risk_validation",
+                )
+                self.storage.update_condition_order_status(condition_id, "failed")
+                self.storage.record_condition_event(
+                    condition_id,
+                    "failed",
+                    {"error": str(exc), "stage": "risk_validation"},
+                )
+                self.storage.record_condition_event(
+                    condition_id,
+                    "execution_result",
+                    {"status": result.status, "payload": result.model_dump(mode="json")},
+                )
+                self._record_and_report_condition_audit(triggered, result)
+                results.append(
+                    {
+                        "condition_id": condition_id,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+                continue
+            try:
                 self.storage.record_plan(triggered.plan)
                 self.storage.update_condition_order_status(condition_id, "submitting")
                 result = ExecutionEngine(self.qmt, self.settings.runtime).execute(
@@ -205,44 +236,7 @@ class GatewayService:
                     "execution_result",
                     {"status": result.status, "payload": result.model_dump(mode="json")},
                 )
-                audit_payload = self._condition_audit_payload(triggered, result)
-                self.storage.record_condition_trigger_audit(
-                    condition_id=condition_id,
-                    source_task_id=triggered.order.task_id,
-                    condition_task_id=triggered.task.task_id,
-                    symbol=triggered.order.symbol,
-                    purpose=triggered.order.purpose,
-                    method=triggered.order.method,
-                    rule=audit_payload["rule"],
-                    market_state=audit_payload["market_state"],
-                    trigger=audit_payload["trigger"],
-                    execution_result=result.model_dump(mode="json"),
-                )
-                if self.local_task_file is not None:
-                    self.storage.update_condition_audit_report_status(
-                        triggered.task.task_id,
-                        "skipped",
-                        "local_task_file",
-                    )
-                else:
-                    try:
-                        self.xquant.report_condition_result(
-                            triggered.order.task_id,
-                            condition_id,
-                            audit_payload,
-                        )
-                        self.storage.update_condition_audit_report_status(
-                            triggered.task.task_id,
-                            "success",
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("failed to report condition result to Xquant")
-                        self.storage.update_condition_audit_report_status(
-                            triggered.task.task_id,
-                            "failed",
-                            str(exc),
-                        )
-                        self.storage.update_condition_order_status(condition_id, "needs_reconcile")
+                self._record_and_report_condition_audit(triggered, result)
                 results.append(
                     {
                         "condition_id": condition_id,
@@ -255,6 +249,78 @@ class GatewayService:
                 self.storage.record_condition_event(condition_id, "failed", {"error": str(exc)})
                 results.append({"condition_id": condition_id, "status": "failed", "error": str(exc)})
         return results
+
+    def _failed_condition_execution_result(
+        self,
+        triggered: TriggeredConditionPlan,
+        error: str,
+        account: AccountSnapshot,
+        positions: list[Position],
+        prices: dict[str, float],
+        *,
+        failure_stage: str,
+    ) -> ExecutionResult:
+        result = ExecutionResult(
+            task_id=triggered.task.task_id,
+            status="failed",
+            mode=triggered.task.mode,
+            planned_orders=triggered.plan.orders,
+            errors=[error],
+            meta={"error": error, "failure_stage": failure_stage},
+        )
+        self._attach_current_account_snapshot(
+            result,
+            triggered.task,
+            fallback_account=account,
+            fallback_positions=positions,
+            fallback_prices=prices,
+        )
+        return result
+
+    def _record_and_report_condition_audit(
+        self,
+        triggered: TriggeredConditionPlan,
+        result: ExecutionResult,
+    ) -> None:
+        condition_id = triggered.order.condition_id
+        audit_payload = self._condition_audit_payload(triggered, result)
+        self.storage.record_condition_trigger_audit(
+            condition_id=condition_id,
+            source_task_id=triggered.order.task_id,
+            condition_task_id=triggered.task.task_id,
+            symbol=triggered.order.symbol,
+            purpose=triggered.order.purpose,
+            method=triggered.order.method,
+            rule=audit_payload["rule"],
+            market_state=audit_payload["market_state"],
+            trigger=audit_payload["trigger"],
+            execution_result=result.model_dump(mode="json"),
+        )
+        if self.local_task_file is not None:
+            self.storage.update_condition_audit_report_status(
+                triggered.task.task_id,
+                "skipped",
+                "local_task_file",
+            )
+            return
+        try:
+            self.xquant.report_condition_result(
+                triggered.order.task_id,
+                condition_id,
+                audit_payload,
+            )
+            self.storage.update_condition_audit_report_status(
+                triggered.task.task_id,
+                "success",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("failed to report condition result to Xquant")
+            self.storage.update_condition_audit_report_status(
+                triggered.task.task_id,
+                "failed",
+                str(exc),
+            )
+            self.storage.update_condition_order_status(condition_id, "needs_reconcile")
 
     def _condition_audit_payload(
         self,

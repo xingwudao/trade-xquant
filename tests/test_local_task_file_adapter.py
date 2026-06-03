@@ -78,6 +78,7 @@ def test_local_task_file_adapter_preserves_new_condition_methods(tmp_path) -> No
                                         "atr_multiple": 2.0,
                                         "bar_interval": "1d",
                                     },
+                                    "action": {"type": "sell_pct", "pct": 1.0},
                                 }
                             ],
                         },
