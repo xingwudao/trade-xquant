@@ -15,9 +15,11 @@ qmt:
 
 runtime:
   poll_interval_seconds: 30
+  condition_poll_interval_seconds: 3
   allow_real_order: false
   dry_run_default: true
   broker_adapter: "qmt"
+  local_task_file: null
   simulate_real_orders: false
   mock_submit_dry_run_orders: false
   mock_order_behavior: "filled"

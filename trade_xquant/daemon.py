@@ -3,11 +3,15 @@ from __future__ import annotations
 import logging
 import socket
 import time
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from trade_xquant import __version__
+from trade_xquant.condition_orders import ConditionEngine, extract_condition_orders
 from trade_xquant.config import Settings
 from trade_xquant.execution_engine import ExecutionEngine
+from trade_xquant.local_task_file import LocalTaskFileAdapter
 from trade_xquant.models import AccountSnapshot, ExecutionResult, Position, RebalanceTask
 from trade_xquant.mock_qmt_adapter import MockBrokerAdapter
 from trade_xquant.portfolio_engine import PortfolioEngine
@@ -46,6 +50,11 @@ class GatewayService:
             timeout_seconds=settings.xquant.timeout_seconds,
             trust_env=settings.xquant.trust_env,
         )
+        self.local_task_file = (
+            LocalTaskFileAdapter(settings.runtime.local_task_file)
+            if settings.runtime.local_task_file
+            else None
+        )
         if settings.runtime.broker_adapter == "mock":
             self.qmt = MockBrokerAdapter(
                 account_id=settings.qmt.account_id,
@@ -65,11 +74,16 @@ class GatewayService:
 
     def poll_once(self, force_dry_run: bool = False, task_id: str | None = None) -> list[dict[str, object]]:
         self.storage.initialize()
-        if self.settings.xquant.product_code:
-            logger.warning(
-                "xquant.product_code is ignored; poll_once uses trading-gateway tasks"
-            )
-        tasks = self.xquant.fetch_pending_tasks(self.settings.qmt.account_id)
+        using_local_task_file = self.local_task_file is not None
+        should_report_gateway = not using_local_task_file
+        if self.local_task_file is not None:
+            tasks = self.local_task_file.fetch_pending_tasks(self.settings.qmt.account_id)
+        else:
+            if self.settings.xquant.product_code:
+                logger.warning(
+                    "xquant.product_code is ignored; poll_once uses trading-gateway tasks"
+                )
+            tasks = self.xquant.fetch_pending_tasks(self.settings.qmt.account_id)
         if task_id:
             tasks = [task for task in tasks if task.task_id == task_id]
         results: list[dict[str, object]] = []
@@ -81,6 +95,9 @@ class GatewayService:
         account = self.qmt.get_account_snapshot()
         positions = self.qmt.get_positions()
         for task in tasks:
+            if self.storage.is_terminal_task(task.task_id):
+                logger.info("skip terminal task: %s", task.task_id)
+                continue
             if force_dry_run:
                 task.mode = "dry_run"
             prices: dict[str, float] = {}
@@ -90,7 +107,8 @@ class GatewayService:
                 plan = self.portfolio.build_plan(task, account, positions, prices)
                 self.risk.validate(task, account, plan, known_symbols=set(prices))
                 self.storage.record_plan(plan)
-                self.xquant.report_plan(task.task_id, plan.model_dump(mode="json"))
+                if should_report_gateway:
+                    self.xquant.report_plan(task.task_id, plan.model_dump(mode="json"))
                 result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
                 self._attach_current_account_snapshot(
                     result,
@@ -102,7 +120,10 @@ class GatewayService:
                 self.storage.record_execution_result(result)
                 status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
                 self.storage.mark_task_result(task.task_id, status, result.model_dump(mode="json"))
-                self.xquant.report_result(task.task_id, status, result)
+                if status in {"dry_run_success", "submitted"}:
+                    self._arm_condition_orders(task)
+                if should_report_gateway:
+                    self.xquant.report_result(task.task_id, status, result)
                 results.append({"task_id": task.task_id, "status": status})
             except Exception as exc:  # noqa: BLE001 - each task must be audited
                 logger.exception("task failed: %s", task.task_id)
@@ -123,26 +144,98 @@ class GatewayService:
                 )
                 payload = failure.model_dump(mode="json")
                 self.storage.mark_task_result(task.task_id, "failed", payload)
-                try:
-                    self.xquant.report_result(task.task_id, "failed", failure)
-                except Exception:
-                    logger.exception("failed to report task failure to Xquant")
+                if should_report_gateway:
+                    try:
+                        self.xquant.report_result(task.task_id, "failed", failure)
+                    except Exception:
+                        logger.exception("failed to report task failure to Xquant")
                 results.append({"task_id": task.task_id, "status": "failed", "error": str(exc)})
         return results
 
+    def condition_poll_once(self) -> list[dict[str, object]]:
+        self.storage.initialize()
+        active_orders = self.storage.list_active_condition_orders()
+        if not active_orders:
+            logger.info("no active condition orders")
+            return []
+
+        self.qmt.connect()
+        account = self.qmt.get_account_snapshot()
+        positions = self.qmt.get_positions()
+        symbols = sorted({order.symbol for order in active_orders} | {position.symbol for position in positions})
+        prices = self.qmt.get_prices(symbols)
+        now = datetime.now(ZoneInfo(self.settings.risk.timezone))
+        triggered_plans = ConditionEngine(self.storage).evaluate(account, positions, prices, now=now)
+        results: list[dict[str, object]] = []
+        for triggered in triggered_plans:
+            condition_id = triggered.order.condition_id
+            try:
+                self.risk.validate(triggered.task, account, triggered.plan, now=now, known_symbols=set(prices))
+                self.storage.record_plan(triggered.plan)
+                self.storage.update_condition_order_status(condition_id, "submitting")
+                result = ExecutionEngine(self.qmt, self.settings.runtime).execute(
+                    triggered.plan,
+                    triggered.task.mode,
+                )
+                self._attach_current_account_snapshot(
+                    result,
+                    triggered.task,
+                    fallback_account=account,
+                    fallback_positions=positions,
+                    fallback_prices=prices,
+                )
+                self.storage.record_execution_result(result)
+                if result.status in {"dry_run_success", "submitted"}:
+                    self.storage.update_condition_order_status(condition_id, "submitted")
+                else:
+                    self.storage.update_condition_order_status(condition_id, "failed")
+                self.storage.record_condition_event(
+                    condition_id,
+                    "execution_result",
+                    {"status": result.status, "payload": result.model_dump(mode="json")},
+                )
+                results.append(
+                    {
+                        "condition_id": condition_id,
+                        "status": result.status,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - each condition must be audited
+                logger.exception("condition order failed: %s", condition_id)
+                self.storage.update_condition_order_status(condition_id, "failed")
+                self.storage.record_condition_event(condition_id, "failed", {"error": str(exc)})
+                results.append({"condition_id": condition_id, "status": "failed", "error": str(exc)})
+        return results
+
     def run_forever(self) -> None:
+        next_task_poll = 0.0
+        next_condition_poll = 0.0
+        last_error: str | None = None
         while True:
-            last_error = None
-            try:
-                self.poll_once()
-            except Exception as exc:  # noqa: BLE001 - daemon must keep reporting liveness
-                logger.exception("poll loop failed")
-                last_error = str(exc)
-            try:
-                self.heartbeat_once(last_error=last_error)
-            except Exception:  # noqa: BLE001 - heartbeat failure must not stop polling
-                logger.exception("failed to report heartbeat to Xquant")
-            time.sleep(self.settings.runtime.poll_interval_seconds)
+            current = time.monotonic()
+            task_poll_due = current >= next_task_poll
+            if current >= next_task_poll:
+                try:
+                    self.poll_once()
+                except Exception as exc:  # noqa: BLE001 - daemon must keep reporting liveness
+                    logger.exception("poll loop failed")
+                    last_error = _append_error(last_error, str(exc))
+                next_task_poll = current + self.settings.runtime.poll_interval_seconds
+            if current >= next_condition_poll:
+                try:
+                    self.condition_poll_once()
+                except Exception as exc:  # noqa: BLE001 - condition failures must not stop polling
+                    logger.exception("condition poll loop failed")
+                    last_error = _append_error(last_error, str(exc))
+                next_condition_poll = current + self.settings.runtime.condition_poll_interval_seconds
+            if task_poll_due:
+                try:
+                    self.heartbeat_once(last_error=last_error)
+                    last_error = None
+                except Exception:  # noqa: BLE001 - heartbeat failure must not stop polling
+                    logger.exception("failed to report heartbeat to Xquant")
+            sleep_until = min(next_task_poll, next_condition_poll)
+            time.sleep(max(0.1, sleep_until - time.monotonic()))
 
     def heartbeat_once(self, last_error: str | None = None) -> dict[str, Any]:
         snapshot: dict[str, Any] | None = None
@@ -294,6 +387,18 @@ class GatewayService:
                 logger.exception("failed to query account prices during result sync")
                 result.meta["account_price_error"] = str(exc)
         attach_account_snapshot(result, account, positions, prices, task)
+
+    def _arm_condition_orders(self, task: RebalanceTask) -> None:
+        condition_orders = extract_condition_orders(task)
+        if not condition_orders:
+            return
+        self.storage.upsert_condition_orders(condition_orders)
+        for order in condition_orders:
+            self.storage.record_condition_event(
+                order.condition_id,
+                "armed",
+                {"task_id": task.task_id, "symbol": order.symbol, "method": order.method},
+            )
 
 
 def attach_account_snapshot(

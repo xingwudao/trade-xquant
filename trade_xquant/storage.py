@@ -9,6 +9,7 @@ from typing import Any, Iterator
 
 from pydantic import BaseModel
 
+from trade_xquant.condition_orders import ConditionAction, ConditionOrder
 from trade_xquant.models import ExecutionResult, OrderPlan, PlannedOrder, RebalanceTask, SubmittedOrder
 
 
@@ -89,6 +90,38 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS task_results (
                     task_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS condition_orders (
+                    condition_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    portfolio_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reference_price REAL,
+                    high_water_price REAL,
+                    trigger_price REAL,
+                    params_json TEXT NOT NULL,
+                    action_json TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    valid_from TEXT,
+                    expires_at TEXT,
+                    raw_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    triggered_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS condition_order_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    condition_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -186,6 +219,115 @@ class Storage:
                         now,
                     ),
                 )
+
+    def upsert_condition_orders(self, orders: list[ConditionOrder]) -> None:
+        now = utc_now()
+        with self._connection() as conn:
+            for order in orders:
+                conn.execute(
+                    """
+                    INSERT INTO condition_orders (
+                        condition_id, task_id, portfolio_id, account_id, mode,
+                        symbol, scope, purpose, method, side, status,
+                        reference_price, high_water_price, trigger_price,
+                        params_json, action_json, enabled, valid_from, expires_at,
+                        raw_json, created_at, updated_at, triggered_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(condition_id) DO UPDATE SET
+                        task_id=excluded.task_id,
+                        portfolio_id=excluded.portfolio_id,
+                        account_id=excluded.account_id,
+                        mode=excluded.mode,
+                        symbol=excluded.symbol,
+                        scope=excluded.scope,
+                        purpose=excluded.purpose,
+                        method=excluded.method,
+                        side=excluded.side,
+                        status=excluded.status,
+                        reference_price=excluded.reference_price,
+                        high_water_price=excluded.high_water_price,
+                        trigger_price=excluded.trigger_price,
+                        params_json=excluded.params_json,
+                        action_json=excluded.action_json,
+                        enabled=excluded.enabled,
+                        valid_from=excluded.valid_from,
+                        expires_at=excluded.expires_at,
+                        raw_json=excluded.raw_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    self._condition_order_params(order, now),
+                )
+
+    def list_active_condition_orders(self) -> list[ConditionOrder]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM condition_orders
+                WHERE enabled=1 AND status IN ('received', 'armed')
+                ORDER BY created_at, condition_id
+                """
+            ).fetchall()
+        return [self._condition_order_from_row(row) for row in rows]
+
+    def get_condition_order(self, condition_id: str) -> ConditionOrder:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM condition_orders WHERE condition_id=?",
+                (condition_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(condition_id)
+        return self._condition_order_from_row(row)
+
+    def update_condition_order_status(self, condition_id: str, status: str) -> None:
+        now = utc_now()
+        triggered_at = now if status == "triggered" else None
+        with self._connection() as conn:
+            if triggered_at:
+                conn.execute(
+                    """
+                    UPDATE condition_orders
+                    SET status=?, updated_at=?, triggered_at=?
+                    WHERE condition_id=?
+                    """,
+                    (status, now, triggered_at, condition_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE condition_orders
+                    SET status=?, updated_at=?
+                    WHERE condition_id=?
+                    """,
+                    (status, now, condition_id),
+                )
+
+    def update_condition_order_market_state(
+        self,
+        condition_id: str,
+        high_water_price: float | None,
+        trigger_price: float | None,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE condition_orders
+                SET high_water_price=?, trigger_price=?, updated_at=?
+                WHERE condition_id=?
+                """,
+                (high_water_price, trigger_price, utc_now(), condition_id),
+            )
+
+    def record_condition_event(self, condition_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO condition_order_events (
+                    condition_id, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (condition_id, event_type, json.dumps(payload, ensure_ascii=False), utc_now()),
+            )
 
     def record_order_event(
         self,
@@ -330,11 +472,15 @@ class Storage:
     def status_summary(self) -> dict[str, Any]:
         with self._connection() as conn:
             tasks = conn.execute("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status").fetchall()
+            conditions = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM condition_orders GROUP BY status"
+            ).fetchall()
             recent = conn.execute(
                 "SELECT task_id, status, updated_at FROM tasks ORDER BY updated_at DESC LIMIT 10"
             ).fetchall()
         return {
             "tasks_by_status": {row["status"]: row["count"] for row in tasks},
+            "condition_orders_by_status": {row["status"]: row["count"] for row in conditions},
             "recent_tasks": [dict(row) for row in recent],
         }
 
@@ -351,6 +497,57 @@ class Storage:
                 yield conn
         finally:
             conn.close()
+
+    def _condition_order_params(self, order: ConditionOrder, now: str) -> tuple[Any, ...]:
+        return (
+            order.condition_id,
+            order.task_id,
+            order.portfolio_id,
+            order.account_id,
+            order.mode,
+            order.symbol,
+            order.scope,
+            order.purpose,
+            order.method,
+            order.side,
+            order.status,
+            order.reference_price,
+            order.high_water_price,
+            order.trigger_price,
+            json.dumps(order.params, ensure_ascii=False),
+            order.action.model_dump_json(),
+            1 if order.enabled else 0,
+            order.valid_from.isoformat() if order.valid_from else None,
+            order.expires_at.isoformat() if order.expires_at else None,
+            json.dumps(order.raw, ensure_ascii=False),
+            now,
+            now,
+            None,
+        )
+
+    def _condition_order_from_row(self, row: sqlite3.Row) -> ConditionOrder:
+        return ConditionOrder(
+            condition_id=row["condition_id"],
+            task_id=row["task_id"],
+            portfolio_id=row["portfolio_id"],
+            account_id=row["account_id"],
+            mode=row["mode"],
+            symbol=row["symbol"],
+            scope=row["scope"],
+            purpose=row["purpose"],
+            method=row["method"],
+            side=row["side"],
+            status=row["status"],
+            reference_price=row["reference_price"],
+            high_water_price=row["high_water_price"],
+            trigger_price=row["trigger_price"],
+            params=json.loads(row["params_json"]),
+            action=ConditionAction.model_validate(json.loads(row["action_json"])),
+            enabled=bool(row["enabled"]),
+            valid_from=datetime.fromisoformat(row["valid_from"]) if row["valid_from"] else None,
+            expires_at=datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None,
+            raw=json.loads(row["raw_json"]),
+        )
 
 
 def utc_now() -> str:

@@ -30,9 +30,11 @@ class QmtConfig(BaseModel):
 
 class RuntimeConfig(BaseModel):
     poll_interval_seconds: int = 30
+    condition_poll_interval_seconds: int = 3
     allow_real_order: bool = False
     dry_run_default: bool = True
     broker_adapter: str = "qmt"
+    local_task_file: str | None = None
     simulate_real_orders: bool = False
     mock_submit_dry_run_orders: bool = False
     mock_order_behavior: str = "filled"
