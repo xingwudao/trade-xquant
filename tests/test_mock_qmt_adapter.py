@@ -194,6 +194,18 @@ def test_mock_qmt_non_positive_price_bar_window_raises_value_error() -> None:
         adapter.get_price_bars("513100.SS", interval="1d", window=0)
 
 
+def test_mock_qmt_non_positive_price_bar_window_validates_before_lookup() -> None:
+    adapter = MockBrokerAdapter(
+        account_id="acct",
+        total_asset=100_000,
+        cash=100_000,
+        prices={"513100.SH": 1.05},
+    )
+
+    with pytest.raises(ValueError, match="window must be positive"):
+        adapter.get_price_bars("513100.SS", interval="1d", window=0)
+
+
 def test_mock_qmt_returns_latest_window_and_normalizes_bar_symbols() -> None:
     tz = ZoneInfo("Asia/Shanghai")
     bars = [
@@ -231,3 +243,80 @@ def test_mock_qmt_returns_latest_window_and_normalizes_bar_symbols() -> None:
 
     assert [bar.close for bar in result] == [1.18, 1.24]
     assert [bar.symbol for bar in result] == ["513100.SH", "513100.SH"]
+
+
+def test_mock_qmt_returned_price_bars_do_not_mutate_mock_state() -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    bars = [
+        PriceBar(
+            symbol="513100.SH",
+            high=1.1,
+            low=1.0,
+            close=1.05,
+            timestamp=datetime(2026, 6, 1, tzinfo=tz),
+        ),
+        PriceBar(
+            symbol="513100.SH",
+            high=1.2,
+            low=1.05,
+            close=1.18,
+            timestamp=datetime(2026, 6, 2, tzinfo=tz),
+        ),
+    ]
+    adapter = MockBrokerAdapter(
+        account_id="acct",
+        total_asset=100_000,
+        cash=100_000,
+        prices={"513100.SH": 1.18},
+        price_bars={"513100.SH": {"1d": bars}},
+    )
+
+    result = adapter.get_price_bars("513100.SS", interval="1d", window=2)
+    result[0].close = 1.09
+
+    fresh_result = adapter.get_price_bars("513100.SS", interval="1d", window=2)
+
+    assert [bar.close for bar in fresh_result] == [1.05, 1.18]
+    assert fresh_result[0] is not result[0]
+
+
+def test_mock_qmt_input_price_bars_do_not_mutate_mock_state() -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    bars = [
+        PriceBar(
+            symbol="513100.SH",
+            high=1.1,
+            low=1.0,
+            close=1.05,
+            timestamp=datetime(2026, 6, 1, tzinfo=tz),
+        ),
+        PriceBar(
+            symbol="513100.SH",
+            high=1.2,
+            low=1.05,
+            close=1.18,
+            timestamp=datetime(2026, 6, 2, tzinfo=tz),
+        ),
+    ]
+    adapter = MockBrokerAdapter(
+        account_id="acct",
+        total_asset=100_000,
+        cash=100_000,
+        prices={"513100.SH": 1.18},
+        price_bars={"513100.SH": {"1d": bars}},
+    )
+
+    bars[0].close = 1.09
+    bars.append(
+        PriceBar(
+            symbol="513100.SH",
+            high=1.3,
+            low=1.15,
+            close=1.24,
+            timestamp=datetime(2026, 6, 3, tzinfo=tz),
+        )
+    )
+
+    result = adapter.get_price_bars("513100.SS", interval="1d", window=2)
+
+    assert [bar.close for bar in result] == [1.05, 1.18]

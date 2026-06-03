@@ -24,7 +24,10 @@ class MockBrokerAdapter:
         self.cash = cash
         self.prices = {normalize_symbol(symbol): price for symbol, price in prices.items()}
         self.price_bars = {
-            normalize_symbol(symbol): intervals
+            normalize_symbol(symbol): {
+                interval: [bar.model_copy(deep=True) for bar in bars]
+                for interval, bars in intervals.items()
+            }
             for symbol, intervals in (price_bars or {}).items()
         }
         self.order_behavior = order_behavior
@@ -60,18 +63,18 @@ class MockBrokerAdapter:
         return {normalize_symbol(symbol): self.prices[normalize_symbol(symbol)] for symbol in symbols}
 
     def get_price_bars(self, symbol: str, interval: str, window: int) -> list[PriceBar]:
+        if window <= 0:
+            raise ValueError("window must be positive")
         normalized = normalize_symbol(symbol)
         bars = self.price_bars.get(normalized, {}).get(interval)
         if bars is None:
             raise RuntimeError(f"mock bars missing for {normalized} interval {interval}")
-        if window <= 0:
-            raise ValueError("window must be positive")
         if len(bars) < window:
             raise RuntimeError(
                 f"mock bars insufficient for {normalized}: "
                 f"need {window}, got {len(bars)}"
             )
-        return bars[-window:]
+        return [bar.model_copy(deep=True) for bar in bars[-window:]]
 
     def place_order(self, order: PlannedOrder) -> dict[str, object]:
         local_order_id = str(len(self.submitted_orders) + 1)
