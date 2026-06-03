@@ -125,6 +125,37 @@ class Storage:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS condition_market_states (
+                    condition_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    latest_price REAL,
+                    high_water_price REAL,
+                    trigger_price REAL,
+                    activated INTEGER NOT NULL,
+                    activated_at TEXT,
+                    atr_value REAL,
+                    hv_value REAL,
+                    std_value REAL,
+                    computed_at TEXT NOT NULL,
+                    market_data_source TEXT NOT NULL,
+                    state_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS condition_trigger_audits (
+                    condition_task_id TEXT PRIMARY KEY,
+                    condition_id TEXT NOT NULL,
+                    source_task_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    rule_json TEXT NOT NULL,
+                    market_state_json TEXT NOT NULL,
+                    trigger_json TEXT NOT NULL,
+                    execution_result_json TEXT NOT NULL,
+                    xquant_report_status TEXT NOT NULL,
+                    xquant_report_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -328,6 +359,153 @@ class Storage:
                 """,
                 (condition_id, event_type, json.dumps(payload, ensure_ascii=False), utc_now()),
             )
+
+    def record_condition_market_state(
+        self,
+        *,
+        condition_id: str,
+        symbol: str,
+        latest_price: float | None,
+        high_water_price: float | None,
+        trigger_price: float | None,
+        activated: bool,
+        activated_at: str | None,
+        atr_value: float | None,
+        hv_value: float | None,
+        std_value: float | None,
+        computed_at: str,
+        market_data_source: str,
+        state: dict[str, Any],
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO condition_market_states (
+                    condition_id, symbol, latest_price, high_water_price,
+                    trigger_price, activated, activated_at, atr_value,
+                    hv_value, std_value, computed_at, market_data_source,
+                    state_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(condition_id) DO UPDATE SET
+                    symbol=excluded.symbol,
+                    latest_price=excluded.latest_price,
+                    high_water_price=excluded.high_water_price,
+                    trigger_price=excluded.trigger_price,
+                    activated=excluded.activated,
+                    activated_at=excluded.activated_at,
+                    atr_value=excluded.atr_value,
+                    hv_value=excluded.hv_value,
+                    std_value=excluded.std_value,
+                    computed_at=excluded.computed_at,
+                    market_data_source=excluded.market_data_source,
+                    state_json=excluded.state_json
+                """,
+                (
+                    condition_id,
+                    symbol,
+                    latest_price,
+                    high_water_price,
+                    trigger_price,
+                    1 if activated else 0,
+                    activated_at,
+                    atr_value,
+                    hv_value,
+                    std_value,
+                    computed_at,
+                    market_data_source,
+                    json.dumps(state, ensure_ascii=False),
+                ),
+            )
+
+    def get_condition_market_state(self, condition_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM condition_market_states WHERE condition_id=?",
+                (condition_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["activated"] = bool(result["activated"])
+        result["state"] = json.loads(result.pop("state_json"))
+        return result
+
+    def record_condition_trigger_audit(
+        self,
+        *,
+        condition_id: str,
+        source_task_id: str,
+        condition_task_id: str,
+        symbol: str,
+        purpose: str,
+        method: str,
+        rule: dict[str, Any],
+        market_state: dict[str, Any],
+        trigger: dict[str, Any],
+        execution_result: dict[str, Any],
+    ) -> None:
+        now = utc_now()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO condition_trigger_audits (
+                    condition_task_id, condition_id, source_task_id, symbol,
+                    purpose, method, rule_json, market_state_json,
+                    trigger_json, execution_result_json, xquant_report_status,
+                    xquant_report_error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(condition_task_id) DO UPDATE SET
+                    execution_result_json=excluded.execution_result_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    condition_task_id,
+                    condition_id,
+                    source_task_id,
+                    symbol,
+                    purpose,
+                    method,
+                    json.dumps(rule, ensure_ascii=False),
+                    json.dumps(market_state, ensure_ascii=False),
+                    json.dumps(trigger, ensure_ascii=False),
+                    json.dumps(execution_result, ensure_ascii=False),
+                    "pending",
+                    None,
+                    now,
+                    now,
+                ),
+            )
+
+    def update_condition_audit_report_status(
+        self,
+        condition_task_id: str,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE condition_trigger_audits
+                SET xquant_report_status=?, xquant_report_error=?, updated_at=?
+                WHERE condition_task_id=?
+                """,
+                (status, error, utc_now(), condition_task_id),
+            )
+
+    def get_condition_trigger_audit(self, condition_task_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM condition_trigger_audits WHERE condition_task_id=?",
+                (condition_task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["rule"] = json.loads(result.pop("rule_json"))
+        result["market_state"] = json.loads(result.pop("market_state_json"))
+        result["trigger"] = json.loads(result.pop("trigger_json"))
+        result["execution_result"] = json.loads(result.pop("execution_result_json"))
+        return result
 
     def record_order_event(
         self,
