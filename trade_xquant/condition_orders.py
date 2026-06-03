@@ -19,7 +19,13 @@ from trade_xquant.models import (
 
 ConditionScope = Literal["instrument", "portfolio"]
 ConditionPurpose = Literal["stop_loss", "take_profit"]
-ConditionMethod = Literal["static_pct", "trailing_pct"]
+ConditionMethod = Literal[
+    "static_pct",
+    "trailing_pct",
+    "atr_trailing",
+    "hv_log_trailing",
+    "std_trailing",
+]
 ConditionStatus = Literal[
     "received",
     "armed",
@@ -230,6 +236,42 @@ def extract_condition_orders(task: RebalanceTask) -> list[ConditionOrder]:
             )
         )
     return orders
+
+
+def required_condition_params(order: ConditionOrder) -> set[str]:
+    if order.method == "static_pct" and order.purpose == "stop_loss":
+        return {"stop_loss_pct"}
+    if order.method == "static_pct" and order.purpose == "take_profit":
+        return {"take_profit_pct"}
+    if order.method == "trailing_pct":
+        required = {"trail_pct"}
+    elif order.method == "atr_trailing":
+        required = {"atr_window", "atr_multiple", "bar_interval"}
+    elif order.method == "hv_log_trailing":
+        required = {"hv_window", "hv_annualization", "lambda", "bar_interval"}
+    elif order.method == "std_trailing":
+        required = {"std_window", "std_multiple", "bar_interval"}
+    else:
+        return set()
+    if order.purpose == "take_profit":
+        required.add("activation_profit_pct|activation_price")
+    return required
+
+
+def validate_condition_hyperparameters(order: ConditionOrder) -> list[str]:
+    missing: list[str] = []
+    for key in sorted(required_condition_params(order)):
+        if "|" in key:
+            alternatives = key.split("|")
+            if not any(order.params.get(name) is not None for name in alternatives):
+                missing.append(key)
+        elif order.params.get(key) is None:
+            missing.append(key)
+    if order.scope != "instrument":
+        missing.append("scope:instrument")
+    if order.reference_price is None:
+        missing.append("reference_price")
+    return missing
 
 
 def _param(order: ConditionOrder, primary: str, fallback: str) -> float:
