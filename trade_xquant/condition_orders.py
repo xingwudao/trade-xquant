@@ -117,6 +117,7 @@ class ConditionEngine:
             if order.valid_from is not None and order.valid_from > now:
                 continue
 
+            latest_price: float | None = None
             try:
                 latest_price = self._latest_price(order, normalized_prices)
                 missing = validate_condition_hyperparameters(order)
@@ -125,10 +126,12 @@ class ConditionEngine:
                     raise ValueError(
                         f"condition {order.condition_id} missing condition params: "
                         f"{missing_keys}"
-                    )
+                )
                 evaluated, market_state = self._with_market_state(order, latest_price, now)
             except ValueError as exc:
-                self._record_evaluation_error(order, str(exc))
+                reason = str(exc)
+                self._record_error_market_state(order, latest_price, reason, now)
+                self._record_evaluation_error(order, reason)
                 continue
             self.storage.update_condition_order_market_state(
                 evaluated.condition_id,
@@ -254,8 +257,6 @@ class ConditionEngine:
 
         activation_price = self._activation_price(order)
         if activation_price is None:
-            if order.method == "trailing_pct":
-                return True, None, None
             raise ValueError(
                 f"condition {order.condition_id} missing "
                 "activation_profit_pct|activation_price"
@@ -379,11 +380,6 @@ class ConditionEngine:
         market_state: dict[str, Any],
         now: datetime,
     ) -> None:
-        market_data_source = (
-            type(self.market_data).__name__
-            if order.method in BAR_CONDITION_METHODS and self.market_data is not None
-            else "prices"
-        )
         self.storage.record_condition_market_state(
             condition_id=order.condition_id,
             symbol=order.symbol,
@@ -396,7 +392,7 @@ class ConditionEngine:
             hv_value=market_state["hv_value"],
             std_value=market_state["std_value"],
             computed_at=now.isoformat(),
-            market_data_source=market_data_source,
+            market_data_source=self._market_data_source(order),
             state={
                 "method": order.method,
                 "purpose": order.purpose,
@@ -404,6 +400,40 @@ class ConditionEngine:
                 "activation_price": market_state["activation_price"],
             },
         )
+
+    def _record_error_market_state(
+        self,
+        order: ConditionOrder,
+        latest_price: float | None,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        stored = self.storage.get_condition_market_state(order.condition_id) or {}
+        self.storage.record_condition_market_state(
+            condition_id=order.condition_id,
+            symbol=order.symbol,
+            latest_price=latest_price,
+            high_water_price=stored.get("high_water_price") or order.high_water_price,
+            trigger_price=stored.get("trigger_price") or order.trigger_price,
+            activated=bool(stored.get("activated", False)),
+            activated_at=stored.get("activated_at"),
+            atr_value=None,
+            hv_value=None,
+            std_value=None,
+            computed_at=now.isoformat(),
+            market_data_source=self._market_data_source(order),
+            state={
+                "method": order.method,
+                "purpose": order.purpose,
+                "params": order.params,
+                "evaluation_error": reason,
+            },
+        )
+
+    def _market_data_source(self, order: ConditionOrder) -> str:
+        if order.method in BAR_CONDITION_METHODS and self.market_data is not None:
+            return type(self.market_data).__name__
+        return "prices"
 
     def _record_evaluation_error(self, order: ConditionOrder, reason: str) -> None:
         self.storage.record_condition_event(
@@ -527,7 +557,7 @@ def required_condition_params(order: ConditionOrder) -> set[str]:
         required = {"std_window", "std_multiple", "bar_interval"}
     else:
         return set()
-    if order.purpose == "take_profit" and order.method in BAR_CONDITION_METHODS:
+    if order.purpose == "take_profit" and order.method in TRAILING_CONDITION_METHODS:
         required.add("activation_profit_pct|activation_price")
     return required
 

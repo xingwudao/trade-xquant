@@ -97,19 +97,20 @@ def test_all_single_instrument_methods_parse() -> None:
 def test_required_condition_params_are_method_and_purpose_specific() -> None:
     order = condition("trailing_pct", "take_profit", {"trail_pct": 0.08})
 
-    assert required_condition_params(order) == {"trail_pct"}
-    assert validate_condition_hyperparameters(order) == []
+    assert required_condition_params(order) == {
+        "activation_profit_pct|activation_price",
+        "trail_pct",
+    }
+    assert validate_condition_hyperparameters(order) == [
+        "activation_profit_pct|activation_price"
+    ]
 
 
-def test_trailing_pct_legacy_shapes_do_not_require_reference_or_activation() -> None:
+def test_trailing_pct_stop_loss_legacy_shape_does_not_require_reference() -> None:
     stop_loss = condition("trailing_pct", "stop_loss", {"trail_pct": 0.08})
-    take_profit = condition("trailing_pct", "take_profit", {"trail_pct": 0.08})
 
     assert validate_condition_hyperparameters(
         stop_loss.model_copy(update={"reference_price": None})
-    ) == []
-    assert validate_condition_hyperparameters(
-        take_profit.model_copy(update={"reference_price": None})
     ) == []
 
 
@@ -123,6 +124,18 @@ def test_trailing_pct_take_profit_activation_pct_requires_reference_price() -> N
     assert validate_condition_hyperparameters(
         order.model_copy(update={"reference_price": None})
     ) == ["reference_price"]
+
+
+def test_trailing_pct_take_profit_activation_price_does_not_require_reference() -> None:
+    order = condition(
+        "trailing_pct",
+        "take_profit",
+        {"trail_pct": 0.08, "activation_price": 1.2},
+    )
+
+    assert validate_condition_hyperparameters(
+        order.model_copy(update={"reference_price": None})
+    ) == []
 
 
 def test_legacy_pct_alias_satisfies_static_and_trailing_validation() -> None:

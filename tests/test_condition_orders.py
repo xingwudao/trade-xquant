@@ -86,6 +86,21 @@ def second_position() -> Position:
     )
 
 
+def condition_event_payload(storage: Storage, condition_id: str) -> dict[str, object]:
+    with closing(storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id
+            """,
+            (condition_id,),
+        ).fetchone()
+    assert row["event_type"] == "evaluation_error"
+    return json.loads(row["payload_json"])
+
+
 def task_with_conditions() -> RebalanceTask:
     return RebalanceTask.model_validate(
         {
@@ -687,21 +702,14 @@ def test_indicator_method_requires_market_data_without_trailing_fallback(
     )
 
     assert plans == []
-    with closing(storage._connect()) as conn:
-        row = conn.execute(
-            """
-            SELECT event_type, payload_json
-            FROM condition_order_events
-            WHERE condition_id=?
-            ORDER BY id
-            """,
-            (f"cond-{method}",),
-        ).fetchone()
-    assert row["event_type"] == "evaluation_error"
-    assert json.loads(row["payload_json"]) == {
+    reason = f"condition cond-{method} requires market_data for {method}"
+    assert condition_event_payload(storage, f"cond-{method}") == {
         "method": method,
-        "reason": f"condition cond-{method} requires market_data for {method}",
+        "reason": reason,
     }
+    state = storage.get_condition_market_state(f"cond-{method}")
+    assert state is not None
+    assert state["state"]["evaluation_error"] == reason
 
 
 def test_missing_market_data_does_not_block_other_triggered_conditions(tmp_path) -> None:
@@ -753,21 +761,14 @@ def test_missing_market_data_does_not_block_other_triggered_conditions(tmp_path)
     assert [plan.order.condition_id for plan in plans] == ["cond-static"]
     assert storage.get_condition_order("cond-atr-error").status == "armed"
     assert storage.get_condition_order("cond-static").status == "triggered"
-    with closing(storage._connect()) as conn:
-        row = conn.execute(
-            """
-            SELECT event_type, payload_json
-            FROM condition_order_events
-            WHERE condition_id=?
-            ORDER BY id
-            """,
-            ("cond-atr-error",),
-        ).fetchone()
-    assert row["event_type"] == "evaluation_error"
-    assert json.loads(row["payload_json"]) == {
+    reason = "condition cond-atr-error requires market_data for atr_trailing"
+    assert condition_event_payload(storage, "cond-atr-error") == {
         "method": "atr_trailing",
-        "reason": "condition cond-atr-error requires market_data for atr_trailing",
+        "reason": reason,
     }
+    state = storage.get_condition_market_state("cond-atr-error")
+    assert state is not None
+    assert state["state"]["evaluation_error"] == reason
 
 
 def test_mock_broker_missing_bars_do_not_block_later_condition(tmp_path) -> None:
@@ -823,21 +824,15 @@ def test_mock_broker_missing_bars_do_not_block_later_condition(tmp_path) -> None
     )
 
     assert [plan.order.condition_id for plan in plans] == ["cond-static"]
-    with closing(storage._connect()) as conn:
-        row = conn.execute(
-            """
-            SELECT event_type, payload_json
-            FROM condition_order_events
-            WHERE condition_id=?
-            ORDER BY id
-            """,
-            ("cond-atr-mock-missing",),
-        ).fetchone()
-    assert row["event_type"] == "evaluation_error"
-    assert json.loads(row["payload_json"]) == {
+    reason = "mock bars missing for 513100.SH interval 1d"
+    assert condition_event_payload(storage, "cond-atr-mock-missing") == {
         "method": "atr_trailing",
-        "reason": "mock bars missing for 513100.SH interval 1d",
+        "reason": reason,
     }
+    state = storage.get_condition_market_state("cond-atr-mock-missing")
+    assert state is not None
+    assert state["state"]["evaluation_error"] == reason
+    assert state["latest_price"] == 1.12
 
 
 def test_unwired_bar_provider_does_not_block_later_condition(tmp_path) -> None:
@@ -887,30 +882,59 @@ def test_unwired_bar_provider_does_not_block_later_condition(tmp_path) -> None:
     )
 
     assert [plan.order.condition_id for plan in plans] == ["cond-static"]
-    with closing(storage._connect()) as conn:
-        row = conn.execute(
-            """
-            SELECT event_type, payload_json
-            FROM condition_order_events
-            WHERE condition_id=?
-            ORDER BY id
-            """,
-            ("cond-atr-unwired",),
-        ).fetchone()
-    assert row["event_type"] == "evaluation_error"
-    assert json.loads(row["payload_json"]) == {
+    reason = "bars are not wired"
+    assert condition_event_payload(storage, "cond-atr-unwired") == {
         "method": "atr_trailing",
-        "reason": "bars are not wired",
+        "reason": reason,
     }
+    state = storage.get_condition_market_state("cond-atr-unwired")
+    assert state is not None
+    assert state["state"]["evaluation_error"] == reason
+    assert state["latest_price"] == 1.12
 
 
-def test_missing_latest_price_records_error_and_continues(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("condition_id", "prices", "reason"),
+    [
+        (
+            "cond-missing-price",
+            {"159915.SZ": 1.12},
+            "condition cond-missing-price missing latest_price",
+        ),
+        (
+            "cond-zero-price",
+            {"513100.SH": 0, "159915.SZ": 1.12},
+            "condition cond-zero-price invalid latest_price: 0",
+        ),
+        (
+            "cond-negative-price",
+            {"513100.SH": -1.0, "159915.SZ": 1.12},
+            "condition cond-negative-price invalid latest_price: -1.0",
+        ),
+        (
+            "cond-inf-price",
+            {"513100.SH": math.inf, "159915.SZ": 1.12},
+            "condition cond-inf-price invalid latest_price: inf",
+        ),
+        (
+            "cond-nan-price",
+            {"513100.SH": math.nan, "159915.SZ": 1.12},
+            "condition cond-nan-price invalid latest_price: nan",
+        ),
+    ],
+)
+def test_invalid_latest_price_records_error_state_and_continues(
+    condition_id,
+    prices,
+    reason,
+    tmp_path,
+) -> None:
     storage = Storage(tmp_path / "audit.db")
     storage.initialize()
     storage.upsert_condition_orders(
         [
             ConditionOrder(
-                condition_id="cond-missing-price",
+                condition_id=condition_id,
                 task_id="task-1",
                 portfolio_id="prod",
                 account_id="acct",
@@ -942,86 +966,19 @@ def test_missing_latest_price_records_error_and_continues(tmp_path) -> None:
     plans = engine.evaluate(
         account=account(),
         positions=[position(), second_position()],
-        prices={"159915.SZ": 1.12},
+        prices=prices,
         now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
     assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
-    with closing(storage._connect()) as conn:
-        row = conn.execute(
-            """
-            SELECT event_type, payload_json
-            FROM condition_order_events
-            WHERE condition_id=?
-            ORDER BY id
-            """,
-            ("cond-missing-price",),
-        ).fetchone()
-    assert row["event_type"] == "evaluation_error"
-    assert json.loads(row["payload_json"]) == {
+    assert condition_event_payload(storage, condition_id) == {
         "method": "static_pct",
-        "reason": "condition cond-missing-price missing latest_price",
+        "reason": reason,
     }
-
-
-def test_nan_latest_price_records_error_and_continues(tmp_path) -> None:
-    storage = Storage(tmp_path / "audit.db")
-    storage.initialize()
-    storage.upsert_condition_orders(
-        [
-            ConditionOrder(
-                condition_id="cond-nan-price",
-                task_id="task-1",
-                portfolio_id="prod",
-                account_id="acct",
-                mode="dry_run",
-                symbol="513100.SH",
-                purpose="take_profit",
-                method="static_pct",
-                reference_price=1.0,
-                params={"take_profit_pct": 0.1},
-                action=ConditionAction(type="sell_pct", pct=1.0),
-            ),
-            ConditionOrder(
-                condition_id="cond-static-second",
-                task_id="task-1",
-                portfolio_id="prod",
-                account_id="acct",
-                mode="dry_run",
-                symbol="159915.SZ",
-                purpose="take_profit",
-                method="static_pct",
-                reference_price=1.0,
-                params={"take_profit_pct": 0.1},
-                action=ConditionAction(type="sell_pct", pct=1.0),
-            ),
-        ]
-    )
-    engine = ConditionEngine(storage)
-
-    plans = engine.evaluate(
-        account=account(),
-        positions=[position(), second_position()],
-        prices={"513100.SH": math.nan, "159915.SZ": 1.12},
-        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
-    )
-
-    assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
-    with closing(storage._connect()) as conn:
-        row = conn.execute(
-            """
-            SELECT event_type, payload_json
-            FROM condition_order_events
-            WHERE condition_id=?
-            ORDER BY id
-            """,
-            ("cond-nan-price",),
-        ).fetchone()
-    assert row["event_type"] == "evaluation_error"
-    assert json.loads(row["payload_json"]) == {
-        "method": "static_pct",
-        "reason": "condition cond-nan-price invalid latest_price: nan",
-    }
+    state = storage.get_condition_market_state(condition_id)
+    assert state is not None
+    assert state["trigger_price"] is None
+    assert state["state"]["evaluation_error"] == reason
 
 
 def test_extract_condition_orders_rejects_missing_required_params() -> None:
