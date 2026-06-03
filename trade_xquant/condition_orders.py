@@ -151,9 +151,14 @@ class ConditionEngine:
             if order.purpose == "stop_loss":
                 return reference_price * (1 - _param(order, "stop_loss_pct", "pct"))
             return reference_price * (1 + _param(order, "take_profit_pct", "pct"))
-        if high_water_price is None:
-            raise ValueError(f"condition {order.condition_id} missing high_water_price")
-        return high_water_price * (1 - _param(order, "trail_pct", "pct"))
+        if order.method == "trailing_pct":
+            if high_water_price is None:
+                raise ValueError(f"condition {order.condition_id} missing high_water_price")
+            return high_water_price * (1 - _param(order, "trail_pct", "pct"))
+        raise ValueError(
+            f"condition {order.condition_id} method {order.method} "
+            "trigger calculation is not implemented"
+        )
 
     def _is_triggered(self, order: ConditionOrder, latest_price: float) -> bool:
         if order.trigger_price is None:

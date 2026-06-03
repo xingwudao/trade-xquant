@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from trade_xquant.condition_orders import (
     ConditionAction,
     ConditionEngine,
@@ -140,3 +142,33 @@ def test_condition_engine_updates_trailing_high_water_before_trigger(tmp_path) -
     assert stored.high_water_price == 1.2
     assert stored.trigger_price == 1.104
     assert stored.status == "armed"
+
+
+def test_deferred_methods_do_not_reuse_trailing_pct_trigger_logic() -> None:
+    engine = ConditionEngine(storage=None)
+    order = ConditionOrder(
+        condition_id="cond-atr",
+        task_id="task-1",
+        portfolio_id="prod",
+        account_id="acct",
+        mode="dry_run",
+        symbol="513100.SH",
+        purpose="stop_loss",
+        method="atr_trailing",
+        reference_price=1.0,
+        high_water_price=1.2,
+        params={
+            "atr_window": 3,
+            "atr_multiple": 2.0,
+            "bar_interval": "1d",
+            "trail_pct": 0.08,
+        },
+        action=ConditionAction(type="sell_pct", pct=1.0),
+    )
+
+    expected_error = (
+        "condition cond-atr method atr_trailing "
+        "trigger calculation is not implemented"
+    )
+    with pytest.raises(ValueError, match=expected_error):
+        engine._trigger_price(order, high_water_price=1.2)
