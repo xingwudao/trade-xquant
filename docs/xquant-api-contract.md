@@ -260,7 +260,7 @@ thresholds or defaults.
   "account_id": "acct",
   "portfolio_id": "prod_etf_steady",
   "symbol": "513100.SH",
-  "status": "submitted",
+  "status": "dry_run_success",
   "trigger": {
     "triggered_at": "2026-06-03T10:30:00+08:00",
     "latest_price": 1.23,
@@ -308,7 +308,7 @@ thresholds or defaults.
   },
   "execution_result": {
     "task_id": "condition:cond-513100-atr-tp",
-    "status": "submitted",
+    "status": "dry_run_success",
     "mode": "dry_run",
     "planned_orders": [
       {
