@@ -1368,6 +1368,154 @@ def test_non_finite_stored_high_water_price_records_error_and_continues(tmp_path
     assert state["state"]["evaluation_error"] == reason
 
 
+def test_non_finite_market_state_high_water_records_error_and_continues(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-state-inf-high-water",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="trailing_pct",
+                high_water_price=1.2,
+                params={"trail_pct": 0.08},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static-second",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    storage.record_condition_market_state(
+        condition_id="cond-state-inf-high-water",
+        symbol="513100.SH",
+        latest_price=1.0,
+        high_water_price=math.inf,
+        trigger_price=math.inf,
+        activated=True,
+        activated_at=None,
+        atr_value=None,
+        hv_value=None,
+        std_value=None,
+        computed_at=datetime(2026, 6, 3, 9, 59, tzinfo=ZoneInfo("Asia/Shanghai")).isoformat(),
+        market_data_source="prices",
+        state={"method": "trailing_pct", "purpose": "stop_loss"},
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position(), second_position()],
+        prices={"513100.SH": 1.0, "159915.SZ": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
+    assert storage.get_condition_order("cond-state-inf-high-water").status == "armed"
+    reason = (
+        "condition cond-state-inf-high-water invalid stored market_state "
+        "high_water_price"
+    )
+    assert condition_event_payload(storage, "cond-state-inf-high-water") == {
+        "method": "trailing_pct",
+        "reason": reason,
+    }
+    state = storage.get_condition_market_state("cond-state-inf-high-water")
+    assert state is not None
+    assert state["high_water_price"] == 1.2
+    assert state["trigger_price"] is None
+    assert state["state"]["evaluation_error"] == reason
+
+
+def test_non_finite_market_state_trigger_price_records_error_and_continues(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-state-inf-trigger",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="trailing_pct",
+                high_water_price=1.2,
+                params={"trail_pct": 0.08},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static-second",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    storage.record_condition_market_state(
+        condition_id="cond-state-inf-trigger",
+        symbol="513100.SH",
+        latest_price=1.0,
+        high_water_price=1.2,
+        trigger_price=math.inf,
+        activated=True,
+        activated_at=None,
+        atr_value=None,
+        hv_value=None,
+        std_value=None,
+        computed_at=datetime(2026, 6, 3, 9, 59, tzinfo=ZoneInfo("Asia/Shanghai")).isoformat(),
+        market_data_source="prices",
+        state={"method": "trailing_pct", "purpose": "stop_loss"},
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position(), second_position()],
+        prices={"513100.SH": 1.0, "159915.SZ": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
+    assert storage.get_condition_order("cond-state-inf-trigger").status == "armed"
+    reason = (
+        "condition cond-state-inf-trigger invalid stored market_state "
+        "trigger_price"
+    )
+    assert condition_event_payload(storage, "cond-state-inf-trigger") == {
+        "method": "trailing_pct",
+        "reason": reason,
+    }
+    state = storage.get_condition_market_state("cond-state-inf-trigger")
+    assert state is not None
+    assert state["high_water_price"] == 1.2
+    assert state["trigger_price"] is None
+    assert state["state"]["evaluation_error"] == reason
+
+
 def test_extract_condition_orders_rejects_missing_required_params() -> None:
     task = RebalanceTask.model_validate(
         {

@@ -206,6 +206,7 @@ class ConditionEngine:
         now: datetime,
     ) -> tuple[ConditionOrder, dict[str, Any]]:
         stored = self.storage.get_condition_market_state(order.condition_id) or {}
+        self._validate_stored_market_state(order, stored)
         activated, activated_at, activation_price = self._activation_state(
             order,
             latest_price,
@@ -301,6 +302,19 @@ class ConditionEngine:
             latest_price,
         ]
         return max(float(value) for value in candidates if value is not None)
+
+    def _validate_stored_market_state(
+        self,
+        order: ConditionOrder,
+        stored: dict[str, Any],
+    ) -> None:
+        for key in ("high_water_price", "trigger_price"):
+            value = stored.get(key)
+            if value is not None and not _finite_float_gt(value, 0):
+                raise ValueError(
+                    f"condition {order.condition_id} invalid stored "
+                    f"market_state {key}"
+                )
 
     def _empty_indicator_values(self) -> dict[str, float | None]:
         return {"atr_value": None, "hv_value": None, "std_value": None}
@@ -419,10 +433,18 @@ class ConditionEngine:
         now: datetime,
     ) -> None:
         stored = self.storage.get_condition_market_state(order.condition_id) or {}
-        high_water_price = stored.get("high_water_price") or order.high_water_price
-        trigger_price = stored.get("trigger_price") or order.trigger_price
+        high_water_price = self._safe_stored_market_number(stored, "high_water_price")
+        if high_water_price is None:
+            high_water_price = order.high_water_price
+        trigger_price = self._safe_stored_market_number(stored, "trigger_price")
+        if trigger_price is None:
+            trigger_price = order.trigger_price
         if latest_price is not None and order.method in TRAILING_CONDITION_METHODS:
-            high_water_price = self._high_water_price(order, latest_price, stored)
+            high_water_price = self._safe_high_water_price(
+                order,
+                latest_price,
+                high_water_price,
+            )
             self.storage.update_condition_order_market_state(
                 order.condition_id,
                 high_water_price=high_water_price,
@@ -448,6 +470,35 @@ class ConditionEngine:
                 "evaluation_error": reason,
             },
         )
+
+    def _safe_stored_market_number(
+        self,
+        stored: dict[str, Any],
+        key: str,
+    ) -> float | None:
+        value = stored.get(key)
+        if value is None or not _finite_float_gt(value, 0):
+            return None
+        return float(value)
+
+    def _safe_high_water_price(
+        self,
+        order: ConditionOrder,
+        latest_price: float,
+        stored_high_water_price: float | None,
+    ) -> float | None:
+        candidates = [
+            stored_high_water_price,
+            order.high_water_price,
+            order.reference_price,
+            latest_price,
+        ]
+        safe_candidates = [
+            float(value)
+            for value in candidates
+            if value is not None and _finite_float_gt(value, 0)
+        ]
+        return max(safe_candidates) if safe_candidates else None
 
     def _market_data_source(self, order: ConditionOrder) -> str:
         if order.method in BAR_CONDITION_METHODS and self.market_data is not None:
