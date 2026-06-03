@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from trade_xquant.models import normalize_symbol, round_money
 
@@ -19,6 +19,12 @@ class PriceBar(BaseModel):
     @classmethod
     def normalize_symbol_value(cls, value: str) -> str:
         return normalize_symbol(value)
+
+    @model_validator(mode="after")
+    def require_high_at_least_low(self) -> PriceBar:
+        if self.high < self.low:
+            raise ValueError("high must be greater than or equal to low")
+        return self
 
 
 class ConditionIndicatorEngine:
@@ -44,8 +50,8 @@ class ConditionIndicatorEngine:
     def hv_log_return(self, bars: list[PriceBar], annualization: float) -> float:
         if len(bars) < 2:
             raise ValueError("hv_log_return requires at least two bars")
-        if annualization <= 0:
-            raise ValueError("annualization must be positive")
+        if not (math.isfinite(annualization) and annualization > 0):
+            raise ValueError("annualization must be finite and positive")
 
         returns = [
             math.log(current.close / previous.close)

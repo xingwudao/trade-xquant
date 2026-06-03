@@ -4,6 +4,8 @@ import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from trade_xquant.condition_indicators import (
     ConditionIndicatorEngine,
     PriceBar,
@@ -70,3 +72,49 @@ def test_indicator_engine_rejects_insufficient_bars() -> None:
         assert "at least two bars" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_price_bar_normalizes_symbol() -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+
+    bar = PriceBar(
+        symbol=" 513100.ss ",
+        high=10.5,
+        low=9.5,
+        close=10.0,
+        timestamp=datetime(2026, 6, 1, tzinfo=tz),
+    )
+
+    assert bar.symbol == "513100.SH"
+
+
+def test_price_bar_rejects_high_below_low() -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+
+    with pytest.raises(ValueError, match="high must be greater than or equal to low"):
+        PriceBar(
+            symbol="513100.SH",
+            high=9.5,
+            low=10.5,
+            close=10.0,
+            timestamp=datetime(2026, 6, 1, tzinfo=tz),
+        )
+
+
+@pytest.mark.parametrize("annualization", [0, -1, math.nan, math.inf])
+def test_hv_rejects_non_positive_or_non_finite_annualization(
+    annualization: float,
+) -> None:
+    engine = ConditionIndicatorEngine()
+
+    with pytest.raises(ValueError, match="annualization must be finite and positive"):
+        engine.hv_log_return(bars(), annualization=annualization)
+
+
+def test_indicator_engine_rejects_empty_bars() -> None:
+    engine = ConditionIndicatorEngine()
+
+    with pytest.raises(ValueError, match="at least one bar"):
+        engine.atr([])
+    with pytest.raises(ValueError, match="at least one bar"):
+        engine.price_std([])
