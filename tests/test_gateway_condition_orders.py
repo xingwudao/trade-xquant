@@ -113,6 +113,59 @@ def test_gateway_poll_once_validates_condition_orders_before_execution(tmp_path)
     assert service.qmt.submitted_orders == []
 
 
+def test_gateway_local_condition_audit_skips_xquant_report(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-local",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "condition_id": "cond-local-skip",
+                                    "symbol": "513100.SH",
+                                    "purpose": "take_profit",
+                                    "method": "static_pct",
+                                    "reference_price": 1.0,
+                                    "params": {"take_profit_pct": 0.1},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+    xquant = ExplodingXquant()
+    service.xquant = xquant  # type: ignore[assignment]
+
+    service.poll_once(force_dry_run=True)
+    broker = PositionBroker()
+    service.qmt = broker  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [{"condition_id": "cond-local-skip", "status": "dry_run_success"}]
+    assert xquant.condition_result_calls == 0
+    assert len(broker.submitted_orders) == 1
+    assert service.storage.get_condition_order("cond-local-skip").status == "submitted"
+    stored = service.storage.get_condition_trigger_audit("condition:cond-local-skip")
+    assert stored is not None
+    assert stored["xquant_report_status"] == "skipped"
+    assert stored["xquant_report_error"] == "local_task_file"
+
+
 def test_gateway_condition_poll_once_executes_triggered_condition_order(tmp_path) -> None:
     service = GatewayService(settings_for(tmp_path))
     service.storage.initialize()
@@ -208,6 +261,20 @@ class AuditXquant:
             raise RuntimeError("xquant audit failed")
 
 
+class ExplodingXquant:
+    def __init__(self) -> None:
+        self.condition_result_calls = 0
+
+    def report_condition_result(
+        self,
+        source_task_id: str,
+        condition_id: str,
+        payload: dict,
+    ) -> None:
+        self.condition_result_calls += 1
+        raise RuntimeError("xquant should not be called")
+
+
 def test_gateway_records_and_reports_condition_audit(tmp_path) -> None:
     service = GatewayService(settings_for(tmp_path))
     service.storage.initialize()
@@ -240,6 +307,9 @@ def test_gateway_records_and_reports_condition_audit(tmp_path) -> None:
     payload = audit.payloads[0][2]
     assert payload["condition_task_id"] == "condition:cond-audit"
     assert payload["rule"]["params"]["take_profit_pct"] == 0.1
+    triggered_at = service.storage.get_condition_order_triggered_at("cond-audit")
+    assert triggered_at is not None
+    assert payload["trigger"]["triggered_at"] == triggered_at
     stored = service.storage.get_condition_trigger_audit("condition:cond-audit")
     assert stored is not None
     assert stored["xquant_report_status"] == "success"
@@ -247,6 +317,7 @@ def test_gateway_records_and_reports_condition_audit(tmp_path) -> None:
     assert stored["market_state"]["latest_price"] == 1.1
     assert stored["trigger"]["latest_price"] == 1.1
     assert stored["trigger"]["trigger_price"] == 1.1
+    assert stored["trigger"]["triggered_at"] == triggered_at
     assert stored["execution_result"]["task_id"] == "condition:cond-audit"
 
 

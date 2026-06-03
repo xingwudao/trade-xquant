@@ -310,6 +310,16 @@ class Storage:
             raise KeyError(condition_id)
         return self._condition_order_from_row(row)
 
+    def get_condition_order_triggered_at(self, condition_id: str) -> str | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT triggered_at FROM condition_orders WHERE condition_id=?",
+                (condition_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(condition_id)
+        return row["triggered_at"]
+
     def update_condition_order_status(self, condition_id: str, status: str) -> None:
         now = utc_now()
         triggered_at = now if status == "triggered" else None

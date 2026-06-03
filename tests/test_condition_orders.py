@@ -157,6 +157,21 @@ def test_storage_persists_active_condition_orders(tmp_path) -> None:
     assert active[0].params == {"take_profit_pct": 0.1}
 
 
+def test_storage_returns_condition_order_triggered_at(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    order = extract_condition_orders(task_with_conditions())[0]
+    storage.upsert_condition_orders([order])
+
+    assert storage.get_condition_order_triggered_at("cond-static") is None
+
+    storage.update_condition_order_status("cond-static", "triggered")
+
+    triggered_at = storage.get_condition_order_triggered_at("cond-static")
+    assert triggered_at is not None
+    assert datetime.fromisoformat(triggered_at).tzinfo is not None
+
+
 def test_condition_engine_triggers_static_take_profit_sell_plan(tmp_path) -> None:
     storage = Storage(tmp_path / "audit.db")
     storage.initialize()

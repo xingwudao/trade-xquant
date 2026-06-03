@@ -218,24 +218,31 @@ class GatewayService:
                     trigger=audit_payload["trigger"],
                     execution_result=result.model_dump(mode="json"),
                 )
-                try:
-                    self.xquant.report_condition_result(
-                        triggered.order.task_id,
-                        condition_id,
-                        audit_payload,
-                    )
+                if self.local_task_file is not None:
                     self.storage.update_condition_audit_report_status(
                         triggered.task.task_id,
-                        "success",
+                        "skipped",
+                        "local_task_file",
                     )
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("failed to report condition result to Xquant")
-                    self.storage.update_condition_audit_report_status(
-                        triggered.task.task_id,
-                        "failed",
-                        str(exc),
-                    )
-                    self.storage.update_condition_order_status(condition_id, "needs_reconcile")
+                else:
+                    try:
+                        self.xquant.report_condition_result(
+                            triggered.order.task_id,
+                            condition_id,
+                            audit_payload,
+                        )
+                        self.storage.update_condition_audit_report_status(
+                            triggered.task.task_id,
+                            "success",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("failed to report condition result to Xquant")
+                        self.storage.update_condition_audit_report_status(
+                            triggered.task.task_id,
+                            "failed",
+                            str(exc),
+                        )
+                        self.storage.update_condition_order_status(condition_id, "needs_reconcile")
                 results.append(
                     {
                         "condition_id": condition_id,
@@ -255,8 +262,10 @@ class GatewayService:
         result: ExecutionResult,
     ) -> dict[str, Any]:
         market_state = self.storage.get_condition_market_state(triggered.order.condition_id) or {}
+        triggered_at = self.storage.get_condition_order_triggered_at(triggered.order.condition_id)
         trigger = {
-            "triggered_at": datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
+            "triggered_at": triggered_at
+            or datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
             "latest_price": market_state.get("latest_price"),
             "trigger_price": market_state.get("trigger_price"),
             "reason": self._condition_trigger_reason(triggered, market_state),
