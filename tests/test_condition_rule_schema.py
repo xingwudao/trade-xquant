@@ -97,13 +97,20 @@ def test_all_single_instrument_methods_parse() -> None:
 def test_required_condition_params_are_method_and_purpose_specific() -> None:
     order = condition("trailing_pct", "take_profit", {"trail_pct": 0.08})
 
-    assert required_condition_params(order) == {
-        "trail_pct",
-        "activation_profit_pct|activation_price",
-    }
-    assert validate_condition_hyperparameters(order) == [
-        "activation_profit_pct|activation_price"
-    ]
+    assert required_condition_params(order) == {"trail_pct"}
+    assert validate_condition_hyperparameters(order) == []
+
+
+def test_trailing_pct_legacy_shapes_do_not_require_reference_or_activation() -> None:
+    stop_loss = condition("trailing_pct", "stop_loss", {"trail_pct": 0.08})
+    take_profit = condition("trailing_pct", "take_profit", {"trail_pct": 0.08})
+
+    assert validate_condition_hyperparameters(
+        stop_loss.model_copy(update={"reference_price": None})
+    ) == []
+    assert validate_condition_hyperparameters(
+        take_profit.model_copy(update={"reference_price": None})
+    ) == []
 
 
 def test_legacy_pct_alias_satisfies_static_and_trailing_validation() -> None:
@@ -127,6 +134,36 @@ def test_missing_reference_price_is_reported() -> None:
     order = order.model_copy(update={"reference_price": None})
 
     assert validate_condition_hyperparameters(order) == ["reference_price"]
+
+
+def test_deferred_take_profit_reference_depends_on_activation_form() -> None:
+    activation_price = condition(
+        "atr_trailing",
+        "take_profit",
+        {
+            "atr_window": 3,
+            "atr_multiple": 2.0,
+            "bar_interval": "1d",
+            "activation_price": 1.2,
+        },
+    )
+    activation_profit_pct = condition(
+        "atr_trailing",
+        "take_profit",
+        {
+            "atr_window": 3,
+            "atr_multiple": 2.0,
+            "bar_interval": "1d",
+            "activation_profit_pct": 0.1,
+        },
+    )
+
+    assert validate_condition_hyperparameters(
+        activation_price.model_copy(update={"reference_price": None})
+    ) == []
+    assert validate_condition_hyperparameters(
+        activation_profit_pct.model_copy(update={"reference_price": None})
+    ) == ["reference_price"]
 
 
 def test_non_instrument_scope_is_reported() -> None:

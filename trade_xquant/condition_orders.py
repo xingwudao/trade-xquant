@@ -281,7 +281,7 @@ def required_condition_params(order: ConditionOrder) -> set[str]:
         required = {"std_window", "std_multiple", "bar_interval"}
     else:
         return set()
-    if order.purpose == "take_profit":
+    if order.purpose == "take_profit" and order.method in DEFERRED_CONDITION_METHODS:
         required.add("activation_profit_pct|activation_price")
     return required
 
@@ -297,9 +297,20 @@ def validate_condition_hyperparameters(order: ConditionOrder) -> list[str]:
             missing.append(key)
     if order.scope != "instrument":
         missing.append("scope:instrument")
-    if order.reference_price is None:
+    if _requires_reference_price(order) and order.reference_price is None:
         missing.append("reference_price")
     return missing
+
+
+def _requires_reference_price(order: ConditionOrder) -> bool:
+    if order.method == "static_pct":
+        return True
+    if order.method in DEFERRED_CONDITION_METHODS and order.purpose == "take_profit":
+        return (
+            order.params.get("activation_profit_pct") is not None
+            and order.params.get("activation_price") is None
+        )
+    return False
 
 
 def _has_condition_param(order: ConditionOrder, key: str) -> bool:
