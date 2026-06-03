@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -137,7 +138,7 @@ class ConditionEngine:
                         "reason": str(exc),
                     },
                 )
-                raise
+                continue
             self.storage.update_condition_order_market_state(
                 evaluated.condition_id,
                 high_water_price=evaluated.high_water_price,
@@ -188,6 +189,26 @@ class ConditionEngine:
             stored,
         )
         high_water_price = self._high_water_price(order, latest_price, stored)
+        if (
+            order.purpose == "take_profit"
+            and order.method in TRAILING_CONDITION_METHODS
+            and not activated
+        ):
+            indicator_values = self._empty_indicator_values()
+            evaluated = order.model_copy(
+                update={
+                    "high_water_price": high_water_price,
+                    "trigger_price": None,
+                }
+            )
+            market_state = {
+                "activated": activated,
+                "activated_at": activated_at,
+                "activation_price": activation_price,
+                **indicator_values,
+            }
+            return evaluated, market_state
+
         indicator_values = self._indicator_values(order)
         trigger_price = self._trigger_price(
             order,
@@ -259,8 +280,11 @@ class ConditionEngine:
         ]
         return max(float(value) for value in candidates if value is not None)
 
+    def _empty_indicator_values(self) -> dict[str, float | None]:
+        return {"atr_value": None, "hv_value": None, "std_value": None}
+
     def _indicator_values(self, order: ConditionOrder) -> dict[str, float | None]:
-        values = {"atr_value": None, "hv_value": None, "std_value": None}
+        values = self._empty_indicator_values()
         if order.method not in BAR_CONDITION_METHODS:
             return values
         if self.market_data is None:
@@ -326,7 +350,9 @@ class ConditionEngine:
                 hv_value = values["hv_value"]
                 if hv_value is None:
                     raise ValueError(f"condition {order.condition_id} missing hv_value")
-                return high_water_price * (1 - float(order.params["lambda"]) * hv_value)
+                return high_water_price * math.exp(
+                    -float(order.params["lambda"]) * hv_value
+                )
             std_value = values["std_value"]
             if std_value is None:
                 raise ValueError(f"condition {order.condition_id} missing std_value")
@@ -505,7 +531,7 @@ def validate_condition_hyperparameters(order: ConditionOrder) -> list[str]:
 def _requires_reference_price(order: ConditionOrder) -> bool:
     if order.method == "static_pct":
         return True
-    if order.method in BAR_CONDITION_METHODS and order.purpose == "take_profit":
+    if order.method in TRAILING_CONDITION_METHODS and order.purpose == "take_profit":
         return (
             order.params.get("activation_profit_pct") is not None
             and order.params.get("activation_price") is None

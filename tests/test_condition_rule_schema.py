@@ -113,6 +113,18 @@ def test_trailing_pct_legacy_shapes_do_not_require_reference_or_activation() -> 
     ) == []
 
 
+def test_trailing_pct_take_profit_activation_pct_requires_reference_price() -> None:
+    order = condition(
+        "trailing_pct",
+        "take_profit",
+        {"trail_pct": 0.08, "activation_profit_pct": 0.12},
+    )
+
+    assert validate_condition_hyperparameters(
+        order.model_copy(update={"reference_price": None})
+    ) == ["reference_price"]
+
+
 def test_legacy_pct_alias_satisfies_static_and_trailing_validation() -> None:
     cases = [
         condition("static_pct", "stop_loss", {"pct": 0.05}),

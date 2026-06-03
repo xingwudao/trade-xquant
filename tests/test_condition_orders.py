@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from contextlib import closing
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -274,7 +275,7 @@ def test_condition_engine_triggers_atr_trailing_stop_loss(tmp_path) -> None:
     assert [plan.order.condition_id for plan in plans] == ["cond-atr"]
     state = storage.get_condition_market_state("cond-atr")
     assert state is not None
-    assert state["atr_value"] is not None
+    assert state["atr_value"] == pytest.approx(0.1333)
     assert state["trigger_price"] == pytest.approx(1.1667)
 
 
@@ -354,7 +355,7 @@ def test_condition_engine_triggers_hv_log_trailing_stop_loss(tmp_path) -> None:
                 params={
                     "hv_window": 3,
                     "hv_annualization": 252,
-                    "lambda": 0.2,
+                    "lambda": 1.0,
                     "bar_interval": "1d",
                 },
                 action=ConditionAction(type="sell_pct", pct=1.0),
@@ -366,15 +367,27 @@ def test_condition_engine_triggers_hv_log_trailing_stop_loss(tmp_path) -> None:
     plans = engine.evaluate(
         account=account(),
         positions=[position()],
-        prices={"513100.SH": 1.12},
+        prices={"513100.SH": 0.7},
         now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
     assert [plan.order.condition_id for plan in plans] == ["cond-hv"]
     state = storage.get_condition_market_state("cond-hv")
     assert state is not None
-    assert state["hv_value"] is not None
-    assert state["trigger_price"] is not None
+    close_prices = [bar.close for bar in price_bars()]
+    returns = [
+        math.log(current / previous)
+        for previous, current in zip(close_prices, close_prices[1:])
+    ]
+    mean_return = sum(returns) / len(returns)
+    expected_hv = math.sqrt(
+        sum((item - mean_return) ** 2 for item in returns) / len(returns)
+    ) * math.sqrt(252)
+    expected_trigger = 1.30 * math.exp(-expected_hv)
+    linear_trigger = 1.30 * (1 - expected_hv)
+    assert state["hv_value"] == pytest.approx(expected_hv)
+    assert state["trigger_price"] == pytest.approx(expected_trigger)
+    assert abs(expected_trigger - linear_trigger) > 0.1
 
 
 def test_condition_engine_triggers_std_trailing_stop_loss(tmp_path) -> None:
@@ -413,8 +426,13 @@ def test_condition_engine_triggers_std_trailing_stop_loss(tmp_path) -> None:
     assert [plan.order.condition_id for plan in plans] == ["cond-std"]
     state = storage.get_condition_market_state("cond-std")
     assert state is not None
-    assert state["std_value"] is not None
-    assert state["trigger_price"] is not None
+    close_prices = [bar.close for bar in price_bars()]
+    mean_close = sum(close_prices) / len(close_prices)
+    expected_std = math.sqrt(
+        sum((item - mean_close) ** 2 for item in close_prices) / len(close_prices)
+    )
+    assert state["std_value"] == pytest.approx(expected_std)
+    assert state["trigger_price"] == pytest.approx(1.30 - expected_std)
 
 
 def test_deferred_take_profit_with_activation_price_can_activate_without_reference(
@@ -459,6 +477,48 @@ def test_deferred_take_profit_with_activation_price_can_activate_without_referen
     assert state["activated"] is True
     assert state["activated_at"] == "2026-06-03T10:00:00+08:00"
     assert state["high_water_price"] == 1.21
+
+
+def test_inactive_indicator_take_profit_does_not_require_market_data(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr-tp-inactive",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="atr_trailing",
+                reference_price=1.0,
+                params={
+                    "atr_window": 3,
+                    "atr_multiple": 1.0,
+                    "bar_interval": "1d",
+                    "activation_profit_pct": 0.2,
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.1},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert plans == []
+    state = storage.get_condition_market_state("cond-atr-tp-inactive")
+    assert state is not None
+    assert state["activated"] is False
+    assert state["trigger_price"] is None
+    assert state["atr_value"] is None
 
 
 @pytest.mark.parametrize(
@@ -520,17 +580,14 @@ def test_indicator_method_requires_market_data_without_trailing_fallback(
     )
     engine = ConditionEngine(storage)
 
-    with pytest.raises(
-        ValueError,
-        match=f"condition cond-{method} requires market_data for {method}",
-    ):
-        engine.evaluate(
-            account=account(),
-            positions=[position()],
-            prices={"513100.SH": 1.12},
-            now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
-        )
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
 
+    assert plans == []
     with closing(storage._connect()) as conn:
         row = conn.execute(
             """
@@ -548,33 +605,70 @@ def test_indicator_method_requires_market_data_without_trailing_fallback(
     }
 
 
-def test_condition_engine_calculates_atr_trigger_price_directly(tmp_path) -> None:
+def test_missing_market_data_does_not_block_other_triggered_conditions(tmp_path) -> None:
     storage = Storage(tmp_path / "audit.db")
     storage.initialize()
-    engine = ConditionEngine(storage, market_data=BarProvider(price_bars()))
-    order = ConditionOrder(
-        condition_id="cond-atr",
-        task_id="task-1",
-        portfolio_id="prod",
-        account_id="acct",
-        mode="dry_run",
-        symbol="513100.SH",
-        purpose="stop_loss",
-        method="atr_trailing",
-        reference_price=1.0,
-        high_water_price=1.2,
-        params={
-            "atr_window": 3,
-            "atr_multiple": 2.0,
-            "bar_interval": "1d",
-            "trail_pct": 0.08,
-        },
-        action=ConditionAction(type="sell_pct", pct=1.0),
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr-error",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="atr_trailing",
+                high_water_price=1.2,
+                params={
+                    "atr_window": 3,
+                    "atr_multiple": 2.0,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
-    trigger_price = engine._trigger_price(order, high_water_price=1.2)
-
-    assert trigger_price == pytest.approx(0.9334)
+    assert [plan.order.condition_id for plan in plans] == ["cond-static"]
+    assert storage.get_condition_order("cond-atr-error").status == "armed"
+    assert storage.get_condition_order("cond-static").status == "triggered"
+    with closing(storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id
+            """,
+            ("cond-atr-error",),
+        ).fetchone()
+    assert row["event_type"] == "evaluation_error"
+    assert json.loads(row["payload_json"]) == {
+        "method": "atr_trailing",
+        "reason": "condition cond-atr-error requires market_data for atr_trailing",
+    }
 
 
 def test_extract_condition_orders_rejects_missing_required_params() -> None:
