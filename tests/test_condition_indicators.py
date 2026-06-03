@@ -45,6 +45,30 @@ def test_atr_uses_true_range_average() -> None:
     assert value == 1.2
 
 
+def test_atr_uses_prior_close_gap_true_range() -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    gap_bars = [
+        PriceBar(
+            symbol="513100.SH",
+            high=10.5,
+            low=9.5,
+            close=10.0,
+            timestamp=datetime(2026, 6, 1, tzinfo=tz),
+        ),
+        PriceBar(
+            symbol="513100.SH",
+            high=13.0,
+            low=12.5,
+            close=12.8,
+            timestamp=datetime(2026, 6, 2, tzinfo=tz),
+        ),
+    ]
+
+    value = ConditionIndicatorEngine().atr(gap_bars)
+
+    assert value == 2.0
+
+
 def test_hv_uses_annualized_log_returns() -> None:
     engine = ConditionIndicatorEngine()
     value = engine.hv_log_return(bars(), annualization=252)
