@@ -253,6 +253,34 @@ def test_clear_action_parses_without_pct() -> None:
     assert action.type == "clear"
 
 
+def test_clear_action_rejects_malformed_pct_when_present() -> None:
+    for value in [0, -0.1, 1.1, math.inf, math.nan]:
+        with pytest.raises(ValidationError, match="pct"):
+            ConditionAction.model_validate({"type": "clear", "pct": value})
+
+
+def test_non_finite_reference_price_is_reported() -> None:
+    order = condition("static_pct", "stop_loss", {"stop_loss_pct": 0.05})
+    order = order.model_copy(update={"reference_price": math.inf})
+
+    assert validate_condition_hyperparameters(order) == ["reference_price"]
+
+
+def test_non_finite_stored_price_state_is_reported_when_present() -> None:
+    order = condition("trailing_pct", "stop_loss", {"trail_pct": 0.08})
+    order = order.model_copy(
+        update={
+            "high_water_price": math.inf,
+            "trigger_price": math.nan,
+        }
+    )
+
+    assert validate_condition_hyperparameters(order) == [
+        "high_water_price",
+        "trigger_price",
+    ]
+
+
 @pytest.mark.parametrize(
     ("method", "purpose", "params", "expected"),
     [

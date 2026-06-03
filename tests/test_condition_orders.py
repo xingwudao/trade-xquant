@@ -1252,6 +1252,122 @@ def test_invalid_stored_take_profit_param_records_error_and_continues(tmp_path) 
     assert state["state"]["evaluation_error"] == reason
 
 
+def test_non_finite_stored_reference_price_records_error_and_continues(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-inf-reference",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                reference_price=math.inf,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static-second",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position(), second_position()],
+        prices={"513100.SH": 0.5, "159915.SZ": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
+    assert storage.get_condition_order("cond-inf-reference").status == "armed"
+    reason = (
+        "condition cond-inf-reference missing/invalid condition params: "
+        "reference_price"
+    )
+    assert condition_event_payload(storage, "cond-inf-reference") == {
+        "method": "static_pct",
+        "reason": reason,
+    }
+    state = storage.get_condition_market_state("cond-inf-reference")
+    assert state is not None
+    assert state["trigger_price"] is None
+    assert state["state"]["evaluation_error"] == reason
+
+
+def test_non_finite_stored_high_water_price_records_error_and_continues(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-inf-high-water",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="trailing_pct",
+                high_water_price=math.inf,
+                params={"trail_pct": 0.08},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static-second",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position(), second_position()],
+        prices={"513100.SH": 1.0, "159915.SZ": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
+    assert storage.get_condition_order("cond-inf-high-water").status == "armed"
+    reason = (
+        "condition cond-inf-high-water missing/invalid condition params: "
+        "high_water_price"
+    )
+    assert condition_event_payload(storage, "cond-inf-high-water") == {
+        "method": "trailing_pct",
+        "reason": reason,
+    }
+    state = storage.get_condition_market_state("cond-inf-high-water")
+    assert state is not None
+    assert state["trigger_price"] is None
+    assert state["state"]["evaluation_error"] == reason
+
+
 def test_extract_condition_orders_rejects_missing_required_params() -> None:
     task = RebalanceTask.model_validate(
         {

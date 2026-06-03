@@ -55,12 +55,12 @@ class ConditionAction(BaseModel):
 
     @model_validator(mode="after")
     def validate_action(self) -> "ConditionAction":
-        if self.type != "sell_pct":
+        if self.type == "clear" and self.pct is None:
             return self
         if self.pct is None:
             raise ValueError("sell_pct action requires pct")
         if not math.isfinite(self.pct) or self.pct <= 0 or self.pct > 1:
-            raise ValueError("sell_pct action pct must be finite and 0 < pct <= 1")
+            raise ValueError("action pct must be finite and 0 < pct <= 1")
         return self
 
 
@@ -623,6 +623,12 @@ def validate_condition_hyperparameters(order: ConditionOrder) -> list[str]:
     for key in sorted(keys_to_validate):
         if not _valid_condition_param(order, key):
             add(key)
+    if order.reference_price is not None and not _finite_float_gt(order.reference_price, 0):
+        add("reference_price")
+    if order.high_water_price is not None and not _finite_float_gt(order.high_water_price, 0):
+        add("high_water_price")
+    if order.trigger_price is not None and not _finite_float_gt(order.trigger_price, 0):
+        add("trigger_price")
     if order.scope != "instrument":
         add("scope:instrument")
     if _requires_reference_price(order) and order.reference_price is None:

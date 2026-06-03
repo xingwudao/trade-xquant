@@ -786,7 +786,9 @@ Xquant-side validation before production:
 Gateway-side validation before production:
 - Schema validation for every required parameter.
 - Reject unsupported `scope`, `purpose`, or `method`.
-- Reject missing reference price, reference wealth, or high-water state.
+- Reject missing or invalid required reference values.
+- Validate locally stored high-water state when present; high-water is gateway
+  runtime state in the current MVP.
 - Reject impossible action percentages.
 - Store every condition state transition.
 - Store trigger evidence, including latest price or wealth and trigger line.
