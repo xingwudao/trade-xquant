@@ -3,6 +3,15 @@
 This file documents the temporary local JSON contract used while the Xquant
 server-side task emitter is still being developed.
 
+See `docs/conditional-stop-take-profit-rules.md` for the full stop-loss and
+take-profit rule taxonomy, parameterization requirements, applicability,
+risks, and validation requirements.
+
+All numeric condition values in local fixtures are placeholders for local
+development only. Production values must be determined by Xquant-side
+backtests and sent in the trading task payload. trade-xquant must not
+hardcode trading thresholds from examples.
+
 The goal is for Xquant to later emit the same shape through the formal
 `/trading-gateway/tasks` API. The local file is only a development source.
 
