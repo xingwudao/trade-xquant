@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from trade_xquant.condition_orders import ConditionAction, ConditionOrder
+from trade_xquant.condition_indicators import PriceBar
 from trade_xquant.config import QmtConfig, RiskConfig, RuntimeConfig, Settings, XquantConfig
 from trade_xquant.daemon import GatewayService
 from trade_xquant.models import AccountSnapshot, PlannedOrder, Position
@@ -146,8 +149,56 @@ def test_gateway_condition_poll_once_executes_triggered_condition_order(tmp_path
     assert service.storage.get_condition_order("cond-1").status == "submitted"
 
 
+def test_gateway_condition_poll_once_executes_indicator_condition_order(tmp_path) -> None:
+    service = GatewayService(settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="atr_trailing",
+                high_water_price=1.30,
+                params={
+                    "atr_window": 3,
+                    "atr_multiple": 2.5,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker(price=0.95)
+    service.qmt = broker  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [{"condition_id": "cond-atr", "status": "dry_run_success"}]
+    assert broker.bar_calls == [("513100.SH", "1d", 3)]
+    assert len(broker.submitted_orders) == 1
+    submitted = broker.submitted_orders[0]
+    assert submitted.task_id == "condition:cond-atr"
+    assert submitted.symbol == "513100.SH"
+    assert submitted.side == "sell"
+    assert submitted.quantity == 1000
+    assert submitted.remark == "cond:cond-atr"
+    assert service.storage.get_condition_order("cond-atr").status == "submitted"
+
+
 class PositionBroker:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        price: float = 1.1,
+        price_bars: list[PriceBar] | None = None,
+    ) -> None:
+        self.price = price
+        self.price_bars = price_bars or self._default_price_bars()
+        self.bar_calls: list[tuple[str, str, int]] = []
         self.submitted_orders: list[PlannedOrder] = []
         self.events = []
 
@@ -169,7 +220,11 @@ class PositionBroker:
         ]
 
     def get_prices(self, symbols: list[str]) -> dict[str, float]:
-        return {symbol: 1.1 for symbol in symbols}
+        return {symbol: self.price for symbol in symbols}
+
+    def get_price_bars(self, symbol: str, interval: str, window: int) -> list[PriceBar]:
+        self.bar_calls.append((symbol, interval, window))
+        return self.price_bars[-window:]
 
     def place_order(self, order: PlannedOrder) -> dict[str, object]:
         self.submitted_orders.append(order)
@@ -187,3 +242,29 @@ class PositionBroker:
 
     def cancel_order(self, order_id: str) -> None:
         return None
+
+    def _default_price_bars(self) -> list[PriceBar]:
+        tz = ZoneInfo("Asia/Shanghai")
+        return [
+            PriceBar(
+                symbol="513100.SH",
+                high=1.1,
+                low=1.0,
+                close=1.05,
+                timestamp=datetime(2026, 6, 1, tzinfo=tz),
+            ),
+            PriceBar(
+                symbol="513100.SH",
+                high=1.2,
+                low=1.05,
+                close=1.18,
+                timestamp=datetime(2026, 6, 2, tzinfo=tz),
+            ),
+            PriceBar(
+                symbol="513100.SH",
+                high=1.3,
+                low=1.15,
+                close=1.24,
+                timestamp=datetime(2026, 6, 3, tzinfo=tz),
+            ),
+        ]

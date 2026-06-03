@@ -170,7 +170,12 @@ class GatewayService:
         symbols = sorted({order.symbol for order in active_orders} | {position.symbol for position in positions})
         prices = self.qmt.get_prices(symbols)
         now = datetime.now(ZoneInfo(self.settings.risk.timezone))
-        triggered_plans = ConditionEngine(self.storage).evaluate(account, positions, prices, now=now)
+        triggered_plans = ConditionEngine(self.storage, market_data=self.qmt).evaluate(
+            account,
+            positions,
+            prices,
+            now=now,
+        )
         results: list[dict[str, object]] = []
         for triggered in triggered_plans:
             condition_id = triggered.order.condition_id

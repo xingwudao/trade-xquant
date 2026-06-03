@@ -35,6 +35,11 @@ class UnwiredBarProvider:
         raise NotImplementedError("bars are not wired")
 
 
+class TimeoutBarProvider:
+    def get_price_bars(self, symbol: str, interval: str, window: int) -> list[PriceBar]:
+        raise TimeoutError("bars timed out")
+
+
 def price_bars() -> list[PriceBar]:
     tz = ZoneInfo("Asia/Shanghai")
     return [
@@ -771,6 +776,54 @@ def test_missing_market_data_does_not_block_other_triggered_conditions(tmp_path)
     assert state["state"]["evaluation_error"] == reason
 
 
+def test_indicator_error_preserves_new_high_water(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr-high-water-error",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="atr_trailing",
+                high_water_price=1.2,
+                params={
+                    "atr_window": 3,
+                    "atr_multiple": 2.0,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.3},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert plans == []
+    reason = "condition cond-atr-high-water-error requires market_data for atr_trailing"
+    assert condition_event_payload(storage, "cond-atr-high-water-error") == {
+        "method": "atr_trailing",
+        "reason": reason,
+    }
+    state = storage.get_condition_market_state("cond-atr-high-water-error")
+    assert state is not None
+    assert state["high_water_price"] == 1.3
+    assert state["state"]["evaluation_error"] == reason
+    stored = storage.get_condition_order("cond-atr-high-water-error")
+    assert stored.high_water_price == 1.3
+    assert stored.trigger_price is None
+
+
 def test_mock_broker_missing_bars_do_not_block_later_condition(tmp_path) -> None:
     storage = Storage(tmp_path / "audit.db")
     storage.initialize()
@@ -833,6 +886,117 @@ def test_mock_broker_missing_bars_do_not_block_later_condition(tmp_path) -> None
     assert state is not None
     assert state["state"]["evaluation_error"] == reason
     assert state["latest_price"] == 1.12
+
+
+def test_provider_timeout_does_not_block_later_condition(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr-timeout",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="atr_trailing",
+                high_water_price=1.2,
+                params={
+                    "atr_window": 3,
+                    "atr_multiple": 2.0,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage, market_data=TimeoutBarProvider())
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static"]
+    assert condition_event_payload(storage, "cond-atr-timeout") == {
+        "method": "atr_trailing",
+        "reason": "bars timed out",
+    }
+    state = storage.get_condition_market_state("cond-atr-timeout")
+    assert state is not None
+    assert state["state"]["evaluation_error"] == "bars timed out"
+
+
+def test_malformed_indicator_params_do_not_block_later_condition(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr-malformed",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="atr_trailing",
+                high_water_price=1.2,
+                params={
+                    "atr_window": [],
+                    "atr_multiple": 2.0,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage, market_data=BarProvider(price_bars()))
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static"]
+    payload = condition_event_payload(storage, "cond-atr-malformed")
+    assert payload["method"] == "atr_trailing"
+    assert "int() argument" in payload["reason"]
+    state = storage.get_condition_market_state("cond-atr-malformed")
+    assert state is not None
+    assert "int() argument" in state["state"]["evaluation_error"]
 
 
 def test_unwired_bar_provider_does_not_block_later_condition(tmp_path) -> None:

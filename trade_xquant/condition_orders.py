@@ -128,7 +128,7 @@ class ConditionEngine:
                         f"{missing_keys}"
                 )
                 evaluated, market_state = self._with_market_state(order, latest_price, now)
-            except ValueError as exc:
+            except (TypeError, ValueError) as exc:
                 reason = str(exc)
                 self._record_error_market_state(order, latest_price, reason, now)
                 self._record_evaluation_error(order, reason)
@@ -328,7 +328,7 @@ class ConditionEngine:
     ) -> list[PriceBar]:
         try:
             return self.market_data.get_price_bars(order.symbol, interval, window)
-        except (RuntimeError, NotImplementedError) as exc:
+        except (RuntimeError, NotImplementedError, OSError, TimeoutError) as exc:
             raise ValueError(str(exc)) from exc
 
     def _trigger_price(
@@ -409,12 +409,21 @@ class ConditionEngine:
         now: datetime,
     ) -> None:
         stored = self.storage.get_condition_market_state(order.condition_id) or {}
+        high_water_price = stored.get("high_water_price") or order.high_water_price
+        trigger_price = stored.get("trigger_price") or order.trigger_price
+        if latest_price is not None and order.method in TRAILING_CONDITION_METHODS:
+            high_water_price = self._high_water_price(order, latest_price, stored)
+            self.storage.update_condition_order_market_state(
+                order.condition_id,
+                high_water_price=high_water_price,
+                trigger_price=trigger_price,
+            )
         self.storage.record_condition_market_state(
             condition_id=order.condition_id,
             symbol=order.symbol,
             latest_price=latest_price,
-            high_water_price=stored.get("high_water_price") or order.high_water_price,
-            trigger_price=stored.get("trigger_price") or order.trigger_price,
+            high_water_price=high_water_price,
+            trigger_price=trigger_price,
             activated=bool(stored.get("activated", False)),
             activated_at=stored.get("activated_at"),
             atr_value=None,
