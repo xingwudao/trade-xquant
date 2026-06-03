@@ -175,6 +175,20 @@ class XquantAdapter:
         )
         self._handle(response)
 
+    def report_condition_result(
+        self,
+        source_task_id: str,
+        condition_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        body = {**payload, "source_task_id": source_task_id, "condition_id": condition_id}
+        response = self.client.post(
+            self._url(f"/trading-gateway/tasks/{source_task_id}/condition-results"),
+            json=body,
+            headers=self._headers(),
+        )
+        self._handle(response)
+
     def close(self) -> None:
         if self._owns_client:
             self.client.close()

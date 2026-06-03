@@ -60,6 +60,32 @@ def test_report_result_posts_execution_payload() -> None:
     assert '"status":"stale"' not in str(seen["payload"])
 
 
+def test_report_condition_result_posts_audit_payload() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["payload"] = request.read().decode()
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://xquant")
+    adapter = XquantAdapter("http://xquant/api/v1", client=client)
+
+    adapter.report_condition_result(
+        "task-1",
+        "cond-1",
+        {
+            "condition_task_id": "condition:cond-1",
+            "status": "submitted",
+            "trigger": {"reason": "latest_price <= trigger_price"},
+        },
+    )
+
+    assert seen["path"] == "/api/v1/trading-gateway/tasks/task-1/condition-results"
+    assert '"source_task_id":"task-1"' in str(seen["payload"])
+    assert '"condition_id":"cond-1"' in str(seen["payload"])
+
+
 def test_manual_task_preview_and_create_contract() -> None:
     seen: list[tuple[str, str]] = []
 

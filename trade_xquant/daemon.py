@@ -11,6 +11,7 @@ from trade_xquant import __version__
 from trade_xquant.condition_orders import (
     ConditionEngine,
     ConditionOrder,
+    TriggeredConditionPlan,
     extract_condition_orders,
 )
 from trade_xquant.config import Settings
@@ -204,6 +205,37 @@ class GatewayService:
                     "execution_result",
                     {"status": result.status, "payload": result.model_dump(mode="json")},
                 )
+                audit_payload = self._condition_audit_payload(triggered, result)
+                self.storage.record_condition_trigger_audit(
+                    condition_id=condition_id,
+                    source_task_id=triggered.order.task_id,
+                    condition_task_id=triggered.task.task_id,
+                    symbol=triggered.order.symbol,
+                    purpose=triggered.order.purpose,
+                    method=triggered.order.method,
+                    rule=audit_payload["rule"],
+                    market_state=audit_payload["market_state"],
+                    trigger=audit_payload["trigger"],
+                    execution_result=result.model_dump(mode="json"),
+                )
+                try:
+                    self.xquant.report_condition_result(
+                        triggered.order.task_id,
+                        condition_id,
+                        audit_payload,
+                    )
+                    self.storage.update_condition_audit_report_status(
+                        triggered.task.task_id,
+                        "success",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("failed to report condition result to Xquant")
+                    self.storage.update_condition_audit_report_status(
+                        triggered.task.task_id,
+                        "failed",
+                        str(exc),
+                    )
+                    self.storage.update_condition_order_status(condition_id, "needs_reconcile")
                 results.append(
                     {
                         "condition_id": condition_id,
@@ -216,6 +248,50 @@ class GatewayService:
                 self.storage.record_condition_event(condition_id, "failed", {"error": str(exc)})
                 results.append({"condition_id": condition_id, "status": "failed", "error": str(exc)})
         return results
+
+    def _condition_audit_payload(
+        self,
+        triggered: TriggeredConditionPlan,
+        result: ExecutionResult,
+    ) -> dict[str, Any]:
+        market_state = self.storage.get_condition_market_state(triggered.order.condition_id) or {}
+        trigger = {
+            "triggered_at": datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
+            "latest_price": market_state.get("latest_price"),
+            "trigger_price": market_state.get("trigger_price"),
+            "reason": self._condition_trigger_reason(triggered, market_state),
+        }
+        return {
+            "condition_task_id": triggered.task.task_id,
+            "account_id": triggered.order.account_id,
+            "portfolio_id": triggered.order.portfolio_id,
+            "symbol": triggered.order.symbol,
+            "status": result.status,
+            "trigger": trigger,
+            "rule": {
+                "scope": triggered.order.scope,
+                "purpose": triggered.order.purpose,
+                "method": triggered.order.method,
+                "params": triggered.order.params,
+                "action": triggered.order.action.model_dump(mode="json"),
+            },
+            "market_state": market_state,
+            "execution_result": result.model_dump(mode="json"),
+        }
+
+    def _condition_trigger_reason(
+        self,
+        triggered: TriggeredConditionPlan,
+        market_state: dict[str, Any],
+    ) -> str | None:
+        state = market_state.get("state", {})
+        if isinstance(state, dict) and state.get("trigger_reason"):
+            return str(state["trigger_reason"])
+        if market_state.get("latest_price") is None or market_state.get("trigger_price") is None:
+            return None
+        if triggered.order.method == "static_pct" and triggered.order.purpose == "take_profit":
+            return "latest_price >= trigger_price"
+        return "latest_price <= trigger_price"
 
     def run_forever(self) -> None:
         next_task_poll = 0.0

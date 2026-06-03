@@ -135,6 +135,7 @@ def test_gateway_condition_poll_once_executes_triggered_condition_order(tmp_path
     )
     broker = PositionBroker()
     service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
 
     result = service.condition_poll_once()
 
@@ -175,6 +176,7 @@ def test_gateway_condition_poll_once_executes_indicator_condition_order(tmp_path
     )
     broker = PositionBroker(price=0.95)
     service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
 
     result = service.condition_poll_once()
 
@@ -188,6 +190,99 @@ def test_gateway_condition_poll_once_executes_indicator_condition_order(tmp_path
     assert submitted.quantity == 1000
     assert submitted.remark == "cond:cond-atr"
     assert service.storage.get_condition_order("cond-atr").status == "submitted"
+
+
+class AuditXquant:
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.payloads: list[tuple[str, str, dict]] = []
+
+    def report_condition_result(
+        self,
+        source_task_id: str,
+        condition_id: str,
+        payload: dict,
+    ) -> None:
+        self.payloads.append((source_task_id, condition_id, payload))
+        if self.fail:
+            raise RuntimeError("xquant audit failed")
+
+
+def test_gateway_records_and_reports_condition_audit(tmp_path) -> None:
+    service = GatewayService(settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-audit",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker()
+    service.qmt = broker  # type: ignore[assignment]
+    audit = AuditXquant()
+    service.xquant = audit  # type: ignore[assignment]
+
+    service.condition_poll_once()
+
+    assert audit.payloads[0][0] == "task-1"
+    assert audit.payloads[0][1] == "cond-audit"
+    payload = audit.payloads[0][2]
+    assert payload["condition_task_id"] == "condition:cond-audit"
+    assert payload["rule"]["params"]["take_profit_pct"] == 0.1
+    stored = service.storage.get_condition_trigger_audit("condition:cond-audit")
+    assert stored is not None
+    assert stored["xquant_report_status"] == "success"
+    assert stored["rule"]["params"]["take_profit_pct"] == 0.1
+    assert stored["market_state"]["latest_price"] == 1.1
+    assert stored["trigger"]["latest_price"] == 1.1
+    assert stored["trigger"]["trigger_price"] == 1.1
+    assert stored["execution_result"]["task_id"] == "condition:cond-audit"
+
+
+def test_gateway_xquant_audit_failure_does_not_repeat_trade(tmp_path) -> None:
+    service = GatewayService(settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-audit-fail",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker()
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant(fail=True)  # type: ignore[assignment]
+
+    service.condition_poll_once()
+    service.condition_poll_once()
+
+    assert len(broker.submitted_orders) == 1
+    stored = service.storage.get_condition_trigger_audit("condition:cond-audit-fail")
+    assert stored is not None
+    assert stored["xquant_report_status"] == "failed"
+    assert stored["xquant_report_error"] == "xquant audit failed"
+    assert service.storage.get_condition_order("cond-audit-fail").status == "needs_reconcile"
 
 
 class PositionBroker:
