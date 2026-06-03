@@ -66,12 +66,9 @@ def test_price_standard_deviation_uses_closes() -> None:
 
 def test_indicator_engine_rejects_insufficient_bars() -> None:
     engine = ConditionIndicatorEngine()
-    try:
+
+    with pytest.raises(ValueError, match="at least two bars"):
         engine.hv_log_return(bars()[:1], annualization=252)
-    except ValueError as exc:
-        assert "at least two bars" in str(exc)
-    else:
-        raise AssertionError("expected ValueError")
 
 
 def test_price_bar_normalizes_symbol() -> None:
@@ -97,6 +94,56 @@ def test_price_bar_rejects_high_below_low() -> None:
             high=9.5,
             low=10.5,
             close=10.0,
+            timestamp=datetime(2026, 6, 1, tzinfo=tz),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("high", math.inf),
+        ("low", math.nan),
+        ("close", -math.inf),
+        ("close", math.inf),
+    ],
+)
+def test_price_bar_rejects_non_finite_prices(field: str, value: float) -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    payload = {
+        "symbol": "513100.SH",
+        "high": 10.5,
+        "low": 9.5,
+        "close": 10.0,
+        "timestamp": datetime(2026, 6, 1, tzinfo=tz),
+    }
+    payload[field] = value
+
+    with pytest.raises(ValueError):
+        PriceBar(**payload)
+
+
+def test_price_bar_rejects_close_above_high() -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+
+    with pytest.raises(ValueError, match="close must be between low and high"):
+        PriceBar(
+            symbol="513100.SH",
+            high=10.5,
+            low=9.5,
+            close=11.0,
+            timestamp=datetime(2026, 6, 1, tzinfo=tz),
+        )
+
+
+def test_price_bar_rejects_close_below_low() -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+
+    with pytest.raises(ValueError, match="close must be between low and high"):
+        PriceBar(
+            symbol="513100.SH",
+            high=10.5,
+            low=9.5,
+            close=9.0,
             timestamp=datetime(2026, 6, 1, tzinfo=tz),
         )
 

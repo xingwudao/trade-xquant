@@ -10,9 +10,9 @@ from trade_xquant.models import normalize_symbol, round_money
 
 class PriceBar(BaseModel):
     symbol: str
-    high: float = Field(gt=0)
-    low: float = Field(gt=0)
-    close: float = Field(gt=0)
+    high: float = Field(gt=0, allow_inf_nan=False)
+    low: float = Field(gt=0, allow_inf_nan=False)
+    close: float = Field(gt=0, allow_inf_nan=False)
     timestamp: datetime
 
     @field_validator("symbol")
@@ -21,9 +21,11 @@ class PriceBar(BaseModel):
         return normalize_symbol(value)
 
     @model_validator(mode="after")
-    def require_high_at_least_low(self) -> PriceBar:
+    def require_price_bounds(self) -> PriceBar:
         if self.high < self.low:
             raise ValueError("high must be greater than or equal to low")
+        if not (self.low <= self.close <= self.high):
+            raise ValueError("close must be between low and high")
         return self
 
 
