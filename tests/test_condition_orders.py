@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from contextlib import closing
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -172,3 +174,108 @@ def test_deferred_methods_do_not_reuse_trailing_pct_trigger_logic() -> None:
     )
     with pytest.raises(ValueError, match=expected_error):
         engine._trigger_price(order, high_water_price=1.2)
+
+
+def test_deferred_method_does_not_block_supported_condition(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="atr_trailing",
+                reference_price=1.0,
+                params={
+                    "atr_window": 3,
+                    "atr_multiple": 2.0,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=AccountSnapshot(account_id="acct", total_asset=100_000, cash=90_000),
+        positions=[
+            Position(
+                symbol="513100.SH",
+                quantity=1000,
+                sellable_quantity=1000,
+                market_value=1100,
+                cost_price=1.0,
+            )
+        ],
+        prices={"513100.SH": 1.1},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static"]
+    assert storage.get_condition_order("cond-atr").status == "armed"
+    with closing(storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id
+            """,
+            ("cond-atr",),
+        ).fetchone()
+    assert row["event_type"] == "deferred_method"
+    assert json.loads(row["payload_json"]) == {
+        "method": "atr_trailing",
+        "reason": "trigger calculation is not implemented",
+    }
+
+
+def test_extract_condition_orders_rejects_missing_required_params() -> None:
+    task = RebalanceTask.model_validate(
+        {
+            "task_id": "task-1",
+            "portfolio_id": "prod",
+            "account_id": "acct",
+            "mode": "dry_run",
+            "created_at": "2026-06-03T09:35:00+08:00",
+            "expires_at": None,
+            "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+            "constraints": {
+                "condition_orders": [
+                    {
+                        "condition_id": "cond-missing",
+                        "symbol": "513100.SH",
+                        "purpose": "stop_loss",
+                        "method": "trailing_pct",
+                        "reference_price": 1.0,
+                        "params": {},
+                    }
+                ]
+            },
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="condition cond-missing missing condition params: trail_pct",
+    ):
+        extract_condition_orders(task)

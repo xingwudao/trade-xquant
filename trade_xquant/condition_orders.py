@@ -26,6 +26,7 @@ ConditionMethod = Literal[
     "hv_log_trailing",
     "std_trailing",
 ]
+DEFERRED_CONDITION_METHODS = {"atr_trailing", "hv_log_trailing", "std_trailing"}
 ConditionStatus = Literal[
     "received",
     "armed",
@@ -107,6 +108,16 @@ class ConditionEngine:
                 continue
             latest_price = normalized_prices.get(order.symbol)
             if latest_price is None or latest_price <= 0:
+                continue
+            if order.method in DEFERRED_CONDITION_METHODS:
+                self.storage.record_condition_event(
+                    order.condition_id,
+                    "deferred_method",
+                    {
+                        "method": order.method,
+                        "reason": "trigger calculation is not implemented",
+                    },
+                )
                 continue
 
             evaluated = self._with_market_state(order, latest_price)
@@ -227,19 +238,24 @@ def extract_condition_orders(task: RebalanceTask) -> list[ConditionOrder]:
     for spec in raw_specs:
         if not isinstance(spec, dict) or spec.get("enabled", True) is False:
             continue
-        orders.append(
-            ConditionOrder.model_validate(
-                {
-                    **spec,
-                    "task_id": task.task_id,
-                    "portfolio_id": task.portfolio_id,
-                    "account_id": task.account_id,
-                    "mode": task.mode,
-                    "raw": spec,
-                    "status": spec.get("status", "armed"),
-                }
-            )
+        order = ConditionOrder.model_validate(
+            {
+                **spec,
+                "task_id": task.task_id,
+                "portfolio_id": task.portfolio_id,
+                "account_id": task.account_id,
+                "mode": task.mode,
+                "raw": spec,
+                "status": spec.get("status", "armed"),
+            }
         )
+        missing = validate_condition_hyperparameters(order)
+        if missing:
+            missing_keys = ", ".join(missing)
+            raise ValueError(
+                f"condition {order.condition_id} missing condition params: {missing_keys}"
+            )
+        orders.append(order)
     return orders
 
 
