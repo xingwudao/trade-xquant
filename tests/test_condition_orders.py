@@ -15,6 +15,7 @@ from trade_xquant.condition_orders import (
     extract_condition_orders,
 )
 from trade_xquant.condition_indicators import PriceBar
+from trade_xquant.mock_qmt_adapter import MockBrokerAdapter
 from trade_xquant.models import AccountSnapshot, Position, RebalanceTask
 from trade_xquant.storage import Storage
 
@@ -22,9 +23,16 @@ from trade_xquant.storage import Storage
 class BarProvider:
     def __init__(self, bars: list[PriceBar]) -> None:
         self.bars = bars
+        self.calls: list[tuple[str, str, int]] = []
 
     def get_price_bars(self, symbol: str, interval: str, window: int) -> list[PriceBar]:
+        self.calls.append((symbol, interval, window))
         return self.bars[-window:]
+
+
+class UnwiredBarProvider:
+    def get_price_bars(self, symbol: str, interval: str, window: int) -> list[PriceBar]:
+        raise NotImplementedError("bars are not wired")
 
 
 def price_bars() -> list[PriceBar]:
@@ -61,6 +69,16 @@ def account() -> AccountSnapshot:
 def position() -> Position:
     return Position(
         symbol="513100.SH",
+        quantity=1000,
+        sellable_quantity=1000,
+        market_value=1200,
+        cost_price=1.0,
+    )
+
+
+def second_position() -> Position:
+    return Position(
+        symbol="159915.SZ",
         quantity=1000,
         sellable_quantity=1000,
         market_value=1200,
@@ -256,27 +274,30 @@ def test_condition_engine_triggers_atr_trailing_stop_loss(tmp_path) -> None:
                 high_water_price=1.30,
                 params={
                     "atr_window": 3,
-                    "atr_multiple": 1.0,
+                    "atr_multiple": 2.5,
                     "bar_interval": "1d",
                 },
                 action=ConditionAction(type="sell_pct", pct=1.0),
             )
         ]
     )
-    engine = ConditionEngine(storage, market_data=BarProvider(price_bars()))
+    provider = BarProvider(price_bars())
+    engine = ConditionEngine(storage, market_data=provider)
 
     plans = engine.evaluate(
         account=account(),
         positions=[position()],
-        prices={"513100.SH": 1.12},
+        prices={"513100.SH": 0.95},
         now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
     assert [plan.order.condition_id for plan in plans] == ["cond-atr"]
     state = storage.get_condition_market_state("cond-atr")
     assert state is not None
-    assert state["atr_value"] == pytest.approx(0.1333)
-    assert state["trigger_price"] == pytest.approx(1.1667)
+    expected_atr = 0.1333
+    assert provider.calls == [("513100.SH", "1d", 3)]
+    assert state["atr_value"] == pytest.approx(expected_atr)
+    assert state["trigger_price"] == pytest.approx(1.30 - 2.5 * expected_atr)
 
 
 def test_condition_engine_trailing_take_profit_requires_activation(tmp_path) -> None:
@@ -355,19 +376,20 @@ def test_condition_engine_triggers_hv_log_trailing_stop_loss(tmp_path) -> None:
                 params={
                     "hv_window": 3,
                     "hv_annualization": 252,
-                    "lambda": 1.0,
+                    "lambda": 0.37,
                     "bar_interval": "1d",
                 },
                 action=ConditionAction(type="sell_pct", pct=1.0),
             )
         ]
     )
-    engine = ConditionEngine(storage, market_data=BarProvider(price_bars()))
+    provider = BarProvider(price_bars())
+    engine = ConditionEngine(storage, market_data=provider)
 
     plans = engine.evaluate(
         account=account(),
         positions=[position()],
-        prices={"513100.SH": 0.7},
+        prices={"513100.SH": 1.0},
         now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
@@ -383,11 +405,12 @@ def test_condition_engine_triggers_hv_log_trailing_stop_loss(tmp_path) -> None:
     expected_hv = math.sqrt(
         sum((item - mean_return) ** 2 for item in returns) / len(returns)
     ) * math.sqrt(252)
-    expected_trigger = 1.30 * math.exp(-expected_hv)
-    linear_trigger = 1.30 * (1 - expected_hv)
+    expected_trigger = 1.30 * math.exp(-0.37 * expected_hv)
+    linear_trigger = 1.30 * (1 - 0.37 * expected_hv)
+    assert provider.calls == [("513100.SH", "1d", 3)]
     assert state["hv_value"] == pytest.approx(expected_hv)
     assert state["trigger_price"] == pytest.approx(expected_trigger)
-    assert abs(expected_trigger - linear_trigger) > 0.1
+    assert abs(expected_trigger - linear_trigger) > 0.01
 
 
 def test_condition_engine_triggers_std_trailing_stop_loss(tmp_path) -> None:
@@ -407,19 +430,20 @@ def test_condition_engine_triggers_std_trailing_stop_loss(tmp_path) -> None:
                 high_water_price=1.30,
                 params={
                     "std_window": 3,
-                    "std_multiple": 1.0,
+                    "std_multiple": 2.5,
                     "bar_interval": "1d",
                 },
                 action=ConditionAction(type="sell_pct", pct=1.0),
             )
         ]
     )
-    engine = ConditionEngine(storage, market_data=BarProvider(price_bars()))
+    provider = BarProvider(price_bars())
+    engine = ConditionEngine(storage, market_data=provider)
 
     plans = engine.evaluate(
         account=account(),
         positions=[position()],
-        prices={"513100.SH": 1.19},
+        prices={"513100.SH": 1.09},
         now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
@@ -431,8 +455,9 @@ def test_condition_engine_triggers_std_trailing_stop_loss(tmp_path) -> None:
     expected_std = math.sqrt(
         sum((item - mean_close) ** 2 for item in close_prices) / len(close_prices)
     )
+    assert provider.calls == [("513100.SH", "1d", 3)]
     assert state["std_value"] == pytest.approx(expected_std)
-    assert state["trigger_price"] == pytest.approx(1.30 - expected_std)
+    assert state["trigger_price"] == pytest.approx(1.30 - 2.5 * expected_std)
 
 
 def test_deferred_take_profit_with_activation_price_can_activate_without_reference(
@@ -477,6 +502,80 @@ def test_deferred_take_profit_with_activation_price_can_activate_without_referen
     assert state["activated"] is True
     assert state["activated_at"] == "2026-06-03T10:00:00+08:00"
     assert state["high_water_price"] == 1.21
+
+
+def test_atr_take_profit_activates_then_triggers_on_pullback(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr-tp-pullback",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="atr_trailing",
+                reference_price=1.0,
+                params={
+                    "atr_window": 3,
+                    "atr_multiple": 1.0,
+                    "bar_interval": "1d",
+                    "activation_profit_pct": 0.2,
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    provider = BarProvider(price_bars())
+    engine = ConditionEngine(storage, market_data=provider)
+    tz = ZoneInfo("Asia/Shanghai")
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.1},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=tz),
+    )
+
+    assert plans == []
+    assert provider.calls == []
+    state = storage.get_condition_market_state("cond-atr-tp-pullback")
+    assert state is not None
+    assert state["activated"] is False
+    assert state["trigger_price"] is None
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.25},
+        now=datetime(2026, 6, 3, 10, 1, tzinfo=tz),
+    )
+
+    assert plans == []
+    assert provider.calls == [("513100.SH", "1d", 3)]
+    state = storage.get_condition_market_state("cond-atr-tp-pullback")
+    assert state is not None
+    assert state["activated"] is True
+    assert state["activated_at"] == "2026-06-03T10:01:00+08:00"
+    assert state["high_water_price"] == 1.25
+    assert state["trigger_price"] == pytest.approx(1.25 - 0.1333)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.1},
+        now=datetime(2026, 6, 3, 10, 2, tzinfo=tz),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-atr-tp-pullback"]
+    assert provider.calls == [("513100.SH", "1d", 3), ("513100.SH", "1d", 3)]
+    state = storage.get_condition_market_state("cond-atr-tp-pullback")
+    assert state is not None
+    assert state["activated_at"] == "2026-06-03T10:01:00+08:00"
+    assert state["high_water_price"] == 1.25
 
 
 def test_inactive_indicator_take_profit_does_not_require_market_data(tmp_path) -> None:
@@ -668,6 +767,260 @@ def test_missing_market_data_does_not_block_other_triggered_conditions(tmp_path)
     assert json.loads(row["payload_json"]) == {
         "method": "atr_trailing",
         "reason": "condition cond-atr-error requires market_data for atr_trailing",
+    }
+
+
+def test_mock_broker_missing_bars_do_not_block_later_condition(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr-mock-missing",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="atr_trailing",
+                high_water_price=1.2,
+                params={
+                    "atr_window": 3,
+                    "atr_multiple": 2.0,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    market_data = MockBrokerAdapter(
+        account_id="acct",
+        total_asset=100_000,
+        cash=90_000,
+        prices={"513100.SH": 1.12},
+    )
+    engine = ConditionEngine(storage, market_data=market_data)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static"]
+    with closing(storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id
+            """,
+            ("cond-atr-mock-missing",),
+        ).fetchone()
+    assert row["event_type"] == "evaluation_error"
+    assert json.loads(row["payload_json"]) == {
+        "method": "atr_trailing",
+        "reason": "mock bars missing for 513100.SH interval 1d",
+    }
+
+
+def test_unwired_bar_provider_does_not_block_later_condition(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr-unwired",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="atr_trailing",
+                high_water_price=1.2,
+                params={
+                    "atr_window": 3,
+                    "atr_multiple": 2.0,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage, market_data=UnwiredBarProvider())
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static"]
+    with closing(storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id
+            """,
+            ("cond-atr-unwired",),
+        ).fetchone()
+    assert row["event_type"] == "evaluation_error"
+    assert json.loads(row["payload_json"]) == {
+        "method": "atr_trailing",
+        "reason": "bars are not wired",
+    }
+
+
+def test_missing_latest_price_records_error_and_continues(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-missing-price",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static-second",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position(), second_position()],
+        prices={"159915.SZ": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
+    with closing(storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id
+            """,
+            ("cond-missing-price",),
+        ).fetchone()
+    assert row["event_type"] == "evaluation_error"
+    assert json.loads(row["payload_json"]) == {
+        "method": "static_pct",
+        "reason": "condition cond-missing-price missing latest_price",
+    }
+
+
+def test_nan_latest_price_records_error_and_continues(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-nan-price",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static-second",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position(), second_position()],
+        prices={"513100.SH": math.nan, "159915.SZ": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
+    with closing(storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id
+            """,
+            ("cond-nan-price",),
+        ).fetchone()
+    assert row["event_type"] == "evaluation_error"
+    assert json.loads(row["payload_json"]) == {
+        "method": "static_pct",
+        "reason": "condition cond-nan-price invalid latest_price: nan",
     }
 
 

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from trade_xquant.condition_indicators import ConditionIndicatorEngine
+from trade_xquant.condition_indicators import ConditionIndicatorEngine, PriceBar
 from trade_xquant.models import (
     AccountSnapshot,
     OrderPlan,
@@ -116,11 +116,9 @@ class ConditionEngine:
                 continue
             if order.valid_from is not None and order.valid_from > now:
                 continue
-            latest_price = normalized_prices.get(order.symbol)
-            if latest_price is None or latest_price <= 0:
-                continue
 
             try:
+                latest_price = self._latest_price(order, normalized_prices)
                 missing = validate_condition_hyperparameters(order)
                 if missing:
                     missing_keys = ", ".join(missing)
@@ -130,14 +128,7 @@ class ConditionEngine:
                     )
                 evaluated, market_state = self._with_market_state(order, latest_price, now)
             except ValueError as exc:
-                self.storage.record_condition_event(
-                    order.condition_id,
-                    "evaluation_error",
-                    {
-                        "method": order.method,
-                        "reason": str(exc),
-                    },
-                )
+                self._record_evaluation_error(order, str(exc))
                 continue
             self.storage.update_condition_order_market_state(
                 evaluated.condition_id,
@@ -174,6 +165,26 @@ class ConditionEngine:
             )
             triggered.append(plan)
         return triggered
+
+    def _latest_price(
+        self,
+        order: ConditionOrder,
+        prices: dict[str, float],
+    ) -> float:
+        if order.symbol not in prices:
+            raise ValueError(f"condition {order.condition_id} missing latest_price")
+        raw_price = prices[order.symbol]
+        try:
+            latest_price = float(raw_price)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"condition {order.condition_id} invalid latest_price: {raw_price}"
+            ) from exc
+        if latest_price <= 0 or not math.isfinite(latest_price):
+            raise ValueError(
+                f"condition {order.condition_id} invalid latest_price: {raw_price}"
+            )
+        return latest_price
 
     def _with_market_state(
         self,
@@ -295,30 +306,29 @@ class ConditionEngine:
 
         interval = str(order.params["bar_interval"])
         if order.method == "atr_trailing":
-            bars = self.market_data.get_price_bars(
-                order.symbol,
-                interval,
-                int(order.params["atr_window"]),
-            )
+            bars = self._price_bars(order, interval, int(order.params["atr_window"]))
             values["atr_value"] = self.indicators.atr(bars)
         elif order.method == "hv_log_trailing":
-            bars = self.market_data.get_price_bars(
-                order.symbol,
-                interval,
-                int(order.params["hv_window"]),
-            )
+            bars = self._price_bars(order, interval, int(order.params["hv_window"]))
             values["hv_value"] = self.indicators.hv_log_return(
                 bars,
                 float(order.params["hv_annualization"]),
             )
         elif order.method == "std_trailing":
-            bars = self.market_data.get_price_bars(
-                order.symbol,
-                interval,
-                int(order.params["std_window"]),
-            )
+            bars = self._price_bars(order, interval, int(order.params["std_window"]))
             values["std_value"] = self.indicators.price_std(bars)
         return values
+
+    def _price_bars(
+        self,
+        order: ConditionOrder,
+        interval: str,
+        window: int,
+    ) -> list[PriceBar]:
+        try:
+            return self.market_data.get_price_bars(order.symbol, interval, window)
+        except (RuntimeError, NotImplementedError) as exc:
+            raise ValueError(str(exc)) from exc
 
     def _trigger_price(
         self,
@@ -392,6 +402,16 @@ class ConditionEngine:
                 "purpose": order.purpose,
                 "params": order.params,
                 "activation_price": market_state["activation_price"],
+            },
+        )
+
+    def _record_evaluation_error(self, order: ConditionOrder, reason: str) -> None:
+        self.storage.record_condition_event(
+            order.condition_id,
+            "evaluation_error",
+            {
+                "method": order.method,
+                "reason": reason,
             },
         )
 
