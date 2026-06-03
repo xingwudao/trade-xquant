@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from trade_xquant.condition_indicators import ConditionIndicatorEngine
 from trade_xquant.models import (
     AccountSnapshot,
     OrderPlan,
@@ -26,7 +27,8 @@ ConditionMethod = Literal[
     "hv_log_trailing",
     "std_trailing",
 ]
-DEFERRED_CONDITION_METHODS = {"atr_trailing", "hv_log_trailing", "std_trailing"}
+BAR_CONDITION_METHODS = {"atr_trailing", "hv_log_trailing", "std_trailing"}
+TRAILING_CONDITION_METHODS = {"trailing_pct", *BAR_CONDITION_METHODS}
 CONDITION_PARAM_ALIASES = {
     "stop_loss_pct": ("pct",),
     "take_profit_pct": ("pct",),
@@ -89,8 +91,10 @@ class TriggeredConditionPlan:
 class ConditionEngine:
     lot_size = 100
 
-    def __init__(self, storage) -> None:
+    def __init__(self, storage, market_data=None) -> None:
         self.storage = storage
+        self.market_data = market_data
+        self.indicators = ConditionIndicatorEngine()
 
     def evaluate(
         self,
@@ -114,24 +118,42 @@ class ConditionEngine:
             latest_price = normalized_prices.get(order.symbol)
             if latest_price is None or latest_price <= 0:
                 continue
-            if order.method in DEFERRED_CONDITION_METHODS:
+
+            try:
+                missing = validate_condition_hyperparameters(order)
+                if missing:
+                    missing_keys = ", ".join(missing)
+                    raise ValueError(
+                        f"condition {order.condition_id} missing condition params: "
+                        f"{missing_keys}"
+                    )
+                evaluated, market_state = self._with_market_state(order, latest_price, now)
+            except ValueError as exc:
                 self.storage.record_condition_event(
                     order.condition_id,
-                    "deferred_method",
+                    "evaluation_error",
                     {
                         "method": order.method,
-                        "reason": "trigger calculation is not implemented",
+                        "reason": str(exc),
                     },
                 )
-                continue
-
-            evaluated = self._with_market_state(order, latest_price)
+                raise
             self.storage.update_condition_order_market_state(
                 evaluated.condition_id,
                 high_water_price=evaluated.high_water_price,
                 trigger_price=evaluated.trigger_price,
             )
-            if not self._is_triggered(evaluated, latest_price):
+            self._record_condition_market_state(
+                evaluated,
+                latest_price,
+                market_state,
+                now,
+            )
+            if not self._is_triggered(
+                evaluated,
+                latest_price,
+                activated=bool(market_state["activated"]),
+            ):
                 continue
 
             plan = self._build_sell_plan(evaluated, account, position_map.get(evaluated.symbol), latest_price)
@@ -152,14 +174,134 @@ class ConditionEngine:
             triggered.append(plan)
         return triggered
 
-    def _with_market_state(self, order: ConditionOrder, latest_price: float) -> ConditionOrder:
-        high_water_price = order.high_water_price
-        if order.method == "trailing_pct":
-            high_water_price = max(high_water_price or order.reference_price or latest_price, latest_price)
-        trigger_price = self._trigger_price(order, high_water_price)
-        return order.model_copy(update={"high_water_price": high_water_price, "trigger_price": trigger_price})
+    def _with_market_state(
+        self,
+        order: ConditionOrder,
+        latest_price: float,
+        now: datetime,
+    ) -> tuple[ConditionOrder, dict[str, Any]]:
+        stored = self.storage.get_condition_market_state(order.condition_id) or {}
+        activated, activated_at, activation_price = self._activation_state(
+            order,
+            latest_price,
+            now,
+            stored,
+        )
+        high_water_price = self._high_water_price(order, latest_price, stored)
+        indicator_values = self._indicator_values(order)
+        trigger_price = self._trigger_price(
+            order,
+            high_water_price,
+            indicator_values=indicator_values,
+        )
+        evaluated = order.model_copy(
+            update={
+                "high_water_price": high_water_price,
+                "trigger_price": trigger_price,
+            }
+        )
+        market_state = {
+            "activated": activated,
+            "activated_at": activated_at,
+            "activation_price": activation_price,
+            **indicator_values,
+        }
+        return evaluated, market_state
 
-    def _trigger_price(self, order: ConditionOrder, high_water_price: float | None) -> float:
+    def _activation_state(
+        self,
+        order: ConditionOrder,
+        latest_price: float,
+        now: datetime,
+        stored: dict[str, Any],
+    ) -> tuple[bool, str | None, float | None]:
+        if order.purpose == "stop_loss" or order.method == "static_pct":
+            return True, None, None
+        if stored.get("activated"):
+            return True, stored.get("activated_at"), self._activation_price(order)
+
+        activation_price = self._activation_price(order)
+        if activation_price is None:
+            if order.method == "trailing_pct":
+                return True, None, None
+            raise ValueError(
+                f"condition {order.condition_id} missing "
+                "activation_profit_pct|activation_price"
+            )
+        if latest_price >= activation_price:
+            return True, now.isoformat(), activation_price
+        return False, None, activation_price
+
+    def _activation_price(self, order: ConditionOrder) -> float | None:
+        activation_price = order.params.get("activation_price")
+        if activation_price is not None:
+            return float(activation_price)
+        activation_profit_pct = order.params.get("activation_profit_pct")
+        if activation_profit_pct is None:
+            return None
+        if order.reference_price is None:
+            raise ValueError(f"condition {order.condition_id} missing reference_price")
+        return order.reference_price * (1 + float(activation_profit_pct))
+
+    def _high_water_price(
+        self,
+        order: ConditionOrder,
+        latest_price: float,
+        stored: dict[str, Any],
+    ) -> float | None:
+        if order.method not in TRAILING_CONDITION_METHODS:
+            return order.high_water_price
+        candidates = [
+            stored.get("high_water_price"),
+            order.high_water_price,
+            order.reference_price,
+            latest_price,
+        ]
+        return max(float(value) for value in candidates if value is not None)
+
+    def _indicator_values(self, order: ConditionOrder) -> dict[str, float | None]:
+        values = {"atr_value": None, "hv_value": None, "std_value": None}
+        if order.method not in BAR_CONDITION_METHODS:
+            return values
+        if self.market_data is None:
+            raise ValueError(
+                f"condition {order.condition_id} requires market_data for "
+                f"{order.method}"
+            )
+
+        interval = str(order.params["bar_interval"])
+        if order.method == "atr_trailing":
+            bars = self.market_data.get_price_bars(
+                order.symbol,
+                interval,
+                int(order.params["atr_window"]),
+            )
+            values["atr_value"] = self.indicators.atr(bars)
+        elif order.method == "hv_log_trailing":
+            bars = self.market_data.get_price_bars(
+                order.symbol,
+                interval,
+                int(order.params["hv_window"]),
+            )
+            values["hv_value"] = self.indicators.hv_log_return(
+                bars,
+                float(order.params["hv_annualization"]),
+            )
+        elif order.method == "std_trailing":
+            bars = self.market_data.get_price_bars(
+                order.symbol,
+                interval,
+                int(order.params["std_window"]),
+            )
+            values["std_value"] = self.indicators.price_std(bars)
+        return values
+
+    def _trigger_price(
+        self,
+        order: ConditionOrder,
+        high_water_price: float | None,
+        indicator_values: dict[str, float | None] | None = None,
+    ) -> float:
         if order.method == "static_pct":
             reference_price = order.reference_price
             if reference_price is None:
@@ -171,12 +313,70 @@ class ConditionEngine:
             if high_water_price is None:
                 raise ValueError(f"condition {order.condition_id} missing high_water_price")
             return high_water_price * (1 - _param(order, "trail_pct", "pct"))
+        if order.method in BAR_CONDITION_METHODS:
+            if high_water_price is None:
+                raise ValueError(f"condition {order.condition_id} missing high_water_price")
+            values = indicator_values or self._indicator_values(order)
+            if order.method == "atr_trailing":
+                atr_value = values["atr_value"]
+                if atr_value is None:
+                    raise ValueError(f"condition {order.condition_id} missing atr_value")
+                return high_water_price - atr_value * float(order.params["atr_multiple"])
+            if order.method == "hv_log_trailing":
+                hv_value = values["hv_value"]
+                if hv_value is None:
+                    raise ValueError(f"condition {order.condition_id} missing hv_value")
+                return high_water_price * (1 - float(order.params["lambda"]) * hv_value)
+            std_value = values["std_value"]
+            if std_value is None:
+                raise ValueError(f"condition {order.condition_id} missing std_value")
+            return high_water_price - std_value * float(order.params["std_multiple"])
         raise ValueError(
             f"condition {order.condition_id} method {order.method} "
             "trigger calculation is not implemented"
         )
 
-    def _is_triggered(self, order: ConditionOrder, latest_price: float) -> bool:
+    def _record_condition_market_state(
+        self,
+        order: ConditionOrder,
+        latest_price: float,
+        market_state: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        market_data_source = (
+            type(self.market_data).__name__
+            if order.method in BAR_CONDITION_METHODS and self.market_data is not None
+            else "prices"
+        )
+        self.storage.record_condition_market_state(
+            condition_id=order.condition_id,
+            symbol=order.symbol,
+            latest_price=latest_price,
+            high_water_price=order.high_water_price,
+            trigger_price=order.trigger_price,
+            activated=bool(market_state["activated"]),
+            activated_at=market_state["activated_at"],
+            atr_value=market_state["atr_value"],
+            hv_value=market_state["hv_value"],
+            std_value=market_state["std_value"],
+            computed_at=now.isoformat(),
+            market_data_source=market_data_source,
+            state={
+                "method": order.method,
+                "purpose": order.purpose,
+                "params": order.params,
+                "activation_price": market_state["activation_price"],
+            },
+        )
+
+    def _is_triggered(
+        self,
+        order: ConditionOrder,
+        latest_price: float,
+        activated: bool = True,
+    ) -> bool:
+        if not activated:
+            return False
         if order.trigger_price is None:
             return False
         if order.method == "static_pct" and order.purpose == "take_profit":
@@ -281,7 +481,7 @@ def required_condition_params(order: ConditionOrder) -> set[str]:
         required = {"std_window", "std_multiple", "bar_interval"}
     else:
         return set()
-    if order.purpose == "take_profit" and order.method in DEFERRED_CONDITION_METHODS:
+    if order.purpose == "take_profit" and order.method in BAR_CONDITION_METHODS:
         required.add("activation_profit_pct|activation_price")
     return required
 
@@ -305,7 +505,7 @@ def validate_condition_hyperparameters(order: ConditionOrder) -> list[str]:
 def _requires_reference_price(order: ConditionOrder) -> bool:
     if order.method == "static_pct":
         return True
-    if order.method in DEFERRED_CONDITION_METHODS and order.purpose == "take_profit":
+    if order.method in BAR_CONDITION_METHODS and order.purpose == "take_profit":
         return (
             order.params.get("activation_profit_pct") is not None
             and order.params.get("activation_price") is None
