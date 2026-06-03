@@ -108,7 +108,6 @@ condition orders live under `constraints.condition_orders`.
             "purpose": "stop_loss",
             "method": "trailing_pct",
             "reference_price": 1.0,
-            "high_water_price": 1.0,
             "params": {
               "trail_pct": 0.08
             },
@@ -142,6 +141,9 @@ Local JSON may mock every Xquant single-instrument sell-side condition rule:
 The JSON file mocks Xquant task payloads only. It does not store high-water
 state, activation state, indicator snapshots, trigger evidence, or execution
 audits. Those are stored in SQLite.
+
+Task payloads may carry reference prices and rule hyperparameters.
+Market-derived state is created and updated by trade-xquant at runtime.
 
 ## Execution
 
