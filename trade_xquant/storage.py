@@ -455,7 +455,17 @@ class Storage:
                     xquant_report_error, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(condition_task_id) DO UPDATE SET
+                    condition_id=excluded.condition_id,
+                    source_task_id=excluded.source_task_id,
+                    symbol=excluded.symbol,
+                    purpose=excluded.purpose,
+                    method=excluded.method,
+                    rule_json=excluded.rule_json,
+                    market_state_json=excluded.market_state_json,
+                    trigger_json=excluded.trigger_json,
                     execution_result_json=excluded.execution_result_json,
+                    xquant_report_status=excluded.xquant_report_status,
+                    xquant_report_error=excluded.xquant_report_error,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -483,7 +493,7 @@ class Storage:
         error: str | None = None,
     ) -> None:
         with self._connection() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE condition_trigger_audits
                 SET xquant_report_status=?, xquant_report_error=?, updated_at=?
@@ -491,6 +501,8 @@ class Storage:
                 """,
                 (status, error, utc_now(), condition_task_id),
             )
+            if cursor.rowcount == 0:
+                raise KeyError(condition_task_id)
 
     def get_condition_trigger_audit(self, condition_task_id: str) -> dict[str, Any] | None:
         with self._connection() as conn:

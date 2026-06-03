@@ -109,10 +109,34 @@ def test_condition_market_state_roundtrip(tmp_path) -> None:
     state = storage.get_condition_market_state("cond-1")
 
     assert state is not None
+    assert set(state) == {
+        "condition_id",
+        "symbol",
+        "latest_price",
+        "high_water_price",
+        "trigger_price",
+        "activated",
+        "activated_at",
+        "atr_value",
+        "hv_value",
+        "std_value",
+        "computed_at",
+        "market_data_source",
+        "state",
+    }
+    assert state["condition_id"] == "cond-1"
     assert state["symbol"] == "513100.SH"
     assert state["latest_price"] == 1.23
+    assert state["high_water_price"] == 1.4
+    assert state["trigger_price"] == 1.18
     assert state["activated"] is True
-    assert state["state"]["reason"] == "test"
+    assert state["activated_at"] == "2026-06-03T10:00:00+08:00"
+    assert state["atr_value"] == 0.03
+    assert state["hv_value"] is None
+    assert state["std_value"] is None
+    assert state["computed_at"] == "2026-06-03T10:30:00+08:00"
+    assert state["market_data_source"] == "mock"
+    assert state["state"] == {"reason": "test"}
 
 
 def test_condition_market_state_upsert_updates_existing_row(tmp_path) -> None:
@@ -182,10 +206,95 @@ def test_condition_trigger_audit_roundtrip_and_report_status(tmp_path) -> None:
     audit = storage.get_condition_trigger_audit("condition:cond-1")
 
     assert audit is not None
+    assert set(audit) == {
+        "condition_task_id",
+        "condition_id",
+        "source_task_id",
+        "symbol",
+        "purpose",
+        "method",
+        "xquant_report_status",
+        "xquant_report_error",
+        "created_at",
+        "updated_at",
+        "rule",
+        "market_state",
+        "trigger",
+        "execution_result",
+    }
+    assert audit["condition_task_id"] == "condition:cond-1"
+    assert audit["condition_id"] == "cond-1"
     assert audit["source_task_id"] == "task-1"
-    assert audit["rule"]["params"]["take_profit_pct"] == 0.1
+    assert audit["symbol"] == "513100.SH"
+    assert audit["purpose"] == "take_profit"
+    assert audit["method"] == "static_pct"
+    assert audit["rule"] == {"params": {"take_profit_pct": 0.1}}
+    assert audit["market_state"] == {"latest_price": 1.1}
+    assert audit["trigger"] == {"reason": "latest_price >= trigger_price"}
+    assert audit["execution_result"] == {"status": "dry_run_success"}
     assert audit["xquant_report_status"] == "failed"
     assert audit["xquant_report_error"] == "http 409"
+    assert audit["created_at"]
+    assert audit["updated_at"]
+
+
+def test_condition_trigger_audit_rerecord_updates_payloads_and_preserves_created_at(
+    tmp_path, monkeypatch
+) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    timestamps = iter(
+        [
+            "2026-06-03T02:00:00+00:00",
+            "2026-06-03T02:01:00+00:00",
+            "2026-06-03T02:02:00+00:00",
+        ]
+    )
+    monkeypatch.setattr("trade_xquant.storage.utc_now", lambda: next(timestamps))
+
+    storage.record_condition_trigger_audit(
+        condition_id="cond-1",
+        source_task_id="task-1",
+        condition_task_id="condition:cond-1",
+        symbol="513100.SH",
+        purpose="take_profit",
+        method="static_pct",
+        rule={"params": {"take_profit_pct": 0.1}},
+        market_state={"latest_price": 1.1},
+        trigger={"reason": "latest_price >= trigger_price"},
+        execution_result={"status": "dry_run_success"},
+    )
+    storage.update_condition_audit_report_status("condition:cond-1", "failed", "http 409")
+
+    storage.record_condition_trigger_audit(
+        condition_id="cond-2",
+        source_task_id="task-2",
+        condition_task_id="condition:cond-1",
+        symbol="159915.SZ",
+        purpose="stop_loss",
+        method="trailing_pct",
+        rule={"params": {"trail_pct": 0.08}},
+        market_state={"latest_price": 0.9, "high_water_price": 1.2},
+        trigger={"reason": "latest_price <= trigger_price"},
+        execution_result={"status": "submitted"},
+    )
+
+    audit = storage.get_condition_trigger_audit("condition:cond-1")
+
+    assert audit is not None
+    assert audit["condition_id"] == "cond-2"
+    assert audit["source_task_id"] == "task-2"
+    assert audit["symbol"] == "159915.SZ"
+    assert audit["purpose"] == "stop_loss"
+    assert audit["method"] == "trailing_pct"
+    assert audit["rule"] == {"params": {"trail_pct": 0.08}}
+    assert audit["market_state"] == {"latest_price": 0.9, "high_water_price": 1.2}
+    assert audit["trigger"] == {"reason": "latest_price <= trigger_price"}
+    assert audit["execution_result"] == {"status": "submitted"}
+    assert audit["xquant_report_status"] == "pending"
+    assert audit["xquant_report_error"] is None
+    assert audit["created_at"] == "2026-06-03T02:00:00+00:00"
+    assert audit["updated_at"] == "2026-06-03T02:02:00+00:00"
 
 
 def test_condition_trigger_audit_report_status_update_preserves_payloads(tmp_path) -> None:
@@ -227,3 +336,13 @@ def test_condition_state_and_audit_getters_return_none_for_missing_keys(tmp_path
 
     assert storage.get_condition_market_state("missing") is None
     assert storage.get_condition_trigger_audit("condition:missing") is None
+
+
+def test_condition_audit_report_status_update_missing_raises(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+
+    with pytest.raises(KeyError) as exc:
+        storage.update_condition_audit_report_status("condition:missing", "failed")
+
+    assert exc.value.args == ("condition:missing",)
