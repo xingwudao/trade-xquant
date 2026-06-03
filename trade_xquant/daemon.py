@@ -168,8 +168,8 @@ class GatewayService:
         self.qmt.connect()
         account = self.qmt.get_account_snapshot()
         positions = self.qmt.get_positions()
-        symbols = sorted({order.symbol for order in active_orders} | {position.symbol for position in positions})
-        prices = self.qmt.get_prices(symbols)
+        symbols = sorted({order.symbol for order in active_orders})
+        prices = self._condition_prices(symbols)
         now = datetime.now(ZoneInfo(self.settings.risk.timezone))
         triggered_plans = ConditionEngine(self.storage, market_data=self.qmt).evaluate(
             account,
@@ -249,6 +249,15 @@ class GatewayService:
                 self.storage.record_condition_event(condition_id, "failed", {"error": str(exc)})
                 results.append({"condition_id": condition_id, "status": "failed", "error": str(exc)})
         return results
+
+    def _condition_prices(self, symbols: list[str]) -> dict[str, float]:
+        prices: dict[str, float] = {}
+        for symbol in symbols:
+            try:
+                prices.update(self.qmt.get_prices([symbol]))
+            except Exception as exc:  # noqa: BLE001 - quote gaps are audited per condition
+                logger.exception("failed to query condition price: %s", symbol)
+        return prices
 
     def _failed_condition_execution_result(
         self,

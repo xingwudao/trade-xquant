@@ -115,6 +115,10 @@ class ConditionEngine:
         now: datetime,
     ) -> list[TriggeredConditionPlan]:
         position_map = {position.symbol: position for position in positions}
+        remaining_sellable = {
+            position.symbol: max(0, position.sellable_quantity)
+            for position in positions
+        }
         normalized_prices = {normalize_symbol(symbol): price for symbol, price in prices.items()}
         triggered: list[TriggeredConditionPlan] = []
         for order in self.storage.list_active_condition_orders():
@@ -161,7 +165,13 @@ class ConditionEngine:
             ):
                 continue
 
-            plan = self._build_sell_plan(evaluated, account, position_map.get(evaluated.symbol), latest_price)
+            plan = self._build_sell_plan(
+                evaluated,
+                account,
+                position_map.get(evaluated.symbol),
+                latest_price,
+                remaining_sellable.get(evaluated.symbol, 0),
+            )
             if plan is None:
                 self.storage.update_condition_order_status(evaluated.condition_id, "failed")
                 self.storage.record_condition_event(
@@ -177,6 +187,11 @@ class ConditionEngine:
                 {"price": latest_price, "trigger_price": evaluated.trigger_price},
             )
             triggered.append(plan)
+            submitted_quantity = sum(order.quantity for order in plan.plan.orders)
+            remaining_sellable[evaluated.symbol] = max(
+                0,
+                remaining_sellable.get(evaluated.symbol, 0) - submitted_quantity,
+            )
         return triggered
 
     def _latest_price(
@@ -433,6 +448,12 @@ class ConditionEngine:
         now: datetime,
     ) -> None:
         stored = self.storage.get_condition_market_state(order.condition_id) or {}
+        activated, activated_at, activation_price = self._error_activation_state(
+            order,
+            latest_price,
+            stored,
+            now,
+        )
         high_water_price = self._safe_stored_market_number(stored, "high_water_price")
         if high_water_price is None:
             high_water_price = order.high_water_price
@@ -456,8 +477,8 @@ class ConditionEngine:
             latest_price=latest_price,
             high_water_price=high_water_price,
             trigger_price=trigger_price,
-            activated=bool(stored.get("activated", False)),
-            activated_at=stored.get("activated_at"),
+            activated=activated,
+            activated_at=activated_at,
             atr_value=None,
             hv_value=None,
             std_value=None,
@@ -467,9 +488,29 @@ class ConditionEngine:
                 "method": order.method,
                 "purpose": order.purpose,
                 "params": order.params,
+                "activation_price": activation_price,
                 "evaluation_error": reason,
             },
         )
+
+    def _error_activation_state(
+        self,
+        order: ConditionOrder,
+        latest_price: float | None,
+        stored: dict[str, Any],
+        now: datetime,
+    ) -> tuple[bool, str | None, float | None]:
+        if order.purpose != "take_profit" or order.method not in TRAILING_CONDITION_METHODS:
+            return bool(stored.get("activated", False)), stored.get("activated_at"), None
+        try:
+            activation_price = self._activation_price(order)
+        except (TypeError, ValueError):
+            return bool(stored.get("activated", False)), stored.get("activated_at"), None
+        if stored.get("activated"):
+            return True, stored.get("activated_at"), activation_price
+        if latest_price is not None and activation_price is not None and latest_price >= activation_price:
+            return True, now.isoformat(), activation_price
+        return False, None, activation_price
 
     def _safe_stored_market_number(
         self,
@@ -535,11 +576,18 @@ class ConditionEngine:
         account: AccountSnapshot,
         position: Position | None,
         latest_price: float,
+        available_sellable: int | None = None,
     ) -> TriggeredConditionPlan | None:
         if position is None or position.sellable_quantity <= 0:
             return None
+        remaining_sellable = position.sellable_quantity
+        if available_sellable is not None:
+            remaining_sellable = min(position.sellable_quantity, max(0, available_sellable))
+        if remaining_sellable <= 0:
+            return None
         pct = 1.0 if order.action.type == "clear" else order.action.pct
-        quantity = self._floor_lot(position.sellable_quantity * pct)
+        requested_quantity = self._floor_lot(position.sellable_quantity * pct)
+        quantity = min(requested_quantity, self._floor_lot(remaining_sellable))
         if quantity <= 0:
             return None
         condition_task_id = f"condition:{order.condition_id}"

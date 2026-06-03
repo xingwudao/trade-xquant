@@ -399,6 +399,56 @@ def test_gateway_condition_poll_once_executes_triggered_condition_order(tmp_path
     assert service.storage.get_condition_order("cond-1").status == "submitted"
 
 
+def test_gateway_condition_quote_failure_does_not_block_other_conditions(tmp_path) -> None:
+    service = GatewayService(settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-missing-quote",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-valid-quote",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    broker = SelectivePriceBroker({"159915.SZ": 1.12})
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [{"condition_id": "cond-valid-quote", "status": "dry_run_success"}]
+    assert len(broker.submitted_orders) == 1
+    assert broker.submitted_orders[0].symbol == "159915.SZ"
+    assert service.storage.get_condition_order("cond-missing-quote").status == "armed"
+    state = service.storage.get_condition_market_state("cond-missing-quote")
+    assert state is not None
+    assert state["state"]["evaluation_error"] == (
+        "condition cond-missing-quote missing latest_price"
+    )
+
+
 def test_gateway_condition_poll_once_executes_indicator_condition_order(tmp_path) -> None:
     service = GatewayService(settings_for(tmp_path))
     service.storage.initialize()
@@ -692,3 +742,33 @@ class PositionBroker:
                 timestamp=datetime(2026, 6, 3, tzinfo=tz),
             ),
         ]
+
+
+class SelectivePriceBroker(PositionBroker):
+    def __init__(self, prices: dict[str, float]) -> None:
+        super().__init__()
+        self.prices = prices
+
+    def get_positions(self) -> list[Position]:
+        return [
+            Position(
+                symbol="513100.SH",
+                quantity=1000,
+                sellable_quantity=1000,
+                market_value=1100,
+                cost_price=1.0,
+            ),
+            Position(
+                symbol="159915.SZ",
+                quantity=1000,
+                sellable_quantity=1000,
+                market_value=1100,
+                cost_price=1.0,
+            ),
+        ]
+
+    def get_prices(self, symbols: list[str]) -> dict[str, float]:
+        missing = [symbol for symbol in symbols if symbol not in self.prices]
+        if missing:
+            raise RuntimeError(f"mock price missing for symbols: {missing}")
+        return {symbol: self.prices[symbol] for symbol in symbols}

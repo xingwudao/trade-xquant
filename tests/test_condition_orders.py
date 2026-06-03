@@ -364,6 +364,54 @@ def test_condition_engine_triggers_atr_trailing_stop_loss(tmp_path) -> None:
     assert state["trigger_price"] == pytest.approx(1.30 - 2.5 * expected_atr)
 
 
+def test_condition_engine_caps_same_symbol_triggered_sells(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-static-tp",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-trailing-sl",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="trailing_pct",
+                high_water_price=1.3,
+                params={"trail_pct": 0.08},
+                action=ConditionAction(type="clear"),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static-tp"]
+    assert plans[0].plan.orders[0].quantity == 1000
+    assert storage.get_condition_order("cond-static-tp").status == "triggered"
+    assert storage.get_condition_order("cond-trailing-sl").status == "failed"
+
+
 def test_condition_engine_trailing_take_profit_requires_activation(tmp_path) -> None:
     storage = Storage(tmp_path / "audit.db")
     storage.initialize()
@@ -985,6 +1033,63 @@ def test_provider_timeout_does_not_block_later_condition(tmp_path) -> None:
     }
     state = storage.get_condition_market_state("cond-atr-timeout")
     assert state is not None
+    assert state["state"]["evaluation_error"] == "bars timed out"
+
+
+def test_indicator_error_preserves_new_take_profit_activation(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-atr-tp-timeout",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="atr_trailing",
+                reference_price=1.0,
+                params={
+                    "activation_profit_pct": 0.2,
+                    "atr_window": 3,
+                    "atr_multiple": 1.5,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-static-second",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    engine = ConditionEngine(storage, market_data=TimeoutBarProvider())
+    now = datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position(), second_position()],
+        prices={"513100.SH": 1.25, "159915.SZ": 1.12},
+        now=now,
+    )
+
+    assert [plan.order.condition_id for plan in plans] == ["cond-static-second"]
+    state = storage.get_condition_market_state("cond-atr-tp-timeout")
+    assert state is not None
+    assert state["activated"] is True
+    assert state["activated_at"] == now.isoformat()
+    assert state["high_water_price"] == 1.25
     assert state["state"]["evaluation_error"] == "bars timed out"
 
 
