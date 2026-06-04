@@ -294,7 +294,16 @@ class Storage:
             rows = conn.execute(
                 """
                 SELECT * FROM condition_orders
-                WHERE enabled=1 AND status IN ('received', 'armed')
+                WHERE enabled=1
+                  AND status IN ('received', 'armed', 'triggered', 'submitting')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM task_results
+                    WHERE task_results.task_id = 'condition:' || condition_orders.condition_id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM submitted_orders
+                    WHERE submitted_orders.task_id = 'condition:' || condition_orders.condition_id
+                  )
                 ORDER BY created_at, condition_id
                 """
             ).fetchall()

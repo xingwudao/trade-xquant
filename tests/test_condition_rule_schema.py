@@ -110,6 +110,21 @@ def test_required_condition_params_are_method_and_purpose_specific() -> None:
     ]
 
 
+def test_hv_log_trailing_rejects_one_bar_window() -> None:
+    order = condition(
+        "hv_log_trailing",
+        "stop_loss",
+        {
+            "hv_window": 1,
+            "hv_annualization": 252,
+            "lambda": 1.0,
+            "bar_interval": "1d",
+        },
+    )
+
+    assert validate_condition_hyperparameters(order) == ["hv_window"]
+
+
 def test_trailing_pct_stop_loss_legacy_shape_does_not_require_reference() -> None:
     stop_loss = condition("trailing_pct", "stop_loss", {"trail_pct": 0.08})
 

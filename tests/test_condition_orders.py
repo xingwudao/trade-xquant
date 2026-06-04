@@ -231,7 +231,7 @@ def test_condition_engine_triggers_static_take_profit_sell_plan(tmp_path) -> Non
     assert plan.plan.orders[0].side == "sell"
     assert plan.plan.orders[0].quantity == 500
     assert plan.plan.orders[0].remark == "cond:cond-static"
-    assert storage.get_condition_order("cond-static").status == "triggered"
+    assert storage.get_condition_order("cond-static").status == "armed"
 
 
 def test_condition_engine_updates_trailing_high_water_before_trigger(tmp_path) -> None:
@@ -408,8 +408,24 @@ def test_condition_engine_caps_same_symbol_triggered_sells(tmp_path) -> None:
 
     assert [plan.order.condition_id for plan in plans] == ["cond-static-tp"]
     assert plans[0].plan.orders[0].quantity == 1000
-    assert storage.get_condition_order("cond-static-tp").status == "triggered"
-    assert storage.get_condition_order("cond-trailing-sl").status == "failed"
+    assert storage.get_condition_order("cond-static-tp").status == "armed"
+    assert storage.get_condition_order("cond-trailing-sl").status == "armed"
+    with closing(storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("cond-trailing-sl",),
+        ).fetchone()
+    assert row["event_type"] == "deferred"
+    assert json.loads(row["payload_json"]) == {
+        "reason": "symbol already has triggered condition in poll",
+        "symbol": "513100.SH",
+    }
 
 
 def test_condition_engine_trailing_take_profit_requires_activation(tmp_path) -> None:
@@ -468,6 +484,131 @@ def test_condition_engine_trailing_take_profit_requires_activation(tmp_path) -> 
     )
 
     assert [plan.order.condition_id for plan in plans] == ["cond-trailing-tp"]
+
+
+def test_bar_based_condition_records_error_for_nonpositive_trigger(tmp_path) -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    bars = [
+        PriceBar(
+            symbol="513100.SH",
+            high=0.20,
+            low=0.10,
+            close=0.15,
+            timestamp=datetime(2026, 6, 1, tzinfo=tz),
+        ),
+        PriceBar(
+            symbol="513100.SH",
+            high=0.22,
+            low=0.12,
+            close=0.18,
+            timestamp=datetime(2026, 6, 2, tzinfo=tz),
+        ),
+    ]
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-nonpositive-atr",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="atr_trailing",
+                high_water_price=0.10,
+                params={
+                    "atr_window": 2,
+                    "atr_multiple": 2.0,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    engine = ConditionEngine(storage, market_data=BarProvider(bars))
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 0.05},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=tz),
+    )
+
+    assert plans == []
+    assert storage.get_condition_order("cond-nonpositive-atr").trigger_price is None
+    assert [order.condition_id for order in storage.list_active_condition_orders()] == [
+        "cond-nonpositive-atr"
+    ]
+    reason = "condition cond-nonpositive-atr invalid trigger_price"
+    assert condition_event_payload(storage, "cond-nonpositive-atr") == {
+        "method": "atr_trailing",
+        "reason": reason,
+    }
+    state = storage.get_condition_market_state("cond-nonpositive-atr")
+    assert state is not None
+    assert state["trigger_price"] is None
+    assert state["state"]["evaluation_error"] == reason
+
+
+def test_std_condition_records_error_for_nonpositive_trigger(tmp_path) -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    bars = [
+        PriceBar(
+            symbol="513100.SH",
+            high=0.20,
+            low=0.01,
+            close=0.01,
+            timestamp=datetime(2026, 6, 1, tzinfo=tz),
+        ),
+        PriceBar(
+            symbol="513100.SH",
+            high=0.40,
+            low=0.40,
+            close=0.40,
+            timestamp=datetime(2026, 6, 2, tzinfo=tz),
+        ),
+    ]
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-nonpositive-std",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="std_trailing",
+                high_water_price=0.10,
+                params={
+                    "std_window": 2,
+                    "std_multiple": 2.0,
+                    "bar_interval": "1d",
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    engine = ConditionEngine(storage, market_data=BarProvider(bars))
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 0.05},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=tz),
+    )
+
+    assert plans == []
+    assert storage.get_condition_order("cond-nonpositive-std").trigger_price is None
+    reason = "condition cond-nonpositive-std invalid trigger_price"
+    assert condition_event_payload(storage, "cond-nonpositive-std") == {
+        "method": "std_trailing",
+        "reason": reason,
+    }
 
 
 def test_condition_engine_triggers_hv_log_trailing_stop_loss(tmp_path) -> None:
@@ -857,7 +998,7 @@ def test_missing_market_data_does_not_block_other_triggered_conditions(tmp_path)
 
     assert [plan.order.condition_id for plan in plans] == ["cond-static"]
     assert storage.get_condition_order("cond-atr-error").status == "armed"
-    assert storage.get_condition_order("cond-static").status == "triggered"
+    assert storage.get_condition_order("cond-static").status == "armed"
     reason = "condition cond-atr-error requires market_data for atr_trailing"
     assert condition_event_payload(storage, "cond-atr-error") == {
         "method": "atr_trailing",
@@ -1650,6 +1791,40 @@ def test_extract_condition_orders_rejects_missing_required_params() -> None:
     with pytest.raises(
         ValueError,
         match="condition cond-missing missing/invalid condition params: trail_pct",
+    ):
+        extract_condition_orders(task)
+
+
+def test_extract_condition_orders_rejects_naive_condition_datetimes() -> None:
+    task = RebalanceTask.model_validate(
+        {
+            "task_id": "task-1",
+            "portfolio_id": "prod",
+            "account_id": "acct",
+            "mode": "dry_run",
+            "created_at": "2026-06-03T09:35:00+08:00",
+            "expires_at": None,
+            "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+            "constraints": {
+                "condition_orders": [
+                    {
+                        "condition_id": "cond-naive-datetime",
+                        "symbol": "513100.SH",
+                        "purpose": "stop_loss",
+                        "method": "static_pct",
+                        "reference_price": 1.0,
+                        "valid_from": "2026-06-03T09:35:00",
+                        "params": {"stop_loss_pct": 0.05},
+                        "action": {"type": "sell_pct", "pct": 1.0},
+                    }
+                ]
+            },
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="condition cond-naive-datetime invalid condition order",
     ):
         extract_condition_orders(task)
 

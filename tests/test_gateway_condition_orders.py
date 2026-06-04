@@ -491,6 +491,39 @@ def test_gateway_condition_poll_once_executes_indicator_condition_order(tmp_path
     assert service.storage.get_condition_order("cond-atr").status == "submitted"
 
 
+def test_gateway_persists_submitted_condition_task_result_for_sync(tmp_path) -> None:
+    settings = settings_for(tmp_path)
+    settings.runtime.simulate_real_orders = True
+    service = GatewayService(settings)
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-real-submit",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker()
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [{"condition_id": "cond-real-submit", "status": "submitted"}]
+    assert service.storage.list_submitted_task_ids() == ["condition:cond-real-submit"]
+    assert service.storage.get_condition_order("cond-real-submit").status == "submitted"
+
+
 class AuditXquant:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail

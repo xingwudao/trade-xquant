@@ -181,6 +181,8 @@ class GatewayService:
         for triggered in triggered_plans:
             condition_id = triggered.order.condition_id
             try:
+                self.storage.record_plan(triggered.plan)
+                self.storage.update_condition_order_status(condition_id, "triggered")
                 self.risk.validate(triggered.task, account, triggered.plan, now=now, known_symbols=set(prices))
             except Exception as exc:  # noqa: BLE001 - risk-blocked triggers still need audit
                 logger.exception("condition order blocked by risk: %s", condition_id)
@@ -191,6 +193,11 @@ class GatewayService:
                     positions,
                     prices,
                     failure_stage="risk_validation",
+                )
+                self.storage.mark_task_result(
+                    triggered.task.task_id,
+                    "failed",
+                    result.model_dump(mode="json"),
                 )
                 self.storage.update_condition_order_status(condition_id, "failed")
                 self.storage.record_condition_event(
@@ -213,7 +220,6 @@ class GatewayService:
                 )
                 continue
             try:
-                self.storage.record_plan(triggered.plan)
                 self.storage.update_condition_order_status(condition_id, "submitting")
                 result = ExecutionEngine(self.qmt, self.settings.runtime).execute(
                     triggered.plan,
@@ -227,7 +233,13 @@ class GatewayService:
                     fallback_prices=prices,
                 )
                 self.storage.record_execution_result(result)
-                if result.status in {"dry_run_success", "submitted"}:
+                status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
+                self.storage.mark_task_result(
+                    triggered.task.task_id,
+                    status,
+                    result.model_dump(mode="json"),
+                )
+                if status in {"dry_run_success", "submitted"}:
                     self.storage.update_condition_order_status(condition_id, "submitted")
                 else:
                     self.storage.update_condition_order_status(condition_id, "failed")

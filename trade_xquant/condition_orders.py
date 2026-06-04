@@ -91,6 +91,15 @@ class ConditionOrder(BaseModel):
     def normalize_symbol_value(cls, value: str) -> str:
         return normalize_symbol(value)
 
+    @field_validator("valid_from", "expires_at")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return value
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("condition datetimes must include timezone")
+        return value
+
 
 @dataclass(frozen=True)
 class TriggeredConditionPlan:
@@ -115,10 +124,7 @@ class ConditionEngine:
         now: datetime,
     ) -> list[TriggeredConditionPlan]:
         position_map = {position.symbol: position for position in positions}
-        remaining_sellable = {
-            position.symbol: max(0, position.sellable_quantity)
-            for position in positions
-        }
+        planned_symbols: set[str] = set()
         normalized_prices = {normalize_symbol(symbol): price for symbol, price in prices.items()}
         triggered: list[TriggeredConditionPlan] = []
         for order in self.storage.list_active_condition_orders():
@@ -165,12 +171,22 @@ class ConditionEngine:
             ):
                 continue
 
+            if evaluated.symbol in planned_symbols:
+                self.storage.record_condition_event(
+                    evaluated.condition_id,
+                    "deferred",
+                    {
+                        "reason": "symbol already has triggered condition in poll",
+                        "symbol": evaluated.symbol,
+                    },
+                )
+                continue
+
             plan = self._build_sell_plan(
                 evaluated,
                 account,
                 position_map.get(evaluated.symbol),
                 latest_price,
-                remaining_sellable.get(evaluated.symbol, 0),
             )
             if plan is None:
                 self.storage.update_condition_order_status(evaluated.condition_id, "failed")
@@ -180,18 +196,13 @@ class ConditionEngine:
                     {"reason": "no sellable lot", "price": latest_price},
                 )
                 continue
-            self.storage.update_condition_order_status(evaluated.condition_id, "triggered")
             self.storage.record_condition_event(
                 evaluated.condition_id,
                 "triggered",
                 {"price": latest_price, "trigger_price": evaluated.trigger_price},
             )
             triggered.append(plan)
-            submitted_quantity = sum(order.quantity for order in plan.plan.orders)
-            remaining_sellable[evaluated.symbol] = max(
-                0,
-                remaining_sellable.get(evaluated.symbol, 0) - submitted_quantity,
-            )
+            planned_symbols.add(evaluated.symbol)
         return triggered
 
     def _latest_price(
@@ -255,6 +266,8 @@ class ConditionEngine:
             high_water_price,
             indicator_values=indicator_values,
         )
+        if not _finite_float_gt(trigger_price, 0):
+            raise ValueError(f"condition {order.condition_id} invalid trigger_price")
         evaluated = order.model_copy(
             update={
                 "high_water_price": high_water_price,
@@ -576,18 +589,12 @@ class ConditionEngine:
         account: AccountSnapshot,
         position: Position | None,
         latest_price: float,
-        available_sellable: int | None = None,
     ) -> TriggeredConditionPlan | None:
         if position is None or position.sellable_quantity <= 0:
             return None
-        remaining_sellable = position.sellable_quantity
-        if available_sellable is not None:
-            remaining_sellable = min(position.sellable_quantity, max(0, available_sellable))
-        if remaining_sellable <= 0:
-            return None
         pct = 1.0 if order.action.type == "clear" else order.action.pct
         requested_quantity = self._floor_lot(position.sellable_quantity * pct)
-        quantity = min(requested_quantity, self._floor_lot(remaining_sellable))
+        quantity = min(requested_quantity, self._floor_lot(position.sellable_quantity))
         if quantity <= 0:
             return None
         condition_task_id = f"condition:{order.condition_id}"
@@ -780,7 +787,9 @@ def _valid_condition_param(order: ConditionOrder, key: str) -> bool:
         "hv_annualization",
     }:
         return _finite_float_gt(value, 0)
-    if key in {"atr_window", "hv_window", "std_window"}:
+    if key == "hv_window":
+        return _positive_int_at_least(value, 2)
+    if key in {"atr_window", "std_window"}:
         return _positive_int(value)
     if key == "bar_interval":
         return isinstance(value, str) and bool(value.strip())
@@ -804,10 +813,14 @@ def _finite_float_in_range(value: Any, lower: float, upper: float) -> bool:
 
 
 def _positive_int(value: Any) -> bool:
+    return _positive_int_at_least(value, 1)
+
+
+def _positive_int_at_least(value: Any, minimum: int) -> bool:
     if isinstance(value, bool):
         return False
     if isinstance(value, int):
-        return value > 0
+        return value >= minimum
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
@@ -816,7 +829,7 @@ def _positive_int(value: Any) -> bool:
             parsed = int(stripped)
         except ValueError:
             return False
-        return stripped == str(parsed) and parsed > 0
+        return stripped == str(parsed) and parsed >= minimum
     return False
 
 
