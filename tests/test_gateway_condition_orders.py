@@ -600,6 +600,47 @@ def test_gateway_records_and_reports_condition_audit(tmp_path) -> None:
     assert stored["execution_result"]["task_id"] == "condition:cond-audit"
 
 
+def test_gateway_reports_activation_price_in_top_level_market_state(tmp_path) -> None:
+    service = GatewayService(settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-activation-audit",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="trailing_pct",
+                reference_price=1.0,
+                params={"trail_pct": 0.08, "activation_profit_pct": 0.2},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker(price=1.25)
+    service.qmt = broker  # type: ignore[assignment]
+    audit = AuditXquant()
+    service.xquant = audit  # type: ignore[assignment]
+
+    assert service.condition_poll_once() == []
+
+    broker.price = 1.14
+    result = service.condition_poll_once()
+
+    assert result == [
+        {
+            "condition_id": "cond-activation-audit",
+            "status": "dry_run_success",
+        }
+    ]
+    payload = audit.payloads[0][2]
+    assert payload["market_state"]["activation_price"] == 1.2
+    assert payload["market_state"]["state"]["activation_price"] == 1.2
+
+
 def test_gateway_xquant_audit_failure_does_not_repeat_trade(tmp_path) -> None:
     service = GatewayService(settings_for(tmp_path))
     service.storage.initialize()

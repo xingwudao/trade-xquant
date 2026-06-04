@@ -182,10 +182,23 @@ class ConditionEngine:
                 )
                 continue
 
+            position = position_map.get(evaluated.symbol)
+            if position is not None and position.sellable_quantity <= 0:
+                self.storage.record_condition_event(
+                    evaluated.condition_id,
+                    "deferred",
+                    {
+                        "reason": "no sellable quantity",
+                        "price": latest_price,
+                        "symbol": evaluated.symbol,
+                    },
+                )
+                continue
+
             plan = self._build_sell_plan(
                 evaluated,
                 account,
-                position_map.get(evaluated.symbol),
+                position,
                 latest_price,
             )
             if plan is None:
@@ -379,9 +392,14 @@ class ConditionEngine:
         window: int,
     ) -> list[PriceBar]:
         try:
-            return self.market_data.get_price_bars(order.symbol, interval, window)
+            bars = self.market_data.get_price_bars(order.symbol, interval, window)
         except (RuntimeError, NotImplementedError, OSError, TimeoutError) as exc:
             raise ValueError(str(exc)) from exc
+        if len(bars) < window:
+            raise ValueError(
+                f"condition {order.condition_id} requires {window} bars, got {len(bars)}"
+            )
+        return bars
 
     def _trigger_price(
         self,

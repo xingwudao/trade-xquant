@@ -295,7 +295,7 @@ class Storage:
                 """
                 SELECT * FROM condition_orders
                 WHERE enabled=1
-                  AND status IN ('received', 'armed', 'triggered', 'submitting')
+                  AND status IN ('received', 'armed', 'triggered')
                   AND NOT EXISTS (
                     SELECT 1 FROM task_results
                     WHERE task_results.task_id = 'condition:' || condition_orders.condition_id
@@ -447,6 +447,7 @@ class Storage:
         result = dict(row)
         result["activated"] = bool(result["activated"])
         result["state"] = json.loads(result.pop("state_json"))
+        result["activation_price"] = result["state"].get("activation_price")
         return result
 
     def record_condition_trigger_audit(

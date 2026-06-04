@@ -428,6 +428,64 @@ def test_condition_engine_caps_same_symbol_triggered_sells(tmp_path) -> None:
     }
 
 
+def test_condition_engine_defers_temporarily_unsellable_trigger(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-unsellable",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    engine = ConditionEngine(storage)
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[
+            Position(
+                symbol="513100.SH",
+                quantity=1000,
+                sellable_quantity=0,
+                market_value=1200,
+                cost_price=1.0,
+            )
+        ],
+        prices={"513100.SH": 1.12},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert plans == []
+    assert storage.get_condition_order("cond-unsellable").status == "armed"
+    with closing(storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("cond-unsellable",),
+        ).fetchone()
+    assert row["event_type"] == "deferred"
+    assert json.loads(row["payload_json"]) == {
+        "reason": "no sellable quantity",
+        "price": 1.12,
+        "symbol": "513100.SH",
+    }
+
+
 def test_condition_engine_trailing_take_profit_requires_activation(tmp_path) -> None:
     storage = Storage(tmp_path / "audit.db")
     storage.initialize()
@@ -607,6 +665,73 @@ def test_std_condition_records_error_for_nonpositive_trigger(tmp_path) -> None:
     reason = "condition cond-nonpositive-std invalid trigger_price"
     assert condition_event_payload(storage, "cond-nonpositive-std") == {
         "method": "std_trailing",
+        "reason": reason,
+    }
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "reason"),
+    [
+        (
+            "atr_trailing",
+            {"atr_window": 3, "atr_multiple": 2.0, "bar_interval": "1d"},
+            "condition cond-short-bars requires 3 bars, got 2",
+        ),
+        (
+            "hv_log_trailing",
+            {
+                "hv_window": 3,
+                "hv_annualization": 252,
+                "lambda": 1.0,
+                "bar_interval": "1d",
+            },
+            "condition cond-short-bars requires 3 bars, got 2",
+        ),
+        (
+            "std_trailing",
+            {"std_window": 3, "std_multiple": 2.0, "bar_interval": "1d"},
+            "condition cond-short-bars requires 3 bars, got 2",
+        ),
+    ],
+)
+def test_bar_based_condition_rejects_short_bar_samples(
+    tmp_path,
+    method: str,
+    params: dict[str, object],
+    reason: str,
+) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-short-bars",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method=method,
+                high_water_price=1.30,
+                params=params,
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    engine = ConditionEngine(storage, market_data=BarProvider(price_bars()[:2]))
+
+    plans = engine.evaluate(
+        account=account(),
+        positions=[position()],
+        prices={"513100.SH": 1.0},
+        now=datetime(2026, 6, 3, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert plans == []
+    assert storage.get_condition_order("cond-short-bars").status == "armed"
+    assert condition_event_payload(storage, "cond-short-bars") == {
+        "method": method,
         "reason": reason,
     }
 

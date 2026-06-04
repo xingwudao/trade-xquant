@@ -4,6 +4,7 @@ import sqlite3
 
 import pytest
 
+from trade_xquant.condition_orders import ConditionAction, ConditionOrder
 from trade_xquant.models import RebalanceTask, TargetPosition
 from trade_xquant.storage import Storage
 
@@ -122,6 +123,7 @@ def test_condition_market_state_roundtrip(tmp_path) -> None:
         "std_value",
         "computed_at",
         "market_data_source",
+        "activation_price",
         "state",
     }
     assert state["condition_id"] == "cond-1"
@@ -136,6 +138,7 @@ def test_condition_market_state_roundtrip(tmp_path) -> None:
     assert state["std_value"] is None
     assert state["computed_at"] == "2026-06-03T10:30:00+08:00"
     assert state["market_data_source"] == "mock"
+    assert state["activation_price"] is None
     assert state["state"] == {"reason": "test"}
 
 
@@ -181,6 +184,7 @@ def test_condition_market_state_upsert_updates_existing_row(tmp_path) -> None:
     assert state["high_water_price"] == 1.42
     assert state["activated"] is False
     assert state["activated_at"] is None
+    assert state["activation_price"] is None
     assert state["market_data_source"] == "mock-v2"
     assert state["state"] == {"reason": "updated"}
 
@@ -236,6 +240,31 @@ def test_condition_trigger_audit_roundtrip_and_report_status(tmp_path) -> None:
     assert audit["xquant_report_error"] == "http 409"
     assert audit["created_at"]
     assert audit["updated_at"]
+
+
+def test_submitting_condition_orders_are_not_active_retry_candidates(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-submitting",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                status="submitting",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+
+    assert storage.list_active_condition_orders() == []
 
 
 def test_condition_trigger_audit_rerecord_updates_payloads_and_preserves_created_at(

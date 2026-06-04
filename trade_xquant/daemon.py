@@ -17,7 +17,14 @@ from trade_xquant.condition_orders import (
 from trade_xquant.config import Settings
 from trade_xquant.execution_engine import ExecutionEngine
 from trade_xquant.local_task_file import LocalTaskFileAdapter
-from trade_xquant.models import AccountSnapshot, ExecutionResult, Position, RebalanceTask
+from trade_xquant.models import (
+    AccountSnapshot,
+    ExecutionResult,
+    OrderPlan,
+    Position,
+    RebalanceTask,
+    TargetPosition,
+)
 from trade_xquant.mock_qmt_adapter import MockBrokerAdapter
 from trade_xquant.portfolio_engine import PortfolioEngine
 from trade_xquant.qmt_adapter import QmtAdapter, compact_obj
@@ -507,6 +514,13 @@ class GatewayService:
                 "task_id": submitted_task_id,
                 "status": synced_status,
             }
+            if _is_condition_task_id(submitted_task_id):
+                self._record_and_report_synced_condition_result(
+                    submitted_task_id,
+                    result,
+                )
+                results.append(result_item)
+                continue
             try:
                 self.xquant.report_result(submitted_task_id, synced_status, result)
             except XquantAdapterError as exc:
@@ -535,6 +549,54 @@ class GatewayService:
         )
         if event.event_type == "stock_trade":
             self.storage.record_trade_event(event.payload, order_id=event.order_id, symbol=event.symbol)
+
+    def _record_and_report_synced_condition_result(
+        self,
+        condition_task_id: str,
+        result: ExecutionResult,
+    ) -> None:
+        condition_id = _condition_id_from_task_id(condition_task_id)
+        order = self.storage.get_condition_order(condition_id)
+        self._update_synced_condition_status(condition_id, result.status)
+        triggered = self._triggered_condition_from_synced_result(order, result)
+        self._record_and_report_condition_audit(triggered, result)
+
+    def _triggered_condition_from_synced_result(
+        self,
+        order: ConditionOrder,
+        result: ExecutionResult,
+    ) -> TriggeredConditionPlan:
+        task = RebalanceTask(
+            task_id=result.task_id,
+            portfolio_id=order.portfolio_id,
+            account_id=order.account_id,
+            mode=result.mode,
+            created_at=datetime.now(ZoneInfo(self.settings.risk.timezone)),
+            expires_at=order.expires_at,
+            targets=[TargetPosition(symbol=order.symbol, target_weight=0)],
+            raw={"condition_id": order.condition_id, "source_task_id": order.task_id},
+        )
+        turnover_amount = sum(item.amount for item in result.planned_orders)
+        total_asset = result.total_asset or 0
+        plan = OrderPlan(
+            task_id=result.task_id,
+            account_id=order.account_id,
+            total_asset=total_asset,
+            turnover_amount=turnover_amount,
+            turnover_ratio=turnover_amount / total_asset if total_asset > 0 else 0,
+            orders=result.planned_orders,
+        )
+        return TriggeredConditionPlan(order=order, task=task, plan=plan)
+
+    def _update_synced_condition_status(self, condition_id: str, status: str) -> None:
+        if status == "success":
+            self.storage.update_condition_order_status(condition_id, "completed")
+        elif status == "failed":
+            self.storage.update_condition_order_status(condition_id, "failed")
+        elif status == "partial":
+            self.storage.update_condition_order_status(condition_id, "needs_reconcile")
+        else:
+            self.storage.update_condition_order_status(condition_id, "submitted")
 
     def _attach_current_account_snapshot(
         self,
@@ -739,6 +801,14 @@ def _payload_matches_task(payload: dict[str, Any], task_id: str, submitted_order
     if _payload_remark(payload) == task_id:
         return True
     return any(_payload_matches_submitted_order(payload, submitted) for submitted in submitted_orders)
+
+
+def _is_condition_task_id(task_id: str) -> bool:
+    return task_id.startswith("condition:")
+
+
+def _condition_id_from_task_id(task_id: str) -> str:
+    return task_id.removeprefix("condition:")
 
 
 def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -> bool:
