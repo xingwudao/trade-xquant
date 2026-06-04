@@ -61,6 +61,12 @@ Copy `config.example.yaml` to `config.yaml`.
 `runtime.poll_interval_seconds`
 - Daemon polling interval.
 
+`runtime.condition_poll_interval_seconds`
+- Daemon condition-order price polling interval.
+- Default `3` seconds.
+- This is intentionally faster than task polling because active stop/take-profit
+  rules should not wait for the next Xquant task poll.
+
 `runtime.allow_real_order`
 - Must remain `false` unless intentionally enabling real orders.
 
@@ -70,6 +76,18 @@ Copy `config.example.yaml` to `config.yaml`.
 `runtime.broker_adapter`
 - `qmt` for the real Windows MiniQMT adapter.
 - `mock` for Mac/local Xquant API tests without connecting to QMT.
+- Real `qmt` mode does not yet provide historical price bars to the condition
+  engine. Bar-based `atr_trailing`, `hv_log_trailing`, and `std_trailing`
+  conditions will record per-order evaluation errors in real QMT mode until
+  QMT bar history is wired.
+
+`runtime.local_task_file`
+- Optional local JSON task file.
+- When set, `poll-once`, `dry-run`, `mock-run`, and `daemon` read tasks from
+  this file instead of calling Xquant task APIs.
+- This is for developing the trade-xquant side of the contract before Xquant
+  emits matching gateway tasks.
+- The schema is documented in `docs/local-condition-orders.md`.
 
 `runtime.simulate_real_orders`
 - Used only with `runtime.broker_adapter: "mock"`.

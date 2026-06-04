@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from trade_xquant.condition_orders import ConditionAction, ConditionOrder
 from trade_xquant.config import QmtConfig, RiskConfig, RuntimeConfig, Settings, XquantConfig
 from trade_xquant.daemon import GatewayService, GatewaySyncReportError
 from trade_xquant.models import (
@@ -23,10 +24,32 @@ from trade_xquant.xquant_adapter import XquantAdapterError
 class FakeXquant:
     def __init__(self) -> None:
         self.results: list[tuple[str, str, dict]] = []
+        self.condition_results: list[tuple[str, str, dict]] = []
 
     def report_result(self, task_id: str, status: str, payload) -> None:
         body = payload.model_dump(mode="json") if hasattr(payload, "model_dump") else payload
         self.results.append((task_id, status, body))
+
+    def report_condition_result(
+        self,
+        source_task_id: str,
+        condition_id: str,
+        payload: dict,
+    ) -> None:
+        self.condition_results.append((source_task_id, condition_id, payload))
+
+
+class FailingConditionXquant(FakeXquant):
+    def report_condition_result(
+        self,
+        source_task_id: str,
+        condition_id: str,
+        payload: dict,
+    ) -> None:
+        raise XquantAdapterError(
+            'Xquant API error 503: {"detail":"condition_result_unavailable"}',
+            status_code=503,
+        )
 
 
 class ConflictXquant:
@@ -62,6 +85,30 @@ class FilledBroker:
                 price=1.0,
                 amount=1000.0,
                 m_strRemark="task-1",
+            )
+        ]
+
+
+class ConditionRemarkBroker(FilledBroker):
+    def get_orders(self):
+        return [
+            SimpleNamespace(
+                stock_code="513100.SH",
+                order_status=56,
+                traded_volume=1000,
+                price=1.0,
+                m_strRemark="cond:cond-sync",
+            )
+        ]
+
+    def get_trades(self):
+        return [
+            SimpleNamespace(
+                stock_code="513100.SH",
+                quantity=1000,
+                price=1.0,
+                amount=1000.0,
+                m_strRemark="cond:cond-sync",
             )
         ]
 
@@ -170,6 +217,35 @@ def submitted_result() -> ExecutionResult:
     )
 
 
+def submitted_condition_result() -> ExecutionResult:
+    task_id = "condition:cond-sync"
+    order = PlannedOrder(
+        task_id=task_id,
+        symbol="513100.SH",
+        side="sell",
+        quantity=1000,
+        price=1.0,
+        amount=1000.0,
+    )
+    submitted = SubmittedOrder(
+        task_id=task_id,
+        symbol="513100.SH",
+        side="sell",
+        quantity=1000,
+        price=1.0,
+        amount=1000.0,
+        local_order_id="1082169287",
+        status="submitted",
+    )
+    return ExecutionResult(
+        task_id=task_id,
+        status="submitted",
+        mode="real",
+        planned_orders=[order],
+        submitted_orders=[submitted],
+    )
+
+
 def mixed_submitted_result() -> ExecutionResult:
     orders = [
         PlannedOrder(
@@ -233,6 +309,50 @@ def test_sync_results_reports_success_when_qmt_orders_are_fully_traded(tmp_path)
     assert body["submitted_orders"][0]["local_order_id"] == "1082169287"
     assert body["trades"][0]["order_id"] == "1082169287"
     assert body["trades"][0]["symbol"] == "513100.SH"
+
+
+def test_sync_results_reports_condition_tasks_to_condition_result_endpoint(tmp_path) -> None:
+    service = make_service_with_condition_result(tmp_path, result_status="submitted")
+
+    result = service.sync_results(task_id="condition:cond-sync")
+
+    assert result == [{"task_id": "condition:cond-sync", "status": "success"}]
+    assert service.xquant.results == []  # type: ignore[attr-defined]
+    assert service.xquant.condition_results[0][0] == "task-1"  # type: ignore[attr-defined]
+    assert service.xquant.condition_results[0][1] == "cond-sync"  # type: ignore[attr-defined]
+    payload = service.xquant.condition_results[0][2]  # type: ignore[attr-defined]
+    assert payload["condition_task_id"] == "condition:cond-sync"
+    assert payload["execution_result"]["status"] == "success"
+    assert service.storage.get_condition_order("cond-sync").status == "completed"
+
+
+def test_sync_results_matches_condition_tasks_by_cond_remark(tmp_path) -> None:
+    service = make_service_with_condition_result(tmp_path, result_status="submitted")
+    service.qmt = ConditionRemarkBroker()  # type: ignore[assignment]
+
+    result = service.sync_results(task_id="condition:cond-sync")
+
+    assert result == [{"task_id": "condition:cond-sync", "status": "success"}]
+    payload = service.xquant.condition_results[0][2]  # type: ignore[attr-defined]
+    assert payload["execution_result"]["status"] == "success"
+    assert payload["execution_result"]["submitted_orders"][0]["status"] == "filled"
+
+
+def test_sync_results_surfaces_condition_result_report_failure(tmp_path) -> None:
+    service = make_service_with_condition_result(tmp_path, result_status="submitted")
+    service.xquant = FailingConditionXquant()  # type: ignore[assignment]
+
+    with pytest.raises(GatewaySyncReportError) as exc:
+        service.sync_results(task_id="condition:cond-sync")
+
+    assert exc.value.status_code == 503
+    assert exc.value.results[0]["task_id"] == "condition:cond-sync"
+    assert exc.value.results[0]["status"] == "success"
+    assert exc.value.results[0]["xquant_synced"] is False
+    assert exc.value.results[0]["status_code"] == 503
+    stored = service.storage.get_condition_trigger_audit("condition:cond-sync")
+    assert stored is not None
+    assert stored["xquant_report_status"] == "failed"
 
 
 def test_sync_results_can_refresh_previously_successful_task(tmp_path) -> None:
@@ -355,6 +475,56 @@ def make_service_with_submitted_task(tmp_path, *, result_status: str) -> Gateway
     )
 
 
+def make_service_with_condition_result(tmp_path, *, result_status: str) -> GatewayService:
+    result = submitted_condition_result()
+    service = make_service_with_result(
+        tmp_path,
+        broker=FilledBroker(),
+        result=result,
+        result_status=result_status,
+    )
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-sync",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    service.storage.update_condition_order_status("cond-sync", "triggered")
+    service.storage.update_condition_order_status("cond-sync", "submitted")
+    service.storage.record_condition_market_state(
+        condition_id="cond-sync",
+        symbol="513100.SH",
+        latest_price=1.1,
+        high_water_price=None,
+        trigger_price=1.1,
+        activated=True,
+        activated_at=None,
+        atr_value=None,
+        hv_value=None,
+        std_value=None,
+        computed_at="2026-06-04T10:00:00+08:00",
+        market_data_source="prices",
+        state={
+            "method": "static_pct",
+            "purpose": "take_profit",
+            "params": {"take_profit_pct": 0.1},
+            "activation_price": None,
+        },
+    )
+    return service
+
+
 def make_service_with_result(
     tmp_path,
     *,
@@ -378,7 +548,7 @@ def make_service_with_result(
     service.storage.initialize()
     service.storage.record_task_received(task(), status="submitted")
     plan = OrderPlan(
-        task_id="task-1",
+        task_id=result.task_id,
         account_id="acct",
         total_asset=100_000,
         turnover_amount=1000,
@@ -389,5 +559,5 @@ def make_service_with_result(
     service.storage.record_execution_result(result)
     payload = result.model_dump(mode="json")
     payload["status"] = result_status
-    service.storage.mark_task_result("task-1", result_status, payload)
+    service.storage.mark_task_result(result.task_id, result_status, payload)
     return service

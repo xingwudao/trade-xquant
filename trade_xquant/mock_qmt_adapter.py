@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Callable
 
 from trade_xquant.broker import QmtGatewayEvent
+from trade_xquant.condition_indicators import PriceBar
 from trade_xquant.models import AccountSnapshot, PlannedOrder, Position, normalize_symbol
 
 
@@ -16,11 +17,19 @@ class MockBrokerAdapter:
         order_behavior: str = "filled",
         partial_fill_ratio: float = 0.5,
         event_handler: Callable[[QmtGatewayEvent], None] | None = None,
+        price_bars: dict[str, dict[str, list[PriceBar]]] | None = None,
     ) -> None:
         self.account_id = account_id
         self.total_asset = total_asset
         self.cash = cash
         self.prices = {normalize_symbol(symbol): price for symbol, price in prices.items()}
+        self.price_bars = {
+            normalize_symbol(symbol): {
+                interval: [bar.model_copy(deep=True) for bar in bars]
+                for interval, bars in intervals.items()
+            }
+            for symbol, intervals in (price_bars or {}).items()
+        }
         self.order_behavior = order_behavior
         self.partial_fill_ratio = max(0.0, min(1.0, partial_fill_ratio))
         self.event_handler = event_handler
@@ -52,6 +61,20 @@ class MockBrokerAdapter:
         if missing:
             raise RuntimeError(f"mock price missing for symbols: {sorted(set(missing))}")
         return {normalize_symbol(symbol): self.prices[normalize_symbol(symbol)] for symbol in symbols}
+
+    def get_price_bars(self, symbol: str, interval: str, window: int) -> list[PriceBar]:
+        if window <= 0:
+            raise ValueError("window must be positive")
+        normalized = normalize_symbol(symbol)
+        bars = self.price_bars.get(normalized, {}).get(interval)
+        if bars is None:
+            raise RuntimeError(f"mock bars missing for {normalized} interval {interval}")
+        if len(bars) < window:
+            raise RuntimeError(
+                f"mock bars insufficient for {normalized}: "
+                f"need {window}, got {len(bars)}"
+            )
+        return [bar.model_copy(deep=True) for bar in bars[-window:]]
 
     def place_order(self, order: PlannedOrder) -> dict[str, object]:
         local_order_id = str(len(self.submitted_orders) + 1)

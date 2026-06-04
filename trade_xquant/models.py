@@ -26,6 +26,7 @@ class TaskConstraints(BaseModel):
     max_turnover_ratio: float | None = None
     max_single_order_amount: float | None = None
     min_order_amount: float | None = None
+    condition_orders: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class RebalanceTask(BaseModel):

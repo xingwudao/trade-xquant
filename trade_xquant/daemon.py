@@ -3,16 +3,32 @@ from __future__ import annotations
 import logging
 import socket
 import time
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from trade_xquant import __version__
+from trade_xquant.condition_orders import (
+    ConditionEngine,
+    ConditionOrder,
+    TriggeredConditionPlan,
+    extract_condition_orders,
+)
 from trade_xquant.config import Settings
 from trade_xquant.execution_engine import ExecutionEngine
-from trade_xquant.models import AccountSnapshot, ExecutionResult, Position, RebalanceTask
+from trade_xquant.local_task_file import LocalTaskFileAdapter
+from trade_xquant.models import (
+    AccountSnapshot,
+    ExecutionResult,
+    OrderPlan,
+    Position,
+    RebalanceTask,
+    TargetPosition,
+)
 from trade_xquant.mock_qmt_adapter import MockBrokerAdapter
 from trade_xquant.portfolio_engine import PortfolioEngine
 from trade_xquant.qmt_adapter import QmtAdapter, compact_obj
-from trade_xquant.risk_control import RiskControl
+from trade_xquant.risk_control import RiskControl, RiskError
 from trade_xquant.storage import Storage
 from trade_xquant.xquant_adapter import XquantAdapter, XquantAdapterError
 
@@ -46,6 +62,11 @@ class GatewayService:
             timeout_seconds=settings.xquant.timeout_seconds,
             trust_env=settings.xquant.trust_env,
         )
+        self.local_task_file = (
+            LocalTaskFileAdapter(settings.runtime.local_task_file)
+            if settings.runtime.local_task_file
+            else None
+        )
         if settings.runtime.broker_adapter == "mock":
             self.qmt = MockBrokerAdapter(
                 account_id=settings.qmt.account_id,
@@ -65,11 +86,16 @@ class GatewayService:
 
     def poll_once(self, force_dry_run: bool = False, task_id: str | None = None) -> list[dict[str, object]]:
         self.storage.initialize()
-        if self.settings.xquant.product_code:
-            logger.warning(
-                "xquant.product_code is ignored; poll_once uses trading-gateway tasks"
-            )
-        tasks = self.xquant.fetch_pending_tasks(self.settings.qmt.account_id)
+        using_local_task_file = self.local_task_file is not None
+        should_report_gateway = not using_local_task_file
+        if self.local_task_file is not None:
+            tasks = self.local_task_file.fetch_pending_tasks(self.settings.qmt.account_id)
+        else:
+            if self.settings.xquant.product_code:
+                logger.warning(
+                    "xquant.product_code is ignored; poll_once uses trading-gateway tasks"
+                )
+            tasks = self.xquant.fetch_pending_tasks(self.settings.qmt.account_id)
         if task_id:
             tasks = [task for task in tasks if task.task_id == task_id]
         results: list[dict[str, object]] = []
@@ -81,16 +107,21 @@ class GatewayService:
         account = self.qmt.get_account_snapshot()
         positions = self.qmt.get_positions()
         for task in tasks:
+            if self.storage.is_terminal_task(task.task_id):
+                logger.info("skip terminal task: %s", task.task_id)
+                continue
             if force_dry_run:
                 task.mode = "dry_run"
             prices: dict[str, float] = {}
             try:
                 self.storage.claim_task(task)
+                condition_orders = extract_condition_orders(task)
                 prices = self.qmt.get_prices([target.symbol for target in task.targets] + [p.symbol for p in positions])
                 plan = self.portfolio.build_plan(task, account, positions, prices)
                 self.risk.validate(task, account, plan, known_symbols=set(prices))
                 self.storage.record_plan(plan)
-                self.xquant.report_plan(task.task_id, plan.model_dump(mode="json"))
+                if should_report_gateway:
+                    self.xquant.report_plan(task.task_id, plan.model_dump(mode="json"))
                 result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
                 self._attach_current_account_snapshot(
                     result,
@@ -102,7 +133,10 @@ class GatewayService:
                 self.storage.record_execution_result(result)
                 status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
                 self.storage.mark_task_result(task.task_id, status, result.model_dump(mode="json"))
-                self.xquant.report_result(task.task_id, status, result)
+                if status in {"dry_run_success", "submitted"}:
+                    self._arm_condition_orders(task, condition_orders)
+                if should_report_gateway:
+                    self.xquant.report_result(task.task_id, status, result)
                 results.append({"task_id": task.task_id, "status": status})
             except Exception as exc:  # noqa: BLE001 - each task must be audited
                 logger.exception("task failed: %s", task.task_id)
@@ -123,26 +157,328 @@ class GatewayService:
                 )
                 payload = failure.model_dump(mode="json")
                 self.storage.mark_task_result(task.task_id, "failed", payload)
-                try:
-                    self.xquant.report_result(task.task_id, "failed", failure)
-                except Exception:
-                    logger.exception("failed to report task failure to Xquant")
+                if should_report_gateway:
+                    try:
+                        self.xquant.report_result(task.task_id, "failed", failure)
+                    except Exception:
+                        logger.exception("failed to report task failure to Xquant")
                 results.append({"task_id": task.task_id, "status": "failed", "error": str(exc)})
         return results
 
+    def condition_poll_once(self) -> list[dict[str, object]]:
+        self.storage.initialize()
+        active_orders = self.storage.list_active_condition_orders()
+        if not active_orders:
+            logger.info("no active condition orders")
+            return []
+
+        self.qmt.connect()
+        account = self.qmt.get_account_snapshot()
+        positions = self.qmt.get_positions()
+        symbols = sorted({order.symbol for order in active_orders})
+        prices = self._condition_prices(symbols)
+        now = datetime.now(ZoneInfo(self.settings.risk.timezone))
+        triggered_plans = ConditionEngine(self.storage, market_data=self.qmt).evaluate(
+            account,
+            positions,
+            prices,
+            now=now,
+        )
+        results: list[dict[str, object]] = []
+        remaining_turnover_amount = account.total_asset * self.settings.risk.max_turnover_ratio
+        for triggered in triggered_plans:
+            condition_id = triggered.order.condition_id
+            try:
+                self.storage.record_task_received(triggered.task, status="claimed")
+                self.storage.record_plan(triggered.plan)
+                self.storage.update_condition_order_status(condition_id, "triggered")
+                if triggered.plan.turnover_amount > remaining_turnover_amount + 1e-9:
+                    raise RiskError("condition turnover exceeds remaining threshold")
+                self.risk.validate(triggered.task, account, triggered.plan, now=now, known_symbols=set(prices))
+                remaining_turnover_amount -= triggered.plan.turnover_amount
+            except Exception as exc:  # noqa: BLE001 - risk-blocked triggers still need audit
+                logger.exception("condition order blocked by risk: %s", condition_id)
+                result = self._failed_condition_execution_result(
+                    triggered,
+                    str(exc),
+                    account,
+                    positions,
+                    prices,
+                    failure_stage="risk_validation",
+                )
+                self.storage.mark_task_result(
+                    triggered.task.task_id,
+                    "failed",
+                    result.model_dump(mode="json"),
+                )
+                self.storage.update_condition_order_status(condition_id, "failed")
+                self.storage.record_condition_event(
+                    condition_id,
+                    "failed",
+                    {"error": str(exc), "stage": "risk_validation"},
+                )
+                self.storage.record_condition_event(
+                    condition_id,
+                    "execution_result",
+                    {"status": result.status, "payload": result.model_dump(mode="json")},
+                )
+                self._record_and_report_condition_audit(triggered, result)
+                results.append(
+                    {
+                        "condition_id": condition_id,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+                continue
+            try:
+                self.storage.update_condition_order_status(condition_id, "submitting")
+                result = ExecutionEngine(self.qmt, self.settings.runtime).execute(
+                    triggered.plan,
+                    triggered.task.mode,
+                )
+                self._attach_current_account_snapshot(
+                    result,
+                    triggered.task,
+                    fallback_account=account,
+                    fallback_positions=positions,
+                    fallback_prices=prices,
+                )
+                self.storage.record_execution_result(result)
+                status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
+                self.storage.mark_task_result(
+                    triggered.task.task_id,
+                    status,
+                    result.model_dump(mode="json"),
+                )
+                if status in {"dry_run_success", "submitted"}:
+                    self.storage.update_condition_order_status(condition_id, "submitted")
+                else:
+                    self.storage.update_condition_order_status(condition_id, "failed")
+                self.storage.record_condition_event(
+                    condition_id,
+                    "execution_result",
+                    {"status": result.status, "payload": result.model_dump(mode="json")},
+                )
+                self._record_and_report_condition_audit(triggered, result)
+                results.append(
+                    {
+                        "condition_id": condition_id,
+                        "status": result.status,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - each condition must be audited
+                logger.exception("condition order failed: %s", condition_id)
+                self.storage.update_condition_order_status(condition_id, "failed")
+                self.storage.record_condition_event(condition_id, "failed", {"error": str(exc)})
+                results.append({"condition_id": condition_id, "status": "failed", "error": str(exc)})
+        return results
+
+    def _condition_prices(self, symbols: list[str]) -> dict[str, float]:
+        prices: dict[str, float] = {}
+        for symbol in symbols:
+            try:
+                prices.update(self.qmt.get_prices([symbol]))
+            except Exception as exc:  # noqa: BLE001 - quote gaps are audited per condition
+                logger.exception("failed to query condition price: %s", symbol)
+        return prices
+
+    def _failed_condition_execution_result(
+        self,
+        triggered: TriggeredConditionPlan,
+        error: str,
+        account: AccountSnapshot,
+        positions: list[Position],
+        prices: dict[str, float],
+        *,
+        failure_stage: str,
+    ) -> ExecutionResult:
+        result = ExecutionResult(
+            task_id=triggered.task.task_id,
+            status="failed",
+            mode=triggered.task.mode,
+            planned_orders=triggered.plan.orders,
+            errors=[error],
+            meta={"error": error, "failure_stage": failure_stage},
+        )
+        self._attach_current_account_snapshot(
+            result,
+            triggered.task,
+            fallback_account=account,
+            fallback_positions=positions,
+            fallback_prices=prices,
+        )
+        return result
+
+    def _record_and_report_condition_audit(
+        self,
+        triggered: TriggeredConditionPlan,
+        result: ExecutionResult,
+    ) -> Exception | None:
+        condition_id = triggered.order.condition_id
+        audit_payload = self._condition_audit_payload(triggered, result)
+        self.storage.record_condition_trigger_audit(
+            condition_id=condition_id,
+            source_task_id=triggered.order.task_id,
+            condition_task_id=triggered.task.task_id,
+            symbol=triggered.order.symbol,
+            purpose=triggered.order.purpose,
+            method=triggered.order.method,
+            rule=audit_payload["rule"],
+            market_state=audit_payload["market_state"],
+            trigger=audit_payload["trigger"],
+            execution_result=result.model_dump(mode="json"),
+        )
+        if self.local_task_file is not None:
+            self.storage.update_condition_audit_report_status(
+                triggered.task.task_id,
+                "skipped",
+                "local_task_file",
+            )
+            return None
+        try:
+            self.xquant.report_condition_result(
+                triggered.order.task_id,
+                condition_id,
+                audit_payload,
+            )
+            self.storage.update_condition_audit_report_status(
+                triggered.task.task_id,
+                "success",
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("failed to report condition result to Xquant")
+            self.storage.update_condition_audit_report_status(
+                triggered.task.task_id,
+                "failed",
+                str(exc),
+            )
+            self.storage.update_condition_order_status(condition_id, "needs_reconcile")
+            return exc
+
+    def _retry_condition_audit_report(self, condition_task_id: str) -> dict[str, object]:
+        audit = self.storage.get_condition_trigger_audit(condition_task_id)
+        if audit is None:
+            return {
+                "task_id": condition_task_id,
+                "status": "missing_audit",
+                "xquant_synced": False,
+                "error": "condition audit record not found",
+            }
+        order = self.storage.get_condition_order(audit["condition_id"])
+        execution_result = audit["execution_result"]
+        execution_status = str(execution_result.get("status") or "unknown")
+        payload = {
+            "condition_task_id": audit["condition_task_id"],
+            "account_id": order.account_id,
+            "portfolio_id": order.portfolio_id,
+            "symbol": audit["symbol"],
+            "status": execution_status,
+            "trigger": audit["trigger"],
+            "rule": audit["rule"],
+            "market_state": audit["market_state"],
+            "execution_result": execution_result,
+        }
+        result_item: dict[str, object] = {
+            "task_id": condition_task_id,
+            "status": execution_status,
+        }
+        try:
+            self.xquant.report_condition_result(
+                audit["source_task_id"],
+                audit["condition_id"],
+                payload,
+            )
+            self.storage.update_condition_audit_report_status(condition_task_id, "success")
+            self._update_synced_condition_status(audit["condition_id"], execution_status)
+        except Exception as exc:  # noqa: BLE001 - sync should return all report failures
+            self.storage.update_condition_audit_report_status(condition_task_id, "failed", str(exc))
+            result_item.update(
+                {
+                    "xquant_synced": False,
+                    "status_code": exc.status_code if isinstance(exc, XquantAdapterError) else None,
+                    "error": str(exc),
+                    "hint": _xquant_report_error_hint(exc) if isinstance(exc, XquantAdapterError) else None,
+                }
+            )
+        return result_item
+
+    def _condition_audit_payload(
+        self,
+        triggered: TriggeredConditionPlan,
+        result: ExecutionResult,
+    ) -> dict[str, Any]:
+        market_state = self.storage.get_condition_market_state(triggered.order.condition_id) or {}
+        triggered_at = self.storage.get_condition_order_triggered_at(triggered.order.condition_id)
+        trigger = {
+            "triggered_at": triggered_at
+            or datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
+            "latest_price": market_state.get("latest_price"),
+            "trigger_price": market_state.get("trigger_price"),
+            "reason": self._condition_trigger_reason(triggered, market_state),
+        }
+        return {
+            "condition_task_id": triggered.task.task_id,
+            "account_id": triggered.order.account_id,
+            "portfolio_id": triggered.order.portfolio_id,
+            "symbol": triggered.order.symbol,
+            "status": result.status,
+            "trigger": trigger,
+            "rule": {
+                "scope": triggered.order.scope,
+                "purpose": triggered.order.purpose,
+                "method": triggered.order.method,
+                "params": triggered.order.params,
+                "action": triggered.order.action.model_dump(mode="json"),
+            },
+            "market_state": market_state,
+            "execution_result": result.model_dump(mode="json"),
+        }
+
+    def _condition_trigger_reason(
+        self,
+        triggered: TriggeredConditionPlan,
+        market_state: dict[str, Any],
+    ) -> str | None:
+        state = market_state.get("state", {})
+        if isinstance(state, dict) and state.get("trigger_reason"):
+            return str(state["trigger_reason"])
+        if market_state.get("latest_price") is None or market_state.get("trigger_price") is None:
+            return None
+        if triggered.order.method == "static_pct" and triggered.order.purpose == "take_profit":
+            return "latest_price >= trigger_price"
+        return "latest_price <= trigger_price"
+
     def run_forever(self) -> None:
+        next_task_poll = 0.0
+        next_condition_poll = 0.0
+        last_error: str | None = None
         while True:
-            last_error = None
-            try:
-                self.poll_once()
-            except Exception as exc:  # noqa: BLE001 - daemon must keep reporting liveness
-                logger.exception("poll loop failed")
-                last_error = str(exc)
-            try:
-                self.heartbeat_once(last_error=last_error)
-            except Exception:  # noqa: BLE001 - heartbeat failure must not stop polling
-                logger.exception("failed to report heartbeat to Xquant")
-            time.sleep(self.settings.runtime.poll_interval_seconds)
+            current = time.monotonic()
+            task_poll_due = current >= next_task_poll
+            if current >= next_task_poll:
+                try:
+                    self.poll_once()
+                except Exception as exc:  # noqa: BLE001 - daemon must keep reporting liveness
+                    logger.exception("poll loop failed")
+                    last_error = _append_error(last_error, str(exc))
+                next_task_poll = current + self.settings.runtime.poll_interval_seconds
+            if current >= next_condition_poll:
+                try:
+                    self.condition_poll_once()
+                except Exception as exc:  # noqa: BLE001 - condition failures must not stop polling
+                    logger.exception("condition poll loop failed")
+                    last_error = _append_error(last_error, str(exc))
+                next_condition_poll = current + self.settings.runtime.condition_poll_interval_seconds
+            if task_poll_due:
+                try:
+                    self.heartbeat_once(last_error=last_error)
+                    last_error = None
+                except Exception:  # noqa: BLE001 - heartbeat failure must not stop polling
+                    logger.exception("failed to report heartbeat to Xquant")
+            sleep_until = min(next_task_poll, next_condition_poll)
+            time.sleep(max(0.1, sleep_until - time.monotonic()))
 
     def heartbeat_once(self, last_error: str | None = None) -> dict[str, Any]:
         snapshot: dict[str, Any] | None = None
@@ -180,71 +516,105 @@ class GatewayService:
     def sync_results(self, task_id: str | None = None, status: str = "all") -> list[dict[str, object]]:
         self.storage.initialize()
         task_ids = self.storage.list_syncable_task_ids(task_id=task_id, status=status)
-        if not task_ids:
+        task_id_set = set(task_ids)
+        audit_task_ids = [
+            audit_task_id
+            for audit_task_id in self.storage.list_retryable_condition_audit_task_ids(
+                task_id=task_id,
+                status=status,
+            )
+            if audit_task_id not in task_id_set
+        ]
+        if not task_ids and not audit_task_ids:
             logger.info("no matching tasks to sync")
             return []
 
-        self.qmt.connect()
-        qmt_orders = [compact_obj(order) for order in self.qmt.get_orders()]
-        qmt_trades = [compact_obj(trade) for trade in self.qmt.get_trades()]
         results: list[dict[str, object]] = []
 
-        for submitted_task_id in task_ids:
-            planned_orders = self.storage.load_planned_orders(submitted_task_id)
-            submitted_orders = self.storage.load_submitted_orders(submitted_task_id)
-            matched_orders = [
-                payload
-                for payload in qmt_orders
-                if _payload_matches_task(payload, submitted_task_id, submitted_orders)
-            ]
-            matched_trades = [
-                payload
-                for payload in qmt_trades
-                if _payload_matches_task(payload, submitted_task_id, submitted_orders)
-            ]
-            synced_orders, synced_status, errors, sync_summary = _summarize_synced_orders(
-                submitted_orders,
-                matched_orders,
-                matched_trades,
-            )
-            result = ExecutionResult(
-                task_id=submitted_task_id,
-                status=synced_status,
-                mode=self.storage.load_task_mode(submitted_task_id),  # type: ignore[arg-type]
-                planned_orders=planned_orders,
-                submitted_orders=synced_orders,
-                trades=[_normalize_trade_payload(trade) for trade in matched_trades],
-                events=[
-                    {
-                        "event_type": "stock_order",
-                        "order_id": _payload_order_id(order),
-                        "symbol": _payload_symbol(order),
-                        "payload": order,
-                    }
-                    for order in matched_orders
-                ],
-                errors=errors,
-                meta={"sync_source": "qmt_query", "sync_summary": sync_summary},
-            )
-            self._attach_current_account_snapshot(result, self.storage.load_task(submitted_task_id))
-            self.storage.mark_task_result(submitted_task_id, synced_status, result.model_dump(mode="json"))
-            result_item: dict[str, object] = {
-                "task_id": submitted_task_id,
-                "status": synced_status,
-            }
-            try:
-                self.xquant.report_result(submitted_task_id, synced_status, result)
-            except XquantAdapterError as exc:
-                result_item.update(
-                    {
-                        "xquant_synced": False,
-                        "status_code": exc.status_code,
-                        "error": str(exc),
-                        "hint": _xquant_report_error_hint(exc),
-                        "sync_summary": sync_summary,
-                    }
+        if task_ids:
+            self.qmt.connect()
+            qmt_orders = [compact_obj(order) for order in self.qmt.get_orders()]
+            qmt_trades = [compact_obj(trade) for trade in self.qmt.get_trades()]
+
+            for submitted_task_id in task_ids:
+                planned_orders = self.storage.load_planned_orders(submitted_task_id)
+                submitted_orders = self.storage.load_submitted_orders(submitted_task_id)
+                matched_orders = [
+                    payload
+                    for payload in qmt_orders
+                    if _payload_matches_task(payload, submitted_task_id, submitted_orders)
+                ]
+                matched_trades = [
+                    payload
+                    for payload in qmt_trades
+                    if _payload_matches_task(payload, submitted_task_id, submitted_orders)
+                ]
+                synced_orders, synced_status, errors, sync_summary = _summarize_synced_orders(
+                    submitted_orders,
+                    matched_orders,
+                    matched_trades,
                 )
-            results.append(result_item)
+                result = ExecutionResult(
+                    task_id=submitted_task_id,
+                    status=synced_status,
+                    mode=self.storage.load_task_mode(submitted_task_id),  # type: ignore[arg-type]
+                    planned_orders=planned_orders,
+                    submitted_orders=synced_orders,
+                    trades=[_normalize_trade_payload(trade) for trade in matched_trades],
+                    events=[
+                        {
+                            "event_type": "stock_order",
+                            "order_id": _payload_order_id(order),
+                            "symbol": _payload_symbol(order),
+                            "payload": order,
+                        }
+                        for order in matched_orders
+                    ],
+                    errors=errors,
+                    meta={"sync_source": "qmt_query", "sync_summary": sync_summary},
+                )
+                self._attach_current_account_snapshot(result, self.storage.load_task(submitted_task_id))
+                self.storage.mark_task_result(submitted_task_id, synced_status, result.model_dump(mode="json"))
+                result_item: dict[str, object] = {
+                    "task_id": submitted_task_id,
+                    "status": synced_status,
+                }
+                if _is_condition_task_id(submitted_task_id):
+                    report_error = self._record_and_report_synced_condition_result(
+                        submitted_task_id,
+                        result,
+                    )
+                    if report_error is not None:
+                        result_item.update(
+                            {
+                                "xquant_synced": False,
+                                "status_code": report_error.status_code
+                                if isinstance(report_error, XquantAdapterError)
+                                else None,
+                                "error": str(report_error),
+                                "hint": _xquant_report_error_hint(report_error)
+                                if isinstance(report_error, XquantAdapterError)
+                                else None,
+                            }
+                        )
+                    results.append(result_item)
+                    continue
+                try:
+                    self.xquant.report_result(submitted_task_id, synced_status, result)
+                except XquantAdapterError as exc:
+                    result_item.update(
+                        {
+                            "xquant_synced": False,
+                            "status_code": exc.status_code,
+                            "error": str(exc),
+                            "hint": _xquant_report_error_hint(exc),
+                            "sync_summary": sync_summary,
+                        }
+                    )
+                results.append(result_item)
+
+        for audit_task_id in audit_task_ids:
+            results.append(self._retry_condition_audit_report(audit_task_id))
 
         if any(result.get("xquant_synced") is False for result in results):
             raise GatewaySyncReportError(results)
@@ -260,6 +630,54 @@ class GatewayService:
         )
         if event.event_type == "stock_trade":
             self.storage.record_trade_event(event.payload, order_id=event.order_id, symbol=event.symbol)
+
+    def _record_and_report_synced_condition_result(
+        self,
+        condition_task_id: str,
+        result: ExecutionResult,
+    ) -> Exception | None:
+        condition_id = _condition_id_from_task_id(condition_task_id)
+        order = self.storage.get_condition_order(condition_id)
+        self._update_synced_condition_status(condition_id, result.status)
+        triggered = self._triggered_condition_from_synced_result(order, result)
+        return self._record_and_report_condition_audit(triggered, result)
+
+    def _triggered_condition_from_synced_result(
+        self,
+        order: ConditionOrder,
+        result: ExecutionResult,
+    ) -> TriggeredConditionPlan:
+        task = RebalanceTask(
+            task_id=result.task_id,
+            portfolio_id=order.portfolio_id,
+            account_id=order.account_id,
+            mode=result.mode,
+            created_at=datetime.now(ZoneInfo(self.settings.risk.timezone)),
+            expires_at=order.expires_at,
+            targets=[TargetPosition(symbol=order.symbol, target_weight=0)],
+            raw={"condition_id": order.condition_id, "source_task_id": order.task_id},
+        )
+        turnover_amount = sum(item.amount for item in result.planned_orders)
+        total_asset = result.total_asset or 0
+        plan = OrderPlan(
+            task_id=result.task_id,
+            account_id=order.account_id,
+            total_asset=total_asset,
+            turnover_amount=turnover_amount,
+            turnover_ratio=turnover_amount / total_asset if total_asset > 0 else 0,
+            orders=result.planned_orders,
+        )
+        return TriggeredConditionPlan(order=order, task=task, plan=plan)
+
+    def _update_synced_condition_status(self, condition_id: str, status: str) -> None:
+        if status == "success":
+            self.storage.update_condition_order_status(condition_id, "completed")
+        elif status == "failed":
+            self.storage.update_condition_order_status(condition_id, "failed")
+        elif status == "partial":
+            self.storage.update_condition_order_status(condition_id, "needs_reconcile")
+        else:
+            self.storage.update_condition_order_status(condition_id, "submitted")
 
     def _attach_current_account_snapshot(
         self,
@@ -294,6 +712,21 @@ class GatewayService:
                 logger.exception("failed to query account prices during result sync")
                 result.meta["account_price_error"] = str(exc)
         attach_account_snapshot(result, account, positions, prices, task)
+
+    def _arm_condition_orders(
+        self,
+        task: RebalanceTask,
+        condition_orders: list[ConditionOrder],
+    ) -> None:
+        if not condition_orders:
+            return
+        self.storage.upsert_condition_orders(condition_orders)
+        for order in condition_orders:
+            self.storage.record_condition_event(
+                order.condition_id,
+                "armed",
+                {"task_id": task.task_id, "symbol": order.symbol, "method": order.method},
+            )
 
 
 def attach_account_snapshot(
@@ -448,7 +881,17 @@ def _xquant_report_error_hint(exc: XquantAdapterError) -> str | None:
 def _payload_matches_task(payload: dict[str, Any], task_id: str, submitted_orders) -> bool:
     if _payload_remark(payload) == task_id:
         return True
+    if _payload_matches_condition_remark(payload, task_id):
+        return True
     return any(_payload_matches_submitted_order(payload, submitted) for submitted in submitted_orders)
+
+
+def _is_condition_task_id(task_id: str) -> bool:
+    return task_id.startswith("condition:")
+
+
+def _condition_id_from_task_id(task_id: str) -> str:
+    return task_id.removeprefix("condition:")
 
 
 def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -> bool:
@@ -460,7 +903,16 @@ def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -
     }
     if payload_ids and submitted_ids and payload_ids.intersection(submitted_ids):
         return True
-    return bool(_payload_remark(payload) == submitted_order.task_id and _payload_symbol(payload) == submitted_order.symbol)
+    same_symbol = _payload_symbol(payload) == submitted_order.symbol
+    if _payload_remark(payload) == submitted_order.task_id and same_symbol:
+        return True
+    return bool(same_symbol and _payload_matches_condition_remark(payload, submitted_order.task_id))
+
+
+def _payload_matches_condition_remark(payload: dict[str, Any], task_id: str) -> bool:
+    if not _is_condition_task_id(task_id):
+        return False
+    return _payload_remark(payload) == f"cond:{_condition_id_from_task_id(task_id)}"
 
 
 def _payload_order_ids(payload: dict[str, Any]) -> set[str]:

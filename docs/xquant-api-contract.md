@@ -222,3 +222,119 @@ Status values:
 
 Xquant should treat repeated result reports for the same `task_id` as
 idempotent updates.
+
+## Report Condition Result
+
+`POST /api/v1/trading-gateway/tasks/{source_task_id}/condition-results`
+
+The gateway calls this endpoint after a condition rule triggers and local
+condition execution has produced an `ExecutionResult`.
+
+Payload includes:
+
+- `source_task_id`.
+- `condition_id`.
+- `condition_task_id`.
+- `account_id`.
+- `portfolio_id`.
+- `symbol`.
+- `status`.
+- `trigger` with `triggered_at`, `latest_price`, `trigger_price`, and
+  `reason`.
+- `rule` with `scope`, `purpose`, `method`, `params`, and `action`.
+- `market_state` with latest price, high-water price, trigger price,
+  activation state, indicator values, computed timestamp, market data
+  source, and nested local state fields.
+- `execution_result`, the local `ExecutionResult` JSON.
+
+Example values are illustrative. Numeric rule parameters are task-supplied
+values determined by Xquant-side research, backtesting, and configuration.
+Market-state values are gateway-derived runtime snapshots, not hardcoded
+thresholds or defaults.
+
+```json
+{
+  "source_task_id": "task-20260603-001",
+  "condition_id": "cond-513100-atr-tp",
+  "condition_task_id": "condition:cond-513100-atr-tp",
+  "account_id": "acct",
+  "portfolio_id": "prod_etf_steady",
+  "symbol": "513100.SH",
+  "status": "dry_run_success",
+  "trigger": {
+    "triggered_at": "2026-06-03T10:30:00+08:00",
+    "latest_price": 1.23,
+    "trigger_price": 1.18,
+    "reason": "latest_price <= trigger_price"
+  },
+  "rule": {
+    "scope": "instrument",
+    "purpose": "take_profit",
+    "method": "atr_trailing",
+    "params": {
+      "activation_profit_pct": 0.12,
+      "atr_window": 14,
+      "atr_multiple": 2.0,
+      "bar_interval": "1d"
+    },
+    "action": {
+      "type": "sell_pct",
+      "pct": 1.0
+    }
+  },
+  "market_state": {
+    "latest_price": 1.23,
+    "high_water_price": 1.4,
+    "trigger_price": 1.18,
+    "activated": true,
+    "activated_at": "2026-06-03T10:20:00+08:00",
+    "activation_price": 1.12,
+    "atr_value": 0.03,
+    "hv_value": null,
+    "std_value": null,
+    "computed_at": "2026-06-03T10:30:00+08:00",
+    "market_data_source": "qmt",
+    "state": {
+      "method": "atr_trailing",
+      "purpose": "take_profit",
+      "params": {
+        "activation_profit_pct": 0.12,
+        "atr_window": 14,
+        "atr_multiple": 2.0,
+        "bar_interval": "1d"
+      },
+      "activation_price": 1.12
+    }
+  },
+  "execution_result": {
+    "task_id": "condition:cond-513100-atr-tp",
+    "status": "dry_run_success",
+    "mode": "dry_run",
+    "planned_orders": [
+      {
+        "task_id": "condition:cond-513100-atr-tp",
+        "symbol": "513100.SH",
+        "side": "sell",
+        "quantity": 1000,
+        "price": 1.23,
+        "amount": 1230.0
+      }
+    ],
+    "submitted_orders": [],
+    "trades": [],
+    "events": [],
+    "holdings": [],
+    "cash": null,
+    "total_asset": null,
+    "errors": [],
+    "meta": {}
+  }
+}
+```
+
+Rules:
+
+- `condition_task_id` is idempotent.
+- A failed condition-result report must not cause repeated trading.
+- Xquant should accept repeated audit reports for the same
+  `condition_task_id` idempotently.
