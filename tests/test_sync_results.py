@@ -39,6 +39,19 @@ class FakeXquant:
         self.condition_results.append((source_task_id, condition_id, payload))
 
 
+class FailingConditionXquant(FakeXquant):
+    def report_condition_result(
+        self,
+        source_task_id: str,
+        condition_id: str,
+        payload: dict,
+    ) -> None:
+        raise XquantAdapterError(
+            'Xquant API error 503: {"detail":"condition_result_unavailable"}',
+            status_code=503,
+        )
+
+
 class ConflictXquant:
     def report_result(self, task_id: str, status: str, payload) -> None:
         raise XquantAdapterError(
@@ -72,6 +85,30 @@ class FilledBroker:
                 price=1.0,
                 amount=1000.0,
                 m_strRemark="task-1",
+            )
+        ]
+
+
+class ConditionRemarkBroker(FilledBroker):
+    def get_orders(self):
+        return [
+            SimpleNamespace(
+                stock_code="513100.SH",
+                order_status=56,
+                traded_volume=1000,
+                price=1.0,
+                m_strRemark="cond:cond-sync",
+            )
+        ]
+
+    def get_trades(self):
+        return [
+            SimpleNamespace(
+                stock_code="513100.SH",
+                quantity=1000,
+                price=1.0,
+                amount=1000.0,
+                m_strRemark="cond:cond-sync",
             )
         ]
 
@@ -287,6 +324,35 @@ def test_sync_results_reports_condition_tasks_to_condition_result_endpoint(tmp_p
     assert payload["condition_task_id"] == "condition:cond-sync"
     assert payload["execution_result"]["status"] == "success"
     assert service.storage.get_condition_order("cond-sync").status == "completed"
+
+
+def test_sync_results_matches_condition_tasks_by_cond_remark(tmp_path) -> None:
+    service = make_service_with_condition_result(tmp_path, result_status="submitted")
+    service.qmt = ConditionRemarkBroker()  # type: ignore[assignment]
+
+    result = service.sync_results(task_id="condition:cond-sync")
+
+    assert result == [{"task_id": "condition:cond-sync", "status": "success"}]
+    payload = service.xquant.condition_results[0][2]  # type: ignore[attr-defined]
+    assert payload["execution_result"]["status"] == "success"
+    assert payload["execution_result"]["submitted_orders"][0]["status"] == "filled"
+
+
+def test_sync_results_surfaces_condition_result_report_failure(tmp_path) -> None:
+    service = make_service_with_condition_result(tmp_path, result_status="submitted")
+    service.xquant = FailingConditionXquant()  # type: ignore[assignment]
+
+    with pytest.raises(GatewaySyncReportError) as exc:
+        service.sync_results(task_id="condition:cond-sync")
+
+    assert exc.value.status_code == 503
+    assert exc.value.results[0]["task_id"] == "condition:cond-sync"
+    assert exc.value.results[0]["status"] == "success"
+    assert exc.value.results[0]["xquant_synced"] is False
+    assert exc.value.results[0]["status_code"] == 503
+    stored = service.storage.get_condition_trigger_audit("condition:cond-sync")
+    assert stored is not None
+    assert stored["xquant_report_status"] == "failed"
 
 
 def test_sync_results_can_refresh_previously_successful_task(tmp_path) -> None:

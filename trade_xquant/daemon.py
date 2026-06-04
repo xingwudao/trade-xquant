@@ -28,7 +28,7 @@ from trade_xquant.models import (
 from trade_xquant.mock_qmt_adapter import MockBrokerAdapter
 from trade_xquant.portfolio_engine import PortfolioEngine
 from trade_xquant.qmt_adapter import QmtAdapter, compact_obj
-from trade_xquant.risk_control import RiskControl
+from trade_xquant.risk_control import RiskControl, RiskError
 from trade_xquant.storage import Storage
 from trade_xquant.xquant_adapter import XquantAdapter, XquantAdapterError
 
@@ -185,13 +185,17 @@ class GatewayService:
             now=now,
         )
         results: list[dict[str, object]] = []
+        remaining_turnover_amount = account.total_asset * self.settings.risk.max_turnover_ratio
         for triggered in triggered_plans:
             condition_id = triggered.order.condition_id
             try:
                 self.storage.record_task_received(triggered.task, status="claimed")
                 self.storage.record_plan(triggered.plan)
                 self.storage.update_condition_order_status(condition_id, "triggered")
+                if triggered.plan.turnover_amount > remaining_turnover_amount + 1e-9:
+                    raise RiskError("condition turnover exceeds remaining threshold")
                 self.risk.validate(triggered.task, account, triggered.plan, now=now, known_symbols=set(prices))
+                remaining_turnover_amount -= triggered.plan.turnover_amount
             except Exception as exc:  # noqa: BLE001 - risk-blocked triggers still need audit
                 logger.exception("condition order blocked by risk: %s", condition_id)
                 result = self._failed_condition_execution_result(
@@ -310,7 +314,7 @@ class GatewayService:
         self,
         triggered: TriggeredConditionPlan,
         result: ExecutionResult,
-    ) -> None:
+    ) -> Exception | None:
         condition_id = triggered.order.condition_id
         audit_payload = self._condition_audit_payload(triggered, result)
         self.storage.record_condition_trigger_audit(
@@ -331,7 +335,7 @@ class GatewayService:
                 "skipped",
                 "local_task_file",
             )
-            return
+            return None
         try:
             self.xquant.report_condition_result(
                 triggered.order.task_id,
@@ -342,6 +346,7 @@ class GatewayService:
                 triggered.task.task_id,
                 "success",
             )
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.exception("failed to report condition result to Xquant")
             self.storage.update_condition_audit_report_status(
@@ -350,6 +355,7 @@ class GatewayService:
                 str(exc),
             )
             self.storage.update_condition_order_status(condition_id, "needs_reconcile")
+            return exc
 
     def _retry_condition_audit_report(self, condition_task_id: str) -> dict[str, object]:
         audit = self.storage.get_condition_trigger_audit(condition_task_id)
@@ -574,10 +580,23 @@ class GatewayService:
                     "status": synced_status,
                 }
                 if _is_condition_task_id(submitted_task_id):
-                    self._record_and_report_synced_condition_result(
+                    report_error = self._record_and_report_synced_condition_result(
                         submitted_task_id,
                         result,
                     )
+                    if report_error is not None:
+                        result_item.update(
+                            {
+                                "xquant_synced": False,
+                                "status_code": report_error.status_code
+                                if isinstance(report_error, XquantAdapterError)
+                                else None,
+                                "error": str(report_error),
+                                "hint": _xquant_report_error_hint(report_error)
+                                if isinstance(report_error, XquantAdapterError)
+                                else None,
+                            }
+                        )
                     results.append(result_item)
                     continue
                 try:
@@ -616,12 +635,12 @@ class GatewayService:
         self,
         condition_task_id: str,
         result: ExecutionResult,
-    ) -> None:
+    ) -> Exception | None:
         condition_id = _condition_id_from_task_id(condition_task_id)
         order = self.storage.get_condition_order(condition_id)
         self._update_synced_condition_status(condition_id, result.status)
         triggered = self._triggered_condition_from_synced_result(order, result)
-        self._record_and_report_condition_audit(triggered, result)
+        return self._record_and_report_condition_audit(triggered, result)
 
     def _triggered_condition_from_synced_result(
         self,
@@ -862,6 +881,8 @@ def _xquant_report_error_hint(exc: XquantAdapterError) -> str | None:
 def _payload_matches_task(payload: dict[str, Any], task_id: str, submitted_orders) -> bool:
     if _payload_remark(payload) == task_id:
         return True
+    if _payload_matches_condition_remark(payload, task_id):
+        return True
     return any(_payload_matches_submitted_order(payload, submitted) for submitted in submitted_orders)
 
 
@@ -882,7 +903,16 @@ def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -
     }
     if payload_ids and submitted_ids and payload_ids.intersection(submitted_ids):
         return True
-    return bool(_payload_remark(payload) == submitted_order.task_id and _payload_symbol(payload) == submitted_order.symbol)
+    same_symbol = _payload_symbol(payload) == submitted_order.symbol
+    if _payload_remark(payload) == submitted_order.task_id and same_symbol:
+        return True
+    return bool(same_symbol and _payload_matches_condition_remark(payload, submitted_order.task_id))
+
+
+def _payload_matches_condition_remark(payload: dict[str, Any], task_id: str) -> bool:
+    if not _is_condition_task_id(task_id):
+        return False
+    return _payload_remark(payload) == f"cond:{_condition_id_from_task_id(task_id)}"
 
 
 def _payload_order_ids(payload: dict[str, Any]) -> set[str]:

@@ -496,6 +496,64 @@ def test_gateway_condition_poll_once_executes_indicator_condition_order(tmp_path
     assert service.storage.get_condition_order("cond-atr").status == "submitted"
 
 
+def test_gateway_condition_poll_enforces_shared_turnover_budget(tmp_path) -> None:
+    service = GatewayService(
+        settings_for(
+            tmp_path,
+            risk=RiskConfig(max_single_order_amount=100_000, max_turnover_ratio=0.8),
+        )
+    )
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-a",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-b",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    broker = SelectivePriceBroker({"513100.SH": 60.0, "159915.SZ": 60.0})
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [
+        {"condition_id": "cond-a", "status": "dry_run_success"},
+        {
+            "condition_id": "cond-b",
+            "status": "failed",
+            "error": "condition turnover exceeds remaining threshold",
+        },
+    ]
+    assert len(broker.submitted_orders) == 1
+    assert broker.submitted_orders[0].symbol == "513100.SH"
+    assert service.storage.get_condition_order("cond-a").status == "submitted"
+    assert service.storage.get_condition_order("cond-b").status == "failed"
+
+
 def test_gateway_persists_submitted_condition_task_result_for_sync(tmp_path) -> None:
     settings = settings_for(tmp_path)
     settings.runtime.simulate_real_orders = True
