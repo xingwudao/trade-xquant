@@ -396,6 +396,11 @@ def test_gateway_condition_poll_once_executes_triggered_condition_order(tmp_path
     assert submitted.side == "sell"
     assert submitted.quantity == 1000
     assert submitted.remark == "cond:cond-1"
+    condition_task = service.storage.load_task("condition:cond-1")
+    assert condition_task is not None
+    assert condition_task.mode == "dry_run"
+    assert condition_task.targets[0].symbol == "513100.SH"
+    assert condition_task.targets[0].target_weight == 0
     assert service.storage.get_condition_order("cond-1").status == "submitted"
 
 
@@ -521,6 +526,10 @@ def test_gateway_persists_submitted_condition_task_result_for_sync(tmp_path) -> 
 
     assert result == [{"condition_id": "cond-real-submit", "status": "submitted"}]
     assert service.storage.list_submitted_task_ids() == ["condition:cond-real-submit"]
+    condition_task = service.storage.load_task("condition:cond-real-submit")
+    assert condition_task is not None
+    assert condition_task.mode == "real"
+    assert condition_task.targets[0].target_weight == 0
     assert service.storage.get_condition_order("cond-real-submit").status == "submitted"
 
 
@@ -674,6 +683,21 @@ def test_gateway_xquant_audit_failure_does_not_repeat_trade(tmp_path) -> None:
     assert stored["xquant_report_status"] == "failed"
     assert stored["xquant_report_error"] == "xquant audit failed"
     assert service.storage.get_condition_order("cond-audit-fail").status == "needs_reconcile"
+
+    retry_audit = AuditXquant()
+    service.xquant = retry_audit  # type: ignore[assignment]
+
+    result = service.sync_results(task_id="condition:cond-audit-fail")
+
+    assert result == [{"task_id": "condition:cond-audit-fail", "status": "dry_run_success"}]
+    assert len(broker.submitted_orders) == 1
+    assert retry_audit.payloads[0][0] == "task-1"
+    assert retry_audit.payloads[0][1] == "cond-audit-fail"
+    assert retry_audit.payloads[0][2]["execution_result"]["status"] == "dry_run_success"
+    stored = service.storage.get_condition_trigger_audit("condition:cond-audit-fail")
+    assert stored is not None
+    assert stored["xquant_report_status"] == "success"
+    assert service.storage.get_condition_order("cond-audit-fail").status == "submitted"
 
 
 def test_gateway_risk_rejection_records_and_reports_condition_audit(tmp_path) -> None:

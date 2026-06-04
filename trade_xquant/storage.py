@@ -539,6 +539,36 @@ class Storage:
         result["execution_result"] = json.loads(result.pop("execution_result_json"))
         return result
 
+    def list_retryable_condition_audit_task_ids(
+        self,
+        task_id: str | None = None,
+        status: str = "all",
+    ) -> list[str]:
+        if status == "all":
+            report_statuses = ["failed", "pending"]
+        elif status == "failed":
+            report_statuses = ["failed"]
+        else:
+            return []
+        placeholders = ", ".join("?" for _ in report_statuses)
+        params: list[str] = list(report_statuses)
+        task_filter = ""
+        if task_id:
+            task_filter = " AND (condition_task_id=? OR source_task_id=?)"
+            params.extend([task_id, task_id])
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT condition_task_id
+                FROM condition_trigger_audits
+                WHERE xquant_report_status IN ({placeholders})
+                  {task_filter}
+                ORDER BY updated_at ASC
+                """,
+                params,
+            ).fetchall()
+        return [row["condition_task_id"] for row in rows]
+
     def record_order_event(
         self,
         event_type: str,

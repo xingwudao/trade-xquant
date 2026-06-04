@@ -188,6 +188,7 @@ class GatewayService:
         for triggered in triggered_plans:
             condition_id = triggered.order.condition_id
             try:
+                self.storage.record_task_received(triggered.task, status="claimed")
                 self.storage.record_plan(triggered.plan)
                 self.storage.update_condition_order_status(condition_id, "triggered")
                 self.risk.validate(triggered.task, account, triggered.plan, now=now, known_symbols=set(prices))
@@ -350,6 +351,53 @@ class GatewayService:
             )
             self.storage.update_condition_order_status(condition_id, "needs_reconcile")
 
+    def _retry_condition_audit_report(self, condition_task_id: str) -> dict[str, object]:
+        audit = self.storage.get_condition_trigger_audit(condition_task_id)
+        if audit is None:
+            return {
+                "task_id": condition_task_id,
+                "status": "missing_audit",
+                "xquant_synced": False,
+                "error": "condition audit record not found",
+            }
+        order = self.storage.get_condition_order(audit["condition_id"])
+        execution_result = audit["execution_result"]
+        execution_status = str(execution_result.get("status") or "unknown")
+        payload = {
+            "condition_task_id": audit["condition_task_id"],
+            "account_id": order.account_id,
+            "portfolio_id": order.portfolio_id,
+            "symbol": audit["symbol"],
+            "status": execution_status,
+            "trigger": audit["trigger"],
+            "rule": audit["rule"],
+            "market_state": audit["market_state"],
+            "execution_result": execution_result,
+        }
+        result_item: dict[str, object] = {
+            "task_id": condition_task_id,
+            "status": execution_status,
+        }
+        try:
+            self.xquant.report_condition_result(
+                audit["source_task_id"],
+                audit["condition_id"],
+                payload,
+            )
+            self.storage.update_condition_audit_report_status(condition_task_id, "success")
+            self._update_synced_condition_status(audit["condition_id"], execution_status)
+        except Exception as exc:  # noqa: BLE001 - sync should return all report failures
+            self.storage.update_condition_audit_report_status(condition_task_id, "failed", str(exc))
+            result_item.update(
+                {
+                    "xquant_synced": False,
+                    "status_code": exc.status_code if isinstance(exc, XquantAdapterError) else None,
+                    "error": str(exc),
+                    "hint": _xquant_report_error_hint(exc) if isinstance(exc, XquantAdapterError) else None,
+                }
+            )
+        return result_item
+
     def _condition_audit_payload(
         self,
         triggered: TriggeredConditionPlan,
@@ -462,78 +510,92 @@ class GatewayService:
     def sync_results(self, task_id: str | None = None, status: str = "all") -> list[dict[str, object]]:
         self.storage.initialize()
         task_ids = self.storage.list_syncable_task_ids(task_id=task_id, status=status)
-        if not task_ids:
+        task_id_set = set(task_ids)
+        audit_task_ids = [
+            audit_task_id
+            for audit_task_id in self.storage.list_retryable_condition_audit_task_ids(
+                task_id=task_id,
+                status=status,
+            )
+            if audit_task_id not in task_id_set
+        ]
+        if not task_ids and not audit_task_ids:
             logger.info("no matching tasks to sync")
             return []
 
-        self.qmt.connect()
-        qmt_orders = [compact_obj(order) for order in self.qmt.get_orders()]
-        qmt_trades = [compact_obj(trade) for trade in self.qmt.get_trades()]
         results: list[dict[str, object]] = []
 
-        for submitted_task_id in task_ids:
-            planned_orders = self.storage.load_planned_orders(submitted_task_id)
-            submitted_orders = self.storage.load_submitted_orders(submitted_task_id)
-            matched_orders = [
-                payload
-                for payload in qmt_orders
-                if _payload_matches_task(payload, submitted_task_id, submitted_orders)
-            ]
-            matched_trades = [
-                payload
-                for payload in qmt_trades
-                if _payload_matches_task(payload, submitted_task_id, submitted_orders)
-            ]
-            synced_orders, synced_status, errors, sync_summary = _summarize_synced_orders(
-                submitted_orders,
-                matched_orders,
-                matched_trades,
-            )
-            result = ExecutionResult(
-                task_id=submitted_task_id,
-                status=synced_status,
-                mode=self.storage.load_task_mode(submitted_task_id),  # type: ignore[arg-type]
-                planned_orders=planned_orders,
-                submitted_orders=synced_orders,
-                trades=[_normalize_trade_payload(trade) for trade in matched_trades],
-                events=[
-                    {
-                        "event_type": "stock_order",
-                        "order_id": _payload_order_id(order),
-                        "symbol": _payload_symbol(order),
-                        "payload": order,
-                    }
-                    for order in matched_orders
-                ],
-                errors=errors,
-                meta={"sync_source": "qmt_query", "sync_summary": sync_summary},
-            )
-            self._attach_current_account_snapshot(result, self.storage.load_task(submitted_task_id))
-            self.storage.mark_task_result(submitted_task_id, synced_status, result.model_dump(mode="json"))
-            result_item: dict[str, object] = {
-                "task_id": submitted_task_id,
-                "status": synced_status,
-            }
-            if _is_condition_task_id(submitted_task_id):
-                self._record_and_report_synced_condition_result(
-                    submitted_task_id,
-                    result,
+        if task_ids:
+            self.qmt.connect()
+            qmt_orders = [compact_obj(order) for order in self.qmt.get_orders()]
+            qmt_trades = [compact_obj(trade) for trade in self.qmt.get_trades()]
+
+            for submitted_task_id in task_ids:
+                planned_orders = self.storage.load_planned_orders(submitted_task_id)
+                submitted_orders = self.storage.load_submitted_orders(submitted_task_id)
+                matched_orders = [
+                    payload
+                    for payload in qmt_orders
+                    if _payload_matches_task(payload, submitted_task_id, submitted_orders)
+                ]
+                matched_trades = [
+                    payload
+                    for payload in qmt_trades
+                    if _payload_matches_task(payload, submitted_task_id, submitted_orders)
+                ]
+                synced_orders, synced_status, errors, sync_summary = _summarize_synced_orders(
+                    submitted_orders,
+                    matched_orders,
+                    matched_trades,
                 )
+                result = ExecutionResult(
+                    task_id=submitted_task_id,
+                    status=synced_status,
+                    mode=self.storage.load_task_mode(submitted_task_id),  # type: ignore[arg-type]
+                    planned_orders=planned_orders,
+                    submitted_orders=synced_orders,
+                    trades=[_normalize_trade_payload(trade) for trade in matched_trades],
+                    events=[
+                        {
+                            "event_type": "stock_order",
+                            "order_id": _payload_order_id(order),
+                            "symbol": _payload_symbol(order),
+                            "payload": order,
+                        }
+                        for order in matched_orders
+                    ],
+                    errors=errors,
+                    meta={"sync_source": "qmt_query", "sync_summary": sync_summary},
+                )
+                self._attach_current_account_snapshot(result, self.storage.load_task(submitted_task_id))
+                self.storage.mark_task_result(submitted_task_id, synced_status, result.model_dump(mode="json"))
+                result_item: dict[str, object] = {
+                    "task_id": submitted_task_id,
+                    "status": synced_status,
+                }
+                if _is_condition_task_id(submitted_task_id):
+                    self._record_and_report_synced_condition_result(
+                        submitted_task_id,
+                        result,
+                    )
+                    results.append(result_item)
+                    continue
+                try:
+                    self.xquant.report_result(submitted_task_id, synced_status, result)
+                except XquantAdapterError as exc:
+                    result_item.update(
+                        {
+                            "xquant_synced": False,
+                            "status_code": exc.status_code,
+                            "error": str(exc),
+                            "hint": _xquant_report_error_hint(exc),
+                            "sync_summary": sync_summary,
+                        }
+                    )
                 results.append(result_item)
-                continue
-            try:
-                self.xquant.report_result(submitted_task_id, synced_status, result)
-            except XquantAdapterError as exc:
-                result_item.update(
-                    {
-                        "xquant_synced": False,
-                        "status_code": exc.status_code,
-                        "error": str(exc),
-                        "hint": _xquant_report_error_hint(exc),
-                        "sync_summary": sync_summary,
-                    }
-                )
-            results.append(result_item)
+
+        for audit_task_id in audit_task_ids:
+            results.append(self._retry_condition_audit_report(audit_task_id))
 
         if any(result.get("xquant_synced") is False for result in results):
             raise GatewaySyncReportError(results)
