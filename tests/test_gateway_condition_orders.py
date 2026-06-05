@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -68,6 +69,387 @@ def test_gateway_poll_once_reads_local_task_file_and_arms_condition_orders(tmp_p
 
     assert result == [{"task_id": "task-1", "status": "dry_run_success"}]
     assert [order.condition_id for order in service.storage.list_active_condition_orders()] == ["cond-1"]
+
+
+def test_gateway_arms_take_profit_reference_from_position_cost(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-reference-source",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.011}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "condition_id": "take-profit-trailing",
+                                    "symbol": "513100.SH",
+                                    "purpose": "take_profit",
+                                    "method": "trailing_pct",
+                                    "params": {
+                                        "activation_profit_pct": 0.05,
+                                        "trail_pct": 0.03,
+                                    },
+                                    "reference": {"source": "position_cost_price"},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+    service.qmt = PositionBroker(price=1.1)  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-reference-source", "status": "dry_run_success"}]
+    order = service.storage.get_condition_order("take-profit-trailing")
+    assert order.status == "armed"
+    assert order.reference_price == 1.0
+    assert order.high_water_price == 1.0
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("take-profit-trailing",),
+        ).fetchone()
+    assert row["event_type"] == "armed"
+    payload = json.loads(row["payload_json"])
+    assert payload["reference"] == {
+        "source": "position_cost_price",
+        "price": 1.0,
+        "activation_price": 1.05,
+    }
+
+
+def test_gateway_arms_static_template_reference_from_position_cost(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-static-template-reference",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.011}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "id": "stop_loss-static_pct-1",
+                                    "scope": "instrument",
+                                    "purpose": "stop_loss",
+                                    "method": "static_pct",
+                                    "params": {"stop_loss_pct": 0.08},
+                                    "reference": {"source": "position_cost_price"},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+    service.qmt = PositionBroker(price=1.1)  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-static-template-reference", "status": "dry_run_success"}]
+    order = service.storage.get_condition_order("cond-acct-prod-513100.SH-stop_loss-static_pct-1")
+    assert order.status == "armed"
+    assert order.reference_price == 1.0
+    assert order.raw["template_id"] == "stop_loss-static_pct-1"
+
+
+def test_gateway_does_not_rearm_in_flight_template_condition(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-new",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.011}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "id": "stop_loss-static_pct-1",
+                                    "scope": "instrument",
+                                    "purpose": "stop_loss",
+                                    "method": "static_pct",
+                                    "params": {"stop_loss_pct": 0.08},
+                                    "reference": {"source": "position_cost_price"},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-acct-prod-513100.SH-stop_loss-static_pct-1",
+                task_id="task-old",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                status="submitted",
+                reference_price=1.2,
+                high_water_price=1.2,
+                params={"stop_loss_pct": 0.08},
+                raw={
+                    "template_id": "stop_loss-static_pct-1",
+                    "reference": {"source": "position_cost_price"},
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    service.qmt = PositionBroker(price=1.1)  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-new", "status": "dry_run_success"}]
+    order = service.storage.get_condition_order(
+        "cond-acct-prod-513100.SH-stop_loss-static_pct-1"
+    )
+    assert order.status == "submitted"
+    assert order.task_id == "task-old"
+    assert order.reference_price == 1.2
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("cond-acct-prod-513100.SH-stop_loss-static_pct-1",),
+        ).fetchone()
+    assert row["event_type"] == "arm_skipped"
+    payload = json.loads(row["payload_json"])
+    assert payload["task_id"] == "task-new"
+    assert payload["existing_task_id"] == "task-old"
+    assert payload["existing_status"] == "submitted"
+
+
+def test_gateway_condition_poll_refreshes_pending_reference_orders(tmp_path) -> None:
+    service = GatewayService(settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-pending-reference",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                status="pending_reference",
+                params={"stop_loss_pct": 0.05},
+                raw={"reference": {"source": "position_cost_price"}},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-pending-reference-other-account",
+                task_id="task-2",
+                portfolio_id="prod",
+                account_id="other-acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                status="pending_reference",
+                params={"stop_loss_pct": 0.05},
+                raw={"reference": {"source": "position_cost_price"}},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    service.qmt = PositionBroker(price=1.0)  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == []
+    order = service.storage.get_condition_order("cond-pending-reference")
+    assert order.status == "armed"
+    assert order.reference_price == 1.0
+    assert order.high_water_price == 1.0
+    other_order = service.storage.get_condition_order(
+        "cond-pending-reference-other-account"
+    )
+    assert other_order.status == "pending_reference"
+    assert other_order.reference_price is None
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("cond-pending-reference",),
+        ).fetchone()
+    assert row["event_type"] == "reference_updated"
+    payload = json.loads(row["payload_json"])
+    assert payload["reference"]["source"] == "position_cost_price"
+    assert payload["reference"]["price"] == 1.0
+
+
+def test_gateway_preserves_explicit_reference_price(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-explicit-reference",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.011}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "condition_id": "stop-loss-explicit",
+                                    "symbol": "513100.SH",
+                                    "purpose": "stop_loss",
+                                    "method": "static_pct",
+                                    "reference_price": 2.0,
+                                    "params": {"stop_loss_pct": 0.05},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+    service.qmt = PositionBroker(price=1.1)  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-explicit-reference", "status": "dry_run_success"}]
+    order = service.storage.get_condition_order("stop-loss-explicit")
+    assert order.status == "armed"
+    assert order.reference_price == 2.0
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("stop-loss-explicit",),
+        ).fetchone()
+    payload = json.loads(row["payload_json"])
+    assert payload["reference"]["source"] == "reference_price"
+    assert payload["reference"]["price"] == 2.0
+
+
+def test_gateway_does_not_default_legacy_trailing_reference_to_position_cost(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-legacy-trailing",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.011}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "condition_id": "legacy-trailing-stop",
+                                    "symbol": "513100.SH",
+                                    "purpose": "stop_loss",
+                                    "method": "trailing_pct",
+                                    "params": {"trail_pct": 0.05},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+    service.qmt = PositionBroker(price=1.1)  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-legacy-trailing", "status": "dry_run_success"}]
+    order = service.storage.get_condition_order("legacy-trailing-stop")
+    assert order.status == "armed"
+    assert order.reference_price is None
+    assert order.high_water_price is None
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("legacy-trailing-stop",),
+        ).fetchone()
+    payload = json.loads(row["payload_json"])
+    assert payload["reference"]["source"] == "unspecified"
+    assert payload["reference"]["price"] is None
 
 
 def test_local_json_can_arm_all_single_instrument_methods(tmp_path) -> None:
@@ -356,7 +738,7 @@ def test_gateway_local_condition_audit_skips_xquant_report(tmp_path) -> None:
     assert xquant.condition_result_calls == 0
     assert len(broker.submitted_orders) == 1
     assert service.storage.get_condition_order("cond-local-skip").status == "submitted"
-    stored = service.storage.get_condition_trigger_audit("condition:cond-local-skip")
+    stored = service.storage.get_condition_trigger_audit("condition:task-local:cond-local-skip")
     assert stored is not None
     assert stored["xquant_report_status"] == "skipped"
     assert stored["xquant_report_error"] == "local_task_file"
@@ -391,17 +773,61 @@ def test_gateway_condition_poll_once_executes_triggered_condition_order(tmp_path
     assert result == [{"condition_id": "cond-1", "status": "dry_run_success"}]
     assert len(broker.submitted_orders) == 1
     submitted = broker.submitted_orders[0]
-    assert submitted.task_id == "condition:cond-1"
+    assert submitted.task_id == "condition:task-1:cond-1"
     assert submitted.symbol == "513100.SH"
     assert submitted.side == "sell"
     assert submitted.quantity == 1000
     assert submitted.remark == "cond:cond-1"
-    condition_task = service.storage.load_task("condition:cond-1")
+    condition_task = service.storage.load_task("condition:task-1:cond-1")
     assert condition_task is not None
     assert condition_task.mode == "dry_run"
     assert condition_task.targets[0].symbol == "513100.SH"
     assert condition_task.targets[0].target_weight == 0
     assert service.storage.get_condition_order("cond-1").status == "submitted"
+
+
+def test_gateway_condition_task_id_is_capped_for_long_source_task_ids(tmp_path) -> None:
+    service = GatewayService(settings_for(tmp_path))
+    service.storage.initialize()
+    condition_id = (
+        "cond-prod_leading_stocks_rotation-300394.SZ-take_profit-trailing_pct-2-"
+        + "x" * 180
+    )
+    source_task_id = (
+        "manual_rebalance_prod_leading_stocks_rotation_20260521_"
+        "dc1c54e3e4b1aa82_real_8a05708a0c39"
+    )
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id=condition_id,
+                task_id=source_task_id,
+                portfolio_id="prod_leading_stocks_rotation",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker()
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    service.condition_poll_once()
+
+    condition_task_id = broker.submitted_orders[0].task_id
+    assert len(condition_task_id) <= 160
+    assert condition_task_id.startswith("condition:")
+    assert condition_id in condition_task_id or condition_task_id.endswith(condition_id[-80:])
+    assert source_task_id not in condition_task_id
+    condition_task = service.storage.load_task(condition_task_id)
+    assert condition_task is not None
+    assert condition_task.raw["condition_id"] == condition_id
 
 
 def test_gateway_condition_quote_failure_does_not_block_other_conditions(tmp_path) -> None:
@@ -488,7 +914,7 @@ def test_gateway_condition_poll_once_executes_indicator_condition_order(tmp_path
     assert broker.bar_calls == [("513100.SH", "1d", 3)]
     assert len(broker.submitted_orders) == 1
     submitted = broker.submitted_orders[0]
-    assert submitted.task_id == "condition:cond-atr"
+    assert submitted.task_id == "condition:task-1:cond-atr"
     assert submitted.symbol == "513100.SH"
     assert submitted.side == "sell"
     assert submitted.quantity == 1000
@@ -583,8 +1009,8 @@ def test_gateway_persists_submitted_condition_task_result_for_sync(tmp_path) -> 
     result = service.condition_poll_once()
 
     assert result == [{"condition_id": "cond-real-submit", "status": "submitted"}]
-    assert service.storage.list_submitted_task_ids() == ["condition:cond-real-submit"]
-    condition_task = service.storage.load_task("condition:cond-real-submit")
+    assert service.storage.list_submitted_task_ids() == ["condition:task-1:cond-real-submit"]
+    condition_task = service.storage.load_task("condition:task-1:cond-real-submit")
     assert condition_task is not None
     assert condition_task.mode == "real"
     assert condition_task.targets[0].target_weight == 0
@@ -651,12 +1077,12 @@ def test_gateway_records_and_reports_condition_audit(tmp_path) -> None:
     assert audit.payloads[0][0] == "task-1"
     assert audit.payloads[0][1] == "cond-audit"
     payload = audit.payloads[0][2]
-    assert payload["condition_task_id"] == "condition:cond-audit"
+    assert payload["condition_task_id"] == "condition:task-1:cond-audit"
     assert payload["rule"]["params"]["take_profit_pct"] == 0.1
     triggered_at = service.storage.get_condition_order_triggered_at("cond-audit")
     assert triggered_at is not None
     assert payload["trigger"]["triggered_at"] == triggered_at
-    stored = service.storage.get_condition_trigger_audit("condition:cond-audit")
+    stored = service.storage.get_condition_trigger_audit("condition:task-1:cond-audit")
     assert stored is not None
     assert stored["xquant_report_status"] == "success"
     assert stored["rule"]["params"]["take_profit_pct"] == 0.1
@@ -664,7 +1090,7 @@ def test_gateway_records_and_reports_condition_audit(tmp_path) -> None:
     assert stored["trigger"]["latest_price"] == 1.1
     assert stored["trigger"]["trigger_price"] == 1.1
     assert stored["trigger"]["triggered_at"] == triggered_at
-    assert stored["execution_result"]["task_id"] == "condition:cond-audit"
+    assert stored["execution_result"]["task_id"] == "condition:task-1:cond-audit"
 
 
 def test_gateway_reports_activation_price_in_top_level_market_state(tmp_path) -> None:
@@ -736,7 +1162,7 @@ def test_gateway_xquant_audit_failure_does_not_repeat_trade(tmp_path) -> None:
     service.condition_poll_once()
 
     assert len(broker.submitted_orders) == 1
-    stored = service.storage.get_condition_trigger_audit("condition:cond-audit-fail")
+    stored = service.storage.get_condition_trigger_audit("condition:task-1:cond-audit-fail")
     assert stored is not None
     assert stored["xquant_report_status"] == "failed"
     assert stored["xquant_report_error"] == "xquant audit failed"
@@ -745,14 +1171,14 @@ def test_gateway_xquant_audit_failure_does_not_repeat_trade(tmp_path) -> None:
     retry_audit = AuditXquant()
     service.xquant = retry_audit  # type: ignore[assignment]
 
-    result = service.sync_results(task_id="condition:cond-audit-fail")
+    result = service.sync_results(task_id="condition:task-1:cond-audit-fail")
 
-    assert result == [{"task_id": "condition:cond-audit-fail", "status": "dry_run_success"}]
+    assert result == [{"task_id": "condition:task-1:cond-audit-fail", "status": "dry_run_success"}]
     assert len(broker.submitted_orders) == 1
     assert retry_audit.payloads[0][0] == "task-1"
     assert retry_audit.payloads[0][1] == "cond-audit-fail"
     assert retry_audit.payloads[0][2]["execution_result"]["status"] == "dry_run_success"
-    stored = service.storage.get_condition_trigger_audit("condition:cond-audit-fail")
+    stored = service.storage.get_condition_trigger_audit("condition:task-1:cond-audit-fail")
     assert stored is not None
     assert stored["xquant_report_status"] == "success"
     assert service.storage.get_condition_order("cond-audit-fail").status == "submitted"
@@ -810,7 +1236,7 @@ def test_gateway_risk_rejection_records_and_reports_condition_audit(tmp_path) ->
         "single order amount exceeds threshold"
     ]
     assert payload["execution_result"]["planned_orders"][0]["amount"] == 1100.0
-    stored = service.storage.get_condition_trigger_audit("condition:cond-risk-reject")
+    stored = service.storage.get_condition_trigger_audit("condition:task-1:cond-risk-reject")
     assert stored is not None
     assert stored["xquant_report_status"] == "success"
     assert stored["execution_result"]["status"] == "failed"

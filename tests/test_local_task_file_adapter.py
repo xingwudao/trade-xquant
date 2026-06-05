@@ -99,6 +99,69 @@ def test_local_task_file_adapter_preserves_new_condition_methods(tmp_path) -> No
     assert orders[0].method == "atr_trailing"
 
 
+def test_condition_rule_templates_expand_to_target_symbols(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [
+                            {"symbol": "513100.SS", "target_weight": 0.5},
+                            {"symbol": "510300.SS", "target_weight": 0.5},
+                        ],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "id": "stop_loss-trailing_pct-1",
+                                    "scope": "instrument",
+                                    "purpose": "stop_loss",
+                                    "method": "trailing_pct",
+                                    "params": {"trail_pct": 0.03},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                    "reference": {"source": "position_cost_price"},
+                                },
+                                {
+                                    "id": "take_profit-trailing_pct-2",
+                                    "scope": "instrument",
+                                    "purpose": "take_profit",
+                                    "method": "trailing_pct",
+                                    "params": {
+                                        "activation_profit_pct": 0.05,
+                                        "trail_pct": 0.03,
+                                    },
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                    "reference": {"source": "position_cost_price"},
+                                },
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tasks = LocalTaskFileAdapter(task_file).fetch_pending_tasks("acct")
+    orders = extract_condition_orders(tasks[0])
+
+    assert len(orders) == 4
+    assert [order.condition_id for order in orders] == [
+        "cond-acct-prod-513100.SH-stop_loss-trailing_pct-1",
+        "cond-acct-prod-510300.SH-stop_loss-trailing_pct-1",
+        "cond-acct-prod-513100.SH-take_profit-trailing_pct-2",
+        "cond-acct-prod-510300.SH-take_profit-trailing_pct-2",
+    ]
+    assert {order.symbol for order in orders} == {"513100.SH", "510300.SH"}
+    assert all(order.raw["reference"]["source"] == "position_cost_price" for order in orders)
+
+
 def test_local_task_file_adapter_accepts_top_level_task_list(tmp_path) -> None:
     task_file = tmp_path / "tasks.json"
     task_file.write_text(

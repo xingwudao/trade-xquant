@@ -335,6 +335,50 @@ thresholds or defaults.
 Rules:
 
 - `condition_task_id` is idempotent.
+- For condition-triggered trades, trade-xquant uses
+  `condition:{source_task_id}:{condition_id}` when it fits Xquant length
+  limits. If it would exceed 160 characters, trade-xquant uses
+  `condition:{source_task_hash}:{condition_id}` and still sends
+  `source_task_id` in the audit payload.
 - A failed condition-result report must not cause repeated trading.
 - Xquant should accept repeated audit reports for the same
   `condition_task_id` idempotently.
+
+## Condition Rule Template Responsibility
+
+Xquant should send condition rule templates as portfolio/account-level
+configuration. The gateway instantiates those templates against the aggregate
+holding for each symbol after local execution and QMT position refresh.
+
+Xquant sends:
+
+- `id`: stable rule template id, for example `stop_loss-trailing_pct-1`.
+- `scope: "instrument"`.
+- `purpose`.
+- `method`.
+- `params`: backtest-derived hyperparameters only.
+- `action`.
+- `reference.source: "position_cost_price"`.
+
+Xquant must not send `reference_price` for rules whose reference depends on
+the executed holding cost. After trading, trade-xquant reads the latest QMT
+position `cost_price`, writes it as the condition instance `reference_price`,
+and derives runtime values such as activation price, high-water price, and
+trigger price locally.
+
+For the current MVP, rule instances are bound to aggregate holdings:
+
+```text
+account_id + portfolio_id + symbol + rule_template_id
+```
+
+trade-xquant expands each template into local condition instances:
+
+```text
+condition_id = cond-{portfolio_id}-{symbol}-{rule_template_id}
+```
+
+When the same portfolio later adds to an existing symbol, Xquant should keep
+the same rule template id. trade-xquant refreshes the aggregate holding
+reference price from QMT and updates the existing condition instance rather
+than requiring Xquant to create lot-level rules.

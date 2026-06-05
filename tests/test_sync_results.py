@@ -113,6 +113,32 @@ class ConditionRemarkBroker(FilledBroker):
         ]
 
 
+class ColonConditionRemarkBroker(FilledBroker):
+    def get_orders(self):
+        return [
+            SimpleNamespace(
+                order_id=1082169287,
+                stock_code="513100.SH",
+                order_status=56,
+                traded_volume=1000,
+                price=1.0,
+                m_strRemark="cond:cond:sync",
+            )
+        ]
+
+    def get_trades(self):
+        return [
+            SimpleNamespace(
+                order_id=1082169287,
+                stock_code="513100.SH",
+                quantity=1000,
+                price=1.0,
+                amount=1000.0,
+                m_strRemark="cond:cond:sync",
+            )
+        ]
+
+
 class MixedBroker:
     def connect(self) -> None:
         return None
@@ -246,6 +272,36 @@ def submitted_condition_result() -> ExecutionResult:
     )
 
 
+def submitted_colon_condition_result() -> ExecutionResult:
+    task_id = "condition:task-1:cond:sync"
+    order = PlannedOrder(
+        task_id=task_id,
+        symbol="513100.SH",
+        side="sell",
+        quantity=1000,
+        price=1.0,
+        amount=1000.0,
+        remark="cond:cond:sync",
+    )
+    submitted = SubmittedOrder(
+        task_id=task_id,
+        symbol="513100.SH",
+        side="sell",
+        quantity=1000,
+        price=1.0,
+        amount=1000.0,
+        local_order_id="1082169287",
+        status="submitted",
+    )
+    return ExecutionResult(
+        task_id=task_id,
+        status="submitted",
+        mode="real",
+        planned_orders=[order],
+        submitted_orders=[submitted],
+    )
+
+
 def mixed_submitted_result() -> ExecutionResult:
     orders = [
         PlannedOrder(
@@ -326,14 +382,84 @@ def test_sync_results_reports_condition_tasks_to_condition_result_endpoint(tmp_p
     assert service.storage.get_condition_order("cond-sync").status == "completed"
 
 
-def test_sync_results_matches_condition_tasks_by_cond_remark(tmp_path) -> None:
+def test_sync_results_does_not_match_condition_tasks_by_cond_remark_only(tmp_path) -> None:
     service = make_service_with_condition_result(tmp_path, result_status="submitted")
     service.qmt = ConditionRemarkBroker()  # type: ignore[assignment]
 
     result = service.sync_results(task_id="condition:cond-sync")
 
-    assert result == [{"task_id": "condition:cond-sync", "status": "success"}]
+    assert result == [{"task_id": "condition:cond-sync", "status": "submitted"}]
     payload = service.xquant.condition_results[0][2]  # type: ignore[attr-defined]
+    assert payload["execution_result"]["status"] == "submitted"
+    assert payload["execution_result"]["submitted_orders"][0]["status"] == "submitted"
+
+
+def test_sync_results_preserves_colons_in_condition_id(tmp_path) -> None:
+    result = submitted_colon_condition_result()
+    service = make_service_with_result(
+        tmp_path,
+        broker=ColonConditionRemarkBroker(),
+        result=result,
+        result_status="submitted",
+    )
+    service.storage.record_task_received(
+        RebalanceTask(
+            task_id=result.task_id,
+            portfolio_id="prod",
+            account_id="acct",
+            mode="real",
+            created_at=task().created_at,
+            expires_at=None,
+            targets=[{"symbol": "513100.SH", "target_weight": 0}],
+            raw={"condition_id": "cond:sync", "source_task_id": "task-1"},
+        ),
+        status="submitted",
+    )
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond:sync",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    service.storage.update_condition_order_status("cond:sync", "submitted")
+    service.storage.record_condition_market_state(
+        condition_id="cond:sync",
+        symbol="513100.SH",
+        latest_price=1.1,
+        high_water_price=None,
+        trigger_price=1.1,
+        activated=True,
+        activated_at=None,
+        atr_value=None,
+        hv_value=None,
+        std_value=None,
+        computed_at="2026-06-04T10:00:00+08:00",
+        market_data_source="prices",
+        state={
+            "method": "static_pct",
+            "purpose": "take_profit",
+            "params": {"take_profit_pct": 0.1},
+            "activation_price": None,
+        },
+    )
+
+    sync_result = service.sync_results(task_id=result.task_id)
+
+    assert sync_result == [{"task_id": result.task_id, "status": "success"}]
+    assert service.xquant.condition_results[0][1] == "cond:sync"  # type: ignore[attr-defined]
+    payload = service.xquant.condition_results[0][2]  # type: ignore[attr-defined]
+    assert payload["condition_task_id"] == result.task_id
     assert payload["execution_result"]["status"] == "success"
     assert payload["execution_result"]["submitted_orders"][0]["status"] == "filled"
 
@@ -387,6 +513,92 @@ def test_sync_results_preserves_current_account_snapshot_in_reported_result(tmp_
             "target_weight": 0.5,
         }
     ]
+
+
+def test_sync_results_refreshes_condition_reference_from_position_cost(tmp_path) -> None:
+    service = make_service_with_result(
+        tmp_path,
+        broker=SnapshotBroker(),
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-position-cost",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="trailing_pct",
+                status="pending_reference",
+                params={"trail_pct": 0.03, "activation_profit_pct": 0.05},
+                raw={"reference": {"source": "position_cost_price"}},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+
+    service.sync_results(task_id="task-1")
+
+    order = service.storage.get_condition_order("cond-position-cost")
+    assert order.status == "armed"
+    assert order.reference_price == 1.5
+    assert order.high_water_price == 1.5
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("cond-position-cost",),
+        ).fetchone()
+    assert row["event_type"] == "reference_updated"
+    payload = json.loads(row["payload_json"])
+    assert payload["reference"]["source"] == "position_cost_price"
+    assert payload["reference"]["price"] == 1.5
+    assert payload["reference"]["activation_price"] == pytest.approx(1.575)
+
+
+def test_sync_results_preserves_condition_status_when_refreshing_reference(
+    tmp_path,
+) -> None:
+    service = make_service_with_result(
+        tmp_path,
+        broker=SnapshotBroker(),
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-already-submitted",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="trailing_pct",
+                status="submitted",
+                params={"trail_pct": 0.03, "activation_profit_pct": 0.05},
+                raw={"reference": {"source": "position_cost_price"}},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+
+    service.sync_results(task_id="task-1")
+
+    order = service.storage.get_condition_order("cond-already-submitted")
+    assert order.status == "submitted"
+    assert order.reference_price == 1.5
+    assert order.high_water_price == 1.5
 
 
 def test_sync_results_reports_partial_when_some_orders_fill_and_some_fail(tmp_path) -> None:

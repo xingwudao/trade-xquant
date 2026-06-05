@@ -145,6 +145,19 @@ audits. Those are stored in SQLite.
 Task payloads may carry reference prices and rule hyperparameters.
 Market-derived state is created and updated by trade-xquant at runtime.
 
+When the rule reference depends on the executed holding cost, local JSON should
+mock the Xquant payload with:
+
+```json
+{
+  "reference": {"source": "position_cost_price"}
+}
+```
+
+In that case `reference_price` is omitted from the Xquant payload. After
+execution, trade-xquant reads the latest QMT aggregate position `cost_price`
+and stores it as the condition instance reference price.
+
 ## Execution
 
 When a condition triggers, trade-xquant creates a normal sell `PlannedOrder`.
@@ -152,10 +165,14 @@ When a condition triggers, trade-xquant creates a normal sell `PlannedOrder`.
 The order uses:
 
 ```text
-task_id = condition:{condition_id}
+task_id = condition:{source_task_id}:{condition_id}
 remark = cond:{condition_id}
 price_type = latest
 ```
+
+If the generated `task_id` would exceed Xquant length limits, trade-xquant
+replaces `source_task_id` with a short hash. The audit payload still includes
+the full `source_task_id`.
 
 The order then goes through the existing `RiskControl` and `ExecutionEngine`.
 

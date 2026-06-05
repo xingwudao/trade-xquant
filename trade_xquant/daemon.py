@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import socket
 import time
 from datetime import datetime
@@ -33,6 +34,13 @@ from trade_xquant.storage import Storage
 from trade_xquant.xquant_adapter import XquantAdapter, XquantAdapterError
 
 logger = logging.getLogger(__name__)
+
+_CONDITION_REARM_BLOCKING_STATUSES = {
+    "triggered",
+    "submitting",
+    "submitted",
+    "needs_reconcile",
+}
 
 
 class GatewaySyncReportError(RuntimeError):
@@ -168,13 +176,25 @@ class GatewayService:
     def condition_poll_once(self) -> list[dict[str, object]]:
         self.storage.initialize()
         active_orders = self.storage.list_active_condition_orders()
-        if not active_orders:
+        pending_reference_orders = self.storage.list_pending_reference_condition_orders(
+            account_id=self.settings.qmt.account_id
+        )
+        if not active_orders and not pending_reference_orders:
             logger.info("no active condition orders")
             return []
 
         self.qmt.connect()
         account = self.qmt.get_account_snapshot()
         positions = self.qmt.get_positions()
+        if pending_reference_orders:
+            self._refresh_pending_condition_references(
+                pending_reference_orders,
+                {position.symbol: position for position in positions},
+            )
+            active_orders = self.storage.list_active_condition_orders()
+            if not active_orders:
+                logger.info("no active condition orders after reference refresh")
+                return []
         symbols = sorted({order.symbol for order in active_orders})
         prices = self._condition_prices(symbols)
         now = datetime.now(ZoneInfo(self.settings.risk.timezone))
@@ -429,6 +449,7 @@ class GatewayService:
                 "scope": triggered.order.scope,
                 "purpose": triggered.order.purpose,
                 "method": triggered.order.method,
+                "reference": self._condition_reference_payload(triggered.order),
                 "params": triggered.order.params,
                 "action": triggered.order.action.model_dump(mode="json"),
             },
@@ -542,17 +563,28 @@ class GatewayService:
                 matched_orders = [
                     payload
                     for payload in qmt_orders
-                    if _payload_matches_task(payload, submitted_task_id, submitted_orders)
+                    if _payload_matches_task(
+                        payload,
+                        submitted_task_id,
+                        submitted_orders,
+                        planned_orders,
+                    )
                 ]
                 matched_trades = [
                     payload
                     for payload in qmt_trades
-                    if _payload_matches_task(payload, submitted_task_id, submitted_orders)
+                    if _payload_matches_task(
+                        payload,
+                        submitted_task_id,
+                        submitted_orders,
+                        planned_orders,
+                    )
                 ]
                 synced_orders, synced_status, errors, sync_summary = _summarize_synced_orders(
                     submitted_orders,
                     matched_orders,
                     matched_trades,
+                    planned_orders,
                 )
                 result = ExecutionResult(
                     task_id=submitted_task_id,
@@ -599,6 +631,7 @@ class GatewayService:
                         )
                     results.append(result_item)
                     continue
+                self._refresh_condition_orders_for_task(submitted_task_id)
                 try:
                     self.xquant.report_result(submitted_task_id, synced_status, result)
                 except XquantAdapterError as exc:
@@ -636,11 +669,27 @@ class GatewayService:
         condition_task_id: str,
         result: ExecutionResult,
     ) -> Exception | None:
-        condition_id = _condition_id_from_task_id(condition_task_id)
+        condition_id = self._condition_id_for_condition_task(condition_task_id)
         order = self.storage.get_condition_order(condition_id)
         self._update_synced_condition_status(condition_id, result.status)
         triggered = self._triggered_condition_from_synced_result(order, result)
         return self._record_and_report_condition_audit(triggered, result)
+
+    def _condition_id_for_condition_task(self, condition_task_id: str) -> str:
+        task = self.storage.load_task(condition_task_id)
+        if task is not None and isinstance(task.raw, dict):
+            raw_condition_id = task.raw.get("condition_id")
+            if isinstance(raw_condition_id, str) and raw_condition_id.strip():
+                return raw_condition_id
+        audit = self.storage.get_condition_trigger_audit(condition_task_id)
+        if audit is not None:
+            return str(audit["condition_id"])
+        stored_condition_id = self.storage.find_condition_id_for_condition_task_id(
+            condition_task_id
+        )
+        if stored_condition_id is not None:
+            return stored_condition_id
+        return _condition_id_from_task_id(condition_task_id)
 
     def _triggered_condition_from_synced_result(
         self,
@@ -720,13 +769,168 @@ class GatewayService:
     ) -> None:
         if not condition_orders:
             return
-        self.storage.upsert_condition_orders(condition_orders)
-        for order in condition_orders:
+        position_map = self._current_position_map()
+        refreshed_orders = [
+            self._condition_order_with_position_reference(order, position_map)
+            for order in condition_orders
+        ]
+        refreshed_orders = [
+            order
+            for order in refreshed_orders
+            if self._can_arm_condition_order_refresh(order)
+        ]
+        if not refreshed_orders:
+            return
+        self.storage.upsert_condition_orders(refreshed_orders)
+        for order in refreshed_orders:
+            event_type = "armed" if order.status == "armed" else order.status
+            payload = {
+                "task_id": task.task_id,
+                "symbol": order.symbol,
+                "method": order.method,
+                "reference": self._condition_reference_payload(order),
+            }
+            if order.status == "pending_reference":
+                payload["reason"] = "missing position cost_price"
             self.storage.record_condition_event(
                 order.condition_id,
-                "armed",
-                {"task_id": task.task_id, "symbol": order.symbol, "method": order.method},
+                event_type,
+                payload,
             )
+
+    def _can_arm_condition_order_refresh(self, order: ConditionOrder) -> bool:
+        try:
+            existing_order = self.storage.get_condition_order(order.condition_id)
+        except KeyError:
+            return True
+        if existing_order.status in _CONDITION_REARM_BLOCKING_STATUSES:
+            self.storage.record_condition_event(
+                order.condition_id,
+                "arm_skipped",
+                {
+                    "task_id": order.task_id,
+                    "existing_task_id": existing_order.task_id,
+                    "existing_status": existing_order.status,
+                    "reason": "condition execution already in flight",
+                },
+            )
+            return False
+        return True
+
+    def _refresh_condition_orders_for_task(self, task_id: str) -> None:
+        orders = self.storage.list_condition_orders_for_task(task_id)
+        if not orders:
+            return
+        position_map = self._current_position_map()
+        refreshed_orders = [
+            self._condition_order_with_position_reference(order, position_map)
+            for order in orders
+        ]
+        self.storage.upsert_condition_orders(refreshed_orders)
+        for order in refreshed_orders:
+            if order.status == "pending_reference":
+                self.storage.record_condition_event(
+                    order.condition_id,
+                    "pending_reference",
+                    {
+                        "task_id": task_id,
+                        "symbol": order.symbol,
+                        "reason": "missing position cost_price",
+                        "reference": self._condition_reference_payload(order),
+                    },
+                )
+                continue
+            if order.reference_price is None:
+                continue
+            self.storage.record_condition_event(
+                order.condition_id,
+                "reference_updated",
+                {
+                    "task_id": task_id,
+                    "symbol": order.symbol,
+                    "reference": self._condition_reference_payload(order),
+                },
+            )
+
+    def _refresh_pending_condition_references(
+        self,
+        orders: list[ConditionOrder],
+        position_map: dict[str, Position],
+    ) -> None:
+        refreshed_orders = [
+            self._condition_order_with_position_reference(order, position_map)
+            for order in orders
+        ]
+        self.storage.upsert_condition_orders(refreshed_orders)
+        for order in refreshed_orders:
+            if order.status == "pending_reference":
+                self.storage.record_condition_event(
+                    order.condition_id,
+                    "pending_reference",
+                    {
+                        "task_id": order.task_id,
+                        "symbol": order.symbol,
+                        "reason": "missing position cost_price",
+                        "reference": self._condition_reference_payload(order),
+                    },
+                )
+                continue
+            if order.reference_price is None:
+                continue
+            self.storage.record_condition_event(
+                order.condition_id,
+                "reference_updated",
+                {
+                    "task_id": order.task_id,
+                    "symbol": order.symbol,
+                    "reference": self._condition_reference_payload(order),
+                },
+            )
+
+    def _current_position_map(self) -> dict[str, Position]:
+        try:
+            return {position.symbol: position for position in self.qmt.get_positions()}
+        except Exception:  # noqa: BLE001 - condition references can retry on next sync
+            logger.exception("failed to query QMT positions for condition references")
+            return {}
+
+    def _condition_order_with_position_reference(
+        self,
+        order: ConditionOrder,
+        position_map: dict[str, Position],
+    ) -> ConditionOrder:
+        if not _uses_position_cost_reference(order):
+            return order.model_copy(
+                update={"status": _refreshed_condition_status(order, "armed")}
+            )
+
+        position = position_map.get(order.symbol)
+        reference_price = _position_cost_price(position)
+        if reference_price is not None:
+            high_water_price = order.high_water_price
+            if high_water_price is None or reference_price > high_water_price:
+                high_water_price = reference_price
+            return order.model_copy(
+                update={
+                    "reference_price": reference_price,
+                    "high_water_price": high_water_price,
+                    "status": _refreshed_condition_status(order, "armed"),
+                }
+            )
+        if order.reference_price is not None:
+            return order.model_copy(
+                update={"status": _refreshed_condition_status(order, "armed")}
+            )
+        return order.model_copy(
+            update={"status": _refreshed_condition_status(order, "pending_reference")}
+        )
+
+    def _condition_reference_payload(self, order: ConditionOrder) -> dict[str, object]:
+        return {
+            "source": _condition_reference_source(order),
+            "price": order.reference_price,
+            "activation_price": _condition_activation_price(order),
+        }
 
 
 def attach_account_snapshot(
@@ -769,6 +973,55 @@ def account_result_snapshot(
     return {"cash": account.cash, "total_asset": account.total_asset, "holdings": holdings}
 
 
+def _position_cost_price(position: Position | None) -> float | None:
+    if position is None or position.cost_price is None:
+        return None
+    try:
+        cost_price = float(position.cost_price)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(cost_price) or cost_price <= 0:
+        return None
+    return cost_price
+
+
+def _condition_reference_source(order: ConditionOrder) -> str:
+    reference = order.raw.get("reference") if isinstance(order.raw, dict) else None
+    if isinstance(reference, dict):
+        source = reference.get("source")
+        if isinstance(source, str) and source.strip():
+            return source
+    if order.reference_price is not None:
+        return "reference_price"
+    return "unspecified"
+
+
+def _uses_position_cost_reference(order: ConditionOrder) -> bool:
+    return _condition_reference_source(order) == "position_cost_price"
+
+
+def _refreshed_condition_status(order: ConditionOrder, status: str) -> str:
+    if order.status in {"received", "pending_reference", "armed"}:
+        return status
+    return order.status
+
+
+def _condition_activation_price(order: ConditionOrder) -> float | None:
+    activation_price = order.params.get("activation_price")
+    if activation_price is not None:
+        try:
+            return float(activation_price)
+        except (TypeError, ValueError):
+            return None
+    activation_profit_pct = order.params.get("activation_profit_pct")
+    if activation_profit_pct is None or order.reference_price is None:
+        return None
+    try:
+        return float(order.reference_price) * (1 + float(activation_profit_pct))
+    except (TypeError, ValueError):
+        return None
+
+
 def _derive_synced_status(
     submitted_orders,
     qmt_orders: list[dict[str, Any]],
@@ -782,10 +1035,12 @@ def _summarize_synced_orders(
     submitted_orders,
     qmt_orders: list[dict[str, Any]],
     qmt_trades: list[dict[str, Any]],
+    planned_orders=None,
 ):
     if not submitted_orders:
         return [], "success", [], {"filled_orders": [], "failed_orders": [], "pending_orders": []}
 
+    planned_orders = planned_orders or []
     synced_orders = []
     errors: list[str] = []
     filled_orders = []
@@ -794,11 +1049,30 @@ def _summarize_synced_orders(
     all_filled = True
     any_filled = False
     for submitted in submitted_orders:
+        submitted_planned_orders = [
+            order
+            for order in planned_orders
+            if order.task_id == submitted.task_id
+            and order.symbol == submitted.symbol
+            and order.side == submitted.side
+        ]
         order_rows = [
-            payload for payload in qmt_orders if _payload_matches_submitted_order(payload, submitted)
+            payload
+            for payload in qmt_orders
+            if _payload_matches_synced_order(
+                payload,
+                submitted,
+                submitted_planned_orders,
+            )
         ]
         trade_rows = [
-            payload for payload in qmt_trades if _payload_matches_submitted_order(payload, submitted)
+            payload
+            for payload in qmt_trades
+            if _payload_matches_synced_order(
+                payload,
+                submitted,
+                submitted_planned_orders,
+            )
         ]
         failed_rows = [payload for payload in order_rows if _is_failed_order(payload)]
         traded_quantity = max(
@@ -878,10 +1152,18 @@ def _xquant_report_error_hint(exc: XquantAdapterError) -> str | None:
     return None
 
 
-def _payload_matches_task(payload: dict[str, Any], task_id: str, submitted_orders) -> bool:
+def _payload_matches_task(
+    payload: dict[str, Any],
+    task_id: str,
+    submitted_orders,
+    planned_orders=None,
+) -> bool:
     if _payload_remark(payload) == task_id:
         return True
-    if _payload_matches_condition_remark(payload, task_id):
+    if not _is_condition_task_id(task_id) and _payload_matches_planned_order_remark(
+        payload,
+        planned_orders or [],
+    ):
         return True
     return any(_payload_matches_submitted_order(payload, submitted) for submitted in submitted_orders)
 
@@ -891,7 +1173,10 @@ def _is_condition_task_id(task_id: str) -> bool:
 
 
 def _condition_id_from_task_id(task_id: str) -> str:
-    return task_id.removeprefix("condition:")
+    value = task_id.removeprefix("condition:")
+    if ":" in value:
+        return value.rsplit(":", 1)[1]
+    return value
 
 
 def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -> bool:
@@ -906,7 +1191,30 @@ def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -
     same_symbol = _payload_symbol(payload) == submitted_order.symbol
     if _payload_remark(payload) == submitted_order.task_id and same_symbol:
         return True
-    return bool(same_symbol and _payload_matches_condition_remark(payload, submitted_order.task_id))
+    return False
+
+
+def _payload_matches_synced_order(
+    payload: dict[str, Any],
+    submitted_order,
+    planned_orders,
+) -> bool:
+    if _payload_matches_submitted_order(payload, submitted_order):
+        return True
+    if _is_condition_task_id(submitted_order.task_id):
+        return False
+    return _payload_matches_planned_order_remark(payload, planned_orders)
+
+
+def _payload_matches_planned_order_remark(payload: dict[str, Any], planned_orders) -> bool:
+    remark = _payload_remark(payload)
+    if not remark:
+        return False
+    symbol = _payload_symbol(payload)
+    return any(
+        order.remark == remark and (symbol is None or symbol == order.symbol)
+        for order in planned_orders
+    )
 
 
 def _payload_matches_condition_remark(payload: dict[str, Any], task_id: str) -> bool:

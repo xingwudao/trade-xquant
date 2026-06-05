@@ -133,7 +133,7 @@ def test_trailing_pct_stop_loss_legacy_shape_does_not_require_reference() -> Non
     ) == []
 
 
-def test_trailing_pct_take_profit_activation_pct_requires_reference_price() -> None:
+def test_trailing_pct_take_profit_activation_pct_allows_position_cost_reference() -> None:
     order = condition(
         "trailing_pct",
         "take_profit",
@@ -141,8 +141,13 @@ def test_trailing_pct_take_profit_activation_pct_requires_reference_price() -> N
     )
 
     assert validate_condition_hyperparameters(
-        order.model_copy(update={"reference_price": None})
-    ) == ["reference_price"]
+        order.model_copy(
+            update={
+                "reference_price": None,
+                "raw": {"reference": {"source": "position_cost_price"}},
+            }
+        )
+    ) == []
 
 
 def test_trailing_pct_take_profit_activation_price_does_not_require_reference() -> None:
@@ -190,7 +195,19 @@ def test_missing_reference_price_is_reported() -> None:
     assert validate_condition_hyperparameters(order) == ["reference_price"]
 
 
-def test_deferred_take_profit_reference_depends_on_activation_form() -> None:
+def test_static_pct_allows_position_cost_reference_source() -> None:
+    order = condition("static_pct", "stop_loss", {"stop_loss_pct": 0.05})
+    order = order.model_copy(
+        update={
+            "reference_price": None,
+            "raw": {"reference": {"source": "position_cost_price"}},
+        }
+    )
+
+    assert validate_condition_hyperparameters(order) == []
+
+
+def test_deferred_take_profit_reference_can_be_filled_from_position_cost() -> None:
     activation_price = condition(
         "atr_trailing",
         "take_profit",
@@ -216,8 +233,37 @@ def test_deferred_take_profit_reference_depends_on_activation_form() -> None:
         activation_price.model_copy(update={"reference_price": None})
     ) == []
     assert validate_condition_hyperparameters(
-        activation_profit_pct.model_copy(update={"reference_price": None})
+        activation_profit_pct.model_copy(
+            update={
+                "reference_price": None,
+                "raw": {"reference": {"source": "position_cost_price"}},
+            }
+        )
+    ) == []
+
+
+def test_take_profit_activation_profit_pct_requires_reference_price() -> None:
+    order = condition(
+        "trailing_pct",
+        "take_profit",
+        {"trail_pct": 0.08, "activation_profit_pct": 0.1},
+    )
+
+    assert validate_condition_hyperparameters(
+        order.model_copy(update={"reference_price": None})
     ) == ["reference_price"]
+
+
+def test_take_profit_activation_price_does_not_require_reference_price() -> None:
+    order = condition(
+        "trailing_pct",
+        "take_profit",
+        {"trail_pct": 0.08, "activation_price": 1.2},
+    )
+
+    assert validate_condition_hyperparameters(
+        order.model_copy(update={"reference_price": None})
+    ) == []
 
 
 def test_non_instrument_scope_is_reported() -> None:
