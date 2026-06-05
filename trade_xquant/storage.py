@@ -304,14 +304,19 @@ class Storage:
                     WHERE task_results.task_id LIKE 'condition:%'
                       AND (
                         task_results.task_id = 'condition:' || condition_orders.condition_id
-                        OR substr(
-                          task_results.task_id,
-                          -length(':' || condition_orders.condition_id)
-                        ) = ':' || condition_orders.condition_id
-                        OR json_extract(
-                          condition_tasks.raw_json,
-                          '$.raw.condition_id'
-                        ) = condition_orders.condition_id
+                        OR task_results.task_id = (
+                          'condition:' || condition_orders.task_id || ':' || condition_orders.condition_id
+                        )
+                        OR (
+                          json_extract(
+                            condition_tasks.raw_json,
+                            '$.raw.condition_id'
+                          ) = condition_orders.condition_id
+                          AND json_extract(
+                            condition_tasks.raw_json,
+                            '$.raw.source_task_id'
+                          ) = condition_orders.task_id
+                        )
                       )
                   )
                   AND NOT EXISTS (
@@ -322,14 +327,19 @@ class Storage:
                     WHERE submitted_orders.task_id LIKE 'condition:%'
                       AND (
                         submitted_orders.task_id = 'condition:' || condition_orders.condition_id
-                        OR substr(
-                          submitted_orders.task_id,
-                          -length(':' || condition_orders.condition_id)
-                        ) = ':' || condition_orders.condition_id
-                        OR json_extract(
-                          condition_tasks.raw_json,
-                          '$.raw.condition_id'
-                        ) = condition_orders.condition_id
+                        OR submitted_orders.task_id = (
+                          'condition:' || condition_orders.task_id || ':' || condition_orders.condition_id
+                        )
+                        OR (
+                          json_extract(
+                            condition_tasks.raw_json,
+                            '$.raw.condition_id'
+                          ) = condition_orders.condition_id
+                          AND json_extract(
+                            condition_tasks.raw_json,
+                            '$.raw.source_task_id'
+                          ) = condition_orders.task_id
+                        )
                       )
                   )
                 ORDER BY created_at, condition_id
@@ -357,12 +367,11 @@ class Storage:
                   AND (
                     ? = 'condition:' || condition_id
                     OR ? = 'condition:' || task_id || ':' || condition_id
-                    OR substr(?, -length(':' || condition_id)) = ':' || condition_id
                   )
                 ORDER BY length(condition_id) DESC
                 LIMIT 1
                 """,
-                (task_id, task_id, task_id, task_id),
+                (task_id, task_id, task_id),
             ).fetchone()
         return str(row["condition_id"]) if row else None
 

@@ -324,6 +324,114 @@ def test_new_condition_task_ids_are_not_active_retry_candidates(tmp_path) -> Non
     assert storage.list_active_condition_orders() == []
 
 
+def test_condition_task_dedupe_does_not_match_condition_id_suffixes(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond:sync",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="sync",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="159915.SZ",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    storage.record_task_received(
+        RebalanceTask.model_validate(
+            {
+                "task_id": "condition:task-1:cond:sync",
+                "portfolio_id": "prod",
+                "account_id": "acct",
+                "mode": "real",
+                "created_at": "2026-05-27T09:35:00+08:00",
+                "expires_at": None,
+                "targets": [{"symbol": "513100.SH", "target_weight": 0}],
+                "raw": {"condition_id": "cond:sync", "source_task_id": "task-1"},
+            }
+        ),
+        status="submitted",
+    )
+    storage.mark_task_result(
+        "condition:task-1:cond:sync",
+        "success",
+        {"ok": True},
+    )
+
+    active = storage.list_active_condition_orders()
+
+    assert [order.condition_id for order in active] == ["sync"]
+
+
+def test_condition_task_dedupe_is_scoped_to_source_task(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-template",
+                task_id="task-2",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    storage.record_task_received(
+        RebalanceTask.model_validate(
+            {
+                "task_id": "condition:task-1:cond-template",
+                "portfolio_id": "prod",
+                "account_id": "acct",
+                "mode": "real",
+                "created_at": "2026-05-27T09:35:00+08:00",
+                "expires_at": None,
+                "targets": [{"symbol": "513100.SH", "target_weight": 0}],
+                "raw": {
+                    "condition_id": "cond-template",
+                    "source_task_id": "task-1",
+                },
+            }
+        ),
+        status="submitted",
+    )
+    storage.mark_task_result(
+        "condition:task-1:cond-template",
+        "success",
+        {"ok": True},
+    )
+
+    active = storage.list_active_condition_orders()
+
+    assert [order.condition_id for order in active] == ["cond-template"]
+
+
 def test_condition_task_id_lookup_preserves_colons_in_condition_id(tmp_path) -> None:
     storage = Storage(tmp_path / "audit.db")
     storage.initialize()

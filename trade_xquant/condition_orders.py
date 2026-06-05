@@ -804,6 +804,13 @@ def _requires_reference_price(order: ConditionOrder) -> bool:
         return False
     if order.method == "static_pct":
         return True
+    if (
+        order.purpose == "take_profit"
+        and order.method in TRAILING_CONDITION_METHODS
+        and order.params.get("activation_profit_pct") is not None
+        and order.params.get("activation_price") is None
+    ):
+        return True
     return False
 
 
