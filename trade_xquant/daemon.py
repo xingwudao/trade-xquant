@@ -544,17 +544,28 @@ class GatewayService:
                 matched_orders = [
                     payload
                     for payload in qmt_orders
-                    if _payload_matches_task(payload, submitted_task_id, submitted_orders)
+                    if _payload_matches_task(
+                        payload,
+                        submitted_task_id,
+                        submitted_orders,
+                        planned_orders,
+                    )
                 ]
                 matched_trades = [
                     payload
                     for payload in qmt_trades
-                    if _payload_matches_task(payload, submitted_task_id, submitted_orders)
+                    if _payload_matches_task(
+                        payload,
+                        submitted_task_id,
+                        submitted_orders,
+                        planned_orders,
+                    )
                 ]
                 synced_orders, synced_status, errors, sync_summary = _summarize_synced_orders(
                     submitted_orders,
                     matched_orders,
                     matched_trades,
+                    planned_orders,
                 )
                 result = ExecutionResult(
                     task_id=submitted_task_id,
@@ -639,11 +650,27 @@ class GatewayService:
         condition_task_id: str,
         result: ExecutionResult,
     ) -> Exception | None:
-        condition_id = _condition_id_from_task_id(condition_task_id)
+        condition_id = self._condition_id_for_condition_task(condition_task_id)
         order = self.storage.get_condition_order(condition_id)
         self._update_synced_condition_status(condition_id, result.status)
         triggered = self._triggered_condition_from_synced_result(order, result)
         return self._record_and_report_condition_audit(triggered, result)
+
+    def _condition_id_for_condition_task(self, condition_task_id: str) -> str:
+        task = self.storage.load_task(condition_task_id)
+        if task is not None and isinstance(task.raw, dict):
+            raw_condition_id = task.raw.get("condition_id")
+            if isinstance(raw_condition_id, str) and raw_condition_id.strip():
+                return raw_condition_id
+        audit = self.storage.get_condition_trigger_audit(condition_task_id)
+        if audit is not None:
+            return str(audit["condition_id"])
+        stored_condition_id = self.storage.find_condition_id_for_condition_task_id(
+            condition_task_id
+        )
+        if stored_condition_id is not None:
+            return stored_condition_id
+        return _condition_id_from_task_id(condition_task_id)
 
     def _triggered_condition_from_synced_result(
         self,
@@ -756,7 +783,7 @@ class GatewayService:
         ]
         self.storage.upsert_condition_orders(refreshed_orders)
         for order in refreshed_orders:
-            if order.reference_price is None:
+            if order.status == "pending_reference":
                 self.storage.record_condition_event(
                     order.condition_id,
                     "pending_reference",
@@ -767,6 +794,8 @@ class GatewayService:
                         "reference": self._condition_reference_payload(order),
                     },
                 )
+                continue
+            if order.reference_price is None:
                 continue
             self.storage.record_condition_event(
                 order.condition_id,
@@ -791,9 +820,9 @@ class GatewayService:
         position_map: dict[str, Position],
     ) -> ConditionOrder:
         if not _uses_position_cost_reference(order):
-            if order.reference_price is not None:
-                return order.model_copy(update={"status": "armed"})
-            return order.model_copy(update={"status": "pending_reference"})
+            return order.model_copy(
+                update={"status": _refreshed_condition_status(order, "armed")}
+            )
 
         position = position_map.get(order.symbol)
         reference_price = _position_cost_price(position)
@@ -805,12 +834,16 @@ class GatewayService:
                 update={
                     "reference_price": reference_price,
                     "high_water_price": high_water_price,
-                    "status": "armed",
+                    "status": _refreshed_condition_status(order, "armed"),
                 }
             )
         if order.reference_price is not None:
-            return order.model_copy(update={"status": "armed"})
-        return order.model_copy(update={"status": "pending_reference"})
+            return order.model_copy(
+                update={"status": _refreshed_condition_status(order, "armed")}
+            )
+        return order.model_copy(
+            update={"status": _refreshed_condition_status(order, "pending_reference")}
+        )
 
     def _condition_reference_payload(self, order: ConditionOrder) -> dict[str, object]:
         return {
@@ -880,11 +913,17 @@ def _condition_reference_source(order: ConditionOrder) -> str:
             return source
     if order.reference_price is not None:
         return "reference_price"
-    return "position_cost_price"
+    return "unspecified"
 
 
 def _uses_position_cost_reference(order: ConditionOrder) -> bool:
     return _condition_reference_source(order) == "position_cost_price"
+
+
+def _refreshed_condition_status(order: ConditionOrder, status: str) -> str:
+    if order.status in {"received", "pending_reference", "armed"}:
+        return status
+    return order.status
 
 
 def _condition_activation_price(order: ConditionOrder) -> float | None:
@@ -916,10 +955,12 @@ def _summarize_synced_orders(
     submitted_orders,
     qmt_orders: list[dict[str, Any]],
     qmt_trades: list[dict[str, Any]],
+    planned_orders=None,
 ):
     if not submitted_orders:
         return [], "success", [], {"filled_orders": [], "failed_orders": [], "pending_orders": []}
 
+    planned_orders = planned_orders or []
     synced_orders = []
     errors: list[str] = []
     filled_orders = []
@@ -928,11 +969,30 @@ def _summarize_synced_orders(
     all_filled = True
     any_filled = False
     for submitted in submitted_orders:
+        submitted_planned_orders = [
+            order
+            for order in planned_orders
+            if order.task_id == submitted.task_id
+            and order.symbol == submitted.symbol
+            and order.side == submitted.side
+        ]
         order_rows = [
-            payload for payload in qmt_orders if _payload_matches_submitted_order(payload, submitted)
+            payload
+            for payload in qmt_orders
+            if _payload_matches_synced_order(
+                payload,
+                submitted,
+                submitted_planned_orders,
+            )
         ]
         trade_rows = [
-            payload for payload in qmt_trades if _payload_matches_submitted_order(payload, submitted)
+            payload
+            for payload in qmt_trades
+            if _payload_matches_synced_order(
+                payload,
+                submitted,
+                submitted_planned_orders,
+            )
         ]
         failed_rows = [payload for payload in order_rows if _is_failed_order(payload)]
         traded_quantity = max(
@@ -1012,8 +1072,15 @@ def _xquant_report_error_hint(exc: XquantAdapterError) -> str | None:
     return None
 
 
-def _payload_matches_task(payload: dict[str, Any], task_id: str, submitted_orders) -> bool:
+def _payload_matches_task(
+    payload: dict[str, Any],
+    task_id: str,
+    submitted_orders,
+    planned_orders=None,
+) -> bool:
     if _payload_remark(payload) == task_id:
+        return True
+    if _payload_matches_planned_order_remark(payload, planned_orders or []):
         return True
     if _payload_matches_condition_remark(payload, task_id):
         return True
@@ -1044,6 +1111,27 @@ def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -
     if _payload_remark(payload) == submitted_order.task_id and same_symbol:
         return True
     return bool(same_symbol and _payload_matches_condition_remark(payload, submitted_order.task_id))
+
+
+def _payload_matches_synced_order(
+    payload: dict[str, Any],
+    submitted_order,
+    planned_orders,
+) -> bool:
+    if _payload_matches_submitted_order(payload, submitted_order):
+        return True
+    return _payload_matches_planned_order_remark(payload, planned_orders)
+
+
+def _payload_matches_planned_order_remark(payload: dict[str, Any], planned_orders) -> bool:
+    remark = _payload_remark(payload)
+    if not remark:
+        return False
+    symbol = _payload_symbol(payload)
+    return any(
+        order.remark == remark and (symbol is None or symbol == order.symbol)
+        for order in planned_orders
+    )
 
 
 def _payload_matches_condition_remark(payload: dict[str, Any], task_id: str) -> bool:

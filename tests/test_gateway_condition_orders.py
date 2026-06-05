@@ -240,6 +240,64 @@ def test_gateway_preserves_explicit_reference_price(tmp_path) -> None:
     assert payload["reference"]["price"] == 2.0
 
 
+def test_gateway_does_not_default_legacy_trailing_reference_to_position_cost(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-legacy-trailing",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.011}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "condition_id": "legacy-trailing-stop",
+                                    "symbol": "513100.SH",
+                                    "purpose": "stop_loss",
+                                    "method": "trailing_pct",
+                                    "params": {"trail_pct": 0.05},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+    service.qmt = PositionBroker(price=1.1)  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-legacy-trailing", "status": "dry_run_success"}]
+    order = service.storage.get_condition_order("legacy-trailing-stop")
+    assert order.status == "armed"
+    assert order.reference_price is None
+    assert order.high_water_price is None
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("legacy-trailing-stop",),
+        ).fetchone()
+    payload = json.loads(row["payload_json"])
+    assert payload["reference"]["source"] == "unspecified"
+    assert payload["reference"]["price"] is None
+
+
 def test_local_json_can_arm_all_single_instrument_methods(tmp_path) -> None:
     task_file = tmp_path / "tasks.json"
     conditions = [
@@ -577,7 +635,10 @@ def test_gateway_condition_poll_once_executes_triggered_condition_order(tmp_path
 def test_gateway_condition_task_id_is_capped_for_long_source_task_ids(tmp_path) -> None:
     service = GatewayService(settings_for(tmp_path))
     service.storage.initialize()
-    condition_id = "cond-prod_leading_stocks_rotation-300394.SZ-take_profit-trailing_pct-2"
+    condition_id = (
+        "cond-prod_leading_stocks_rotation-300394.SZ-take_profit-trailing_pct-2-"
+        + "x" * 180
+    )
     source_task_id = (
         "manual_rebalance_prod_leading_stocks_rotation_20260521_"
         "dc1c54e3e4b1aa82_real_8a05708a0c39"
@@ -608,8 +669,11 @@ def test_gateway_condition_task_id_is_capped_for_long_source_task_ids(tmp_path) 
     condition_task_id = broker.submitted_orders[0].task_id
     assert len(condition_task_id) <= 160
     assert condition_task_id.startswith("condition:")
-    assert condition_task_id.endswith(f":{condition_id}")
+    assert condition_id in condition_task_id or condition_task_id.endswith(condition_id[-80:])
     assert source_task_id not in condition_task_id
+    condition_task = service.storage.load_task(condition_task_id)
+    assert condition_task is not None
+    assert condition_task.raw["condition_id"] == condition_id
 
 
 def test_gateway_condition_quote_failure_does_not_block_other_conditions(tmp_path) -> None:

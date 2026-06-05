@@ -31,6 +31,8 @@ ConditionMethod = Literal[
 ]
 BAR_CONDITION_METHODS = {"atr_trailing", "hv_log_trailing", "std_trailing"}
 TRAILING_CONDITION_METHODS = {"trailing_pct", *BAR_CONDITION_METHODS}
+CONDITION_TASK_ID_MAX_LENGTH = 160
+CONDITION_TASK_ID_PREFIX = "condition:"
 CONDITION_PARAM_ALIASES = {
     "stop_loss_pct": ("pct",),
     "take_profit_pct": ("pct",),
@@ -715,11 +717,20 @@ def _expand_condition_spec(task: RebalanceTask, spec: dict[str, Any]) -> list[di
 
 
 def _condition_task_id(order: ConditionOrder) -> str:
-    candidate = f"condition:{order.task_id}:{order.condition_id}"
-    if len(candidate) <= 160:
+    candidate = f"{CONDITION_TASK_ID_PREFIX}{order.task_id}:{order.condition_id}"
+    if len(candidate) <= CONDITION_TASK_ID_MAX_LENGTH:
         return candidate
     source_hash = sha1(order.task_id.encode("utf-8")).hexdigest()[:12]
-    return f"condition:{source_hash}:{order.condition_id}"
+    source_capped = f"{CONDITION_TASK_ID_PREFIX}{source_hash}:{order.condition_id}"
+    if len(source_capped) <= CONDITION_TASK_ID_MAX_LENGTH:
+        return source_capped
+
+    condition_hash = sha1(order.condition_id.encode("utf-8")).hexdigest()[:12]
+    prefix = f"{CONDITION_TASK_ID_PREFIX}{source_hash}:{condition_hash}:"
+    tail_length = CONDITION_TASK_ID_MAX_LENGTH - len(prefix)
+    if tail_length <= 0:
+        return prefix.rstrip(":")[:CONDITION_TASK_ID_MAX_LENGTH]
+    return f"{prefix}{order.condition_id[-tail_length:]}"
 
 
 def _condition_spec_disabled(spec: dict[str, Any]) -> bool:

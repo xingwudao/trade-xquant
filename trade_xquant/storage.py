@@ -297,12 +297,40 @@ class Storage:
                 WHERE enabled=1
                   AND status IN ('received', 'armed', 'triggered')
                   AND NOT EXISTS (
-                    SELECT 1 FROM task_results
-                    WHERE task_results.task_id = 'condition:' || condition_orders.condition_id
+                    SELECT 1
+                    FROM task_results
+                    LEFT JOIN tasks AS condition_tasks
+                      ON condition_tasks.task_id = task_results.task_id
+                    WHERE task_results.task_id LIKE 'condition:%'
+                      AND (
+                        task_results.task_id = 'condition:' || condition_orders.condition_id
+                        OR substr(
+                          task_results.task_id,
+                          -length(':' || condition_orders.condition_id)
+                        ) = ':' || condition_orders.condition_id
+                        OR json_extract(
+                          condition_tasks.raw_json,
+                          '$.raw.condition_id'
+                        ) = condition_orders.condition_id
+                      )
                   )
                   AND NOT EXISTS (
-                    SELECT 1 FROM submitted_orders
-                    WHERE submitted_orders.task_id = 'condition:' || condition_orders.condition_id
+                    SELECT 1
+                    FROM submitted_orders
+                    LEFT JOIN tasks AS condition_tasks
+                      ON condition_tasks.task_id = submitted_orders.task_id
+                    WHERE submitted_orders.task_id LIKE 'condition:%'
+                      AND (
+                        submitted_orders.task_id = 'condition:' || condition_orders.condition_id
+                        OR substr(
+                          submitted_orders.task_id,
+                          -length(':' || condition_orders.condition_id)
+                        ) = ':' || condition_orders.condition_id
+                        OR json_extract(
+                          condition_tasks.raw_json,
+                          '$.raw.condition_id'
+                        ) = condition_orders.condition_id
+                      )
                   )
                 ORDER BY created_at, condition_id
                 """
@@ -318,6 +346,25 @@ class Storage:
         if row is None:
             raise KeyError(condition_id)
         return self._condition_order_from_row(row)
+
+    def find_condition_id_for_condition_task_id(self, task_id: str) -> str | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT condition_id
+                FROM condition_orders
+                WHERE ? LIKE 'condition:%'
+                  AND (
+                    ? = 'condition:' || condition_id
+                    OR ? = 'condition:' || task_id || ':' || condition_id
+                    OR substr(?, -length(':' || condition_id)) = ':' || condition_id
+                  )
+                ORDER BY length(condition_id) DESC
+                LIMIT 1
+                """,
+                (task_id, task_id, task_id, task_id),
+            ).fetchone()
+        return str(row["condition_id"]) if row else None
 
     def list_condition_orders_for_task(self, task_id: str) -> list[ConditionOrder]:
         with self._connection() as conn:
