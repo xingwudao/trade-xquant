@@ -319,6 +319,18 @@ class Storage:
             raise KeyError(condition_id)
         return self._condition_order_from_row(row)
 
+    def list_condition_orders_for_task(self, task_id: str) -> list[ConditionOrder]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM condition_orders
+                WHERE task_id=?
+                ORDER BY created_at, condition_id
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._condition_order_from_row(row) for row in rows]
+
     def get_condition_order_triggered_at(self, condition_id: str) -> str | None:
         with self._connection() as conn:
             row = conn.execute(

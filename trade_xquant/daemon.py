@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import socket
 import time
 from datetime import datetime
@@ -429,6 +430,7 @@ class GatewayService:
                 "scope": triggered.order.scope,
                 "purpose": triggered.order.purpose,
                 "method": triggered.order.method,
+                "reference": self._condition_reference_payload(triggered.order),
                 "params": triggered.order.params,
                 "action": triggered.order.action.model_dump(mode="json"),
             },
@@ -599,6 +601,7 @@ class GatewayService:
                         )
                     results.append(result_item)
                     continue
+                self._refresh_condition_orders_for_task(submitted_task_id)
                 try:
                     self.xquant.report_result(submitted_task_id, synced_status, result)
                 except XquantAdapterError as exc:
@@ -720,13 +723,101 @@ class GatewayService:
     ) -> None:
         if not condition_orders:
             return
-        self.storage.upsert_condition_orders(condition_orders)
-        for order in condition_orders:
+        position_map = self._current_position_map()
+        refreshed_orders = [
+            self._condition_order_with_position_reference(order, position_map)
+            for order in condition_orders
+        ]
+        self.storage.upsert_condition_orders(refreshed_orders)
+        for order in refreshed_orders:
+            event_type = "armed" if order.status == "armed" else order.status
+            payload = {
+                "task_id": task.task_id,
+                "symbol": order.symbol,
+                "method": order.method,
+                "reference": self._condition_reference_payload(order),
+            }
+            if order.status == "pending_reference":
+                payload["reason"] = "missing position cost_price"
             self.storage.record_condition_event(
                 order.condition_id,
-                "armed",
-                {"task_id": task.task_id, "symbol": order.symbol, "method": order.method},
+                event_type,
+                payload,
             )
+
+    def _refresh_condition_orders_for_task(self, task_id: str) -> None:
+        orders = self.storage.list_condition_orders_for_task(task_id)
+        if not orders:
+            return
+        position_map = self._current_position_map()
+        refreshed_orders = [
+            self._condition_order_with_position_reference(order, position_map)
+            for order in orders
+        ]
+        self.storage.upsert_condition_orders(refreshed_orders)
+        for order in refreshed_orders:
+            if order.reference_price is None:
+                self.storage.record_condition_event(
+                    order.condition_id,
+                    "pending_reference",
+                    {
+                        "task_id": task_id,
+                        "symbol": order.symbol,
+                        "reason": "missing position cost_price",
+                        "reference": self._condition_reference_payload(order),
+                    },
+                )
+                continue
+            self.storage.record_condition_event(
+                order.condition_id,
+                "reference_updated",
+                {
+                    "task_id": task_id,
+                    "symbol": order.symbol,
+                    "reference": self._condition_reference_payload(order),
+                },
+            )
+
+    def _current_position_map(self) -> dict[str, Position]:
+        try:
+            return {position.symbol: position for position in self.qmt.get_positions()}
+        except Exception:  # noqa: BLE001 - condition references can retry on next sync
+            logger.exception("failed to query QMT positions for condition references")
+            return {}
+
+    def _condition_order_with_position_reference(
+        self,
+        order: ConditionOrder,
+        position_map: dict[str, Position],
+    ) -> ConditionOrder:
+        if not _uses_position_cost_reference(order):
+            if order.reference_price is not None:
+                return order.model_copy(update={"status": "armed"})
+            return order.model_copy(update={"status": "pending_reference"})
+
+        position = position_map.get(order.symbol)
+        reference_price = _position_cost_price(position)
+        if reference_price is not None:
+            high_water_price = order.high_water_price
+            if high_water_price is None or reference_price > high_water_price:
+                high_water_price = reference_price
+            return order.model_copy(
+                update={
+                    "reference_price": reference_price,
+                    "high_water_price": high_water_price,
+                    "status": "armed",
+                }
+            )
+        if order.reference_price is not None:
+            return order.model_copy(update={"status": "armed"})
+        return order.model_copy(update={"status": "pending_reference"})
+
+    def _condition_reference_payload(self, order: ConditionOrder) -> dict[str, object]:
+        return {
+            "source": _condition_reference_source(order),
+            "price": order.reference_price,
+            "activation_price": _condition_activation_price(order),
+        }
 
 
 def attach_account_snapshot(
@@ -767,6 +858,49 @@ def account_result_snapshot(
             }
         )
     return {"cash": account.cash, "total_asset": account.total_asset, "holdings": holdings}
+
+
+def _position_cost_price(position: Position | None) -> float | None:
+    if position is None or position.cost_price is None:
+        return None
+    try:
+        cost_price = float(position.cost_price)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(cost_price) or cost_price <= 0:
+        return None
+    return cost_price
+
+
+def _condition_reference_source(order: ConditionOrder) -> str:
+    reference = order.raw.get("reference") if isinstance(order.raw, dict) else None
+    if isinstance(reference, dict):
+        source = reference.get("source")
+        if isinstance(source, str) and source.strip():
+            return source
+    if order.reference_price is not None:
+        return "reference_price"
+    return "position_cost_price"
+
+
+def _uses_position_cost_reference(order: ConditionOrder) -> bool:
+    return _condition_reference_source(order) == "position_cost_price"
+
+
+def _condition_activation_price(order: ConditionOrder) -> float | None:
+    activation_price = order.params.get("activation_price")
+    if activation_price is not None:
+        try:
+            return float(activation_price)
+        except (TypeError, ValueError):
+            return None
+    activation_profit_pct = order.params.get("activation_profit_pct")
+    if activation_profit_pct is None or order.reference_price is None:
+        return None
+    try:
+        return float(order.reference_price) * (1 + float(activation_profit_pct))
+    except (TypeError, ValueError):
+        return None
 
 
 def _derive_synced_status(
@@ -891,7 +1025,10 @@ def _is_condition_task_id(task_id: str) -> bool:
 
 
 def _condition_id_from_task_id(task_id: str) -> str:
-    return task_id.removeprefix("condition:")
+    value = task_id.removeprefix("condition:")
+    if ":" in value:
+        return value.rsplit(":", 1)[1]
+    return value
 
 
 def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -> bool:

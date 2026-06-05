@@ -389,6 +389,56 @@ def test_sync_results_preserves_current_account_snapshot_in_reported_result(tmp_
     ]
 
 
+def test_sync_results_refreshes_condition_reference_from_position_cost(tmp_path) -> None:
+    service = make_service_with_result(
+        tmp_path,
+        broker=SnapshotBroker(),
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-position-cost",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="trailing_pct",
+                status="pending_reference",
+                params={"trail_pct": 0.03, "activation_profit_pct": 0.05},
+                raw={"reference": {"source": "position_cost_price"}},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+
+    service.sync_results(task_id="task-1")
+
+    order = service.storage.get_condition_order("cond-position-cost")
+    assert order.status == "armed"
+    assert order.reference_price == 1.5
+    assert order.high_water_price == 1.5
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("cond-position-cost",),
+        ).fetchone()
+    assert row["event_type"] == "reference_updated"
+    payload = json.loads(row["payload_json"])
+    assert payload["reference"]["source"] == "position_cost_price"
+    assert payload["reference"]["price"] == 1.5
+    assert payload["reference"]["activation_price"] == pytest.approx(1.575)
+
+
 def test_sync_results_reports_partial_when_some_orders_fill_and_some_fail(tmp_path) -> None:
     service = make_service_with_result(
         tmp_path,

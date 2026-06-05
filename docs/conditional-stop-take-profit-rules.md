@@ -128,15 +128,13 @@ Recommended normalized fields:
 
 ```json
 {
-  "condition_id": "string",
+  "id": "stable rule template id",
   "scope": "instrument | portfolio",
   "purpose": "stop_loss | take_profit",
   "method": "static_pct | trailing_pct | atr_trailing | hv_log_trailing | std_trailing",
-  "symbol": "string for instrument scope",
-  "reference_price": "number supplied by Xquant when scope is instrument",
-  "reference_wealth": "number supplied by Xquant when scope is portfolio",
   "params": {"hyperparameters": "numbers or strings required by the method"},
   "action": {"type": "sell_pct", "pct": 1.0},
+  "reference": {"source": "position_cost_price"},
   "enabled": true
 }
 ```
@@ -144,11 +142,21 @@ Recommended normalized fields:
 Implementation notes:
 - JSON examples use strings above only to document shape.
 - Real task payloads must use typed values.
-- Xquant task payloads contain only hyperparameters, reference values, and the
-  explicit action.
-- The gateway owns runtime state in the current MVP: high-water values,
-  activation state, indicator snapshots, trigger evidence, and execution audit
-  payloads are stored in SQLite and condition audit reports.
+- Xquant task payloads contain hyperparameters, the explicit action, and
+  reference-source metadata when the reference depends on eventual holding
+  cost.
+- Xquant sends portfolio/account-level rule templates. If a rule has `id` but
+  no `symbol`, trade-xquant expands it to one local condition instance per
+  task target symbol.
+- For execution-cost-based rules, Xquant sends
+  `reference.source: "position_cost_price"` and does not send
+  `reference_price`.
+- The local condition instance id is:
+  `cond-{portfolio_id}-{symbol}-{rule_template_id}`.
+- The gateway owns runtime state in the current MVP: QMT position cost
+  references, high-water values, activation state, indicator snapshots,
+  trigger evidence, and execution audit payloads are stored in SQLite and
+  condition audit reports.
 - The gateway must reject rules whose required parameters are missing,
   malformed, or outside safe ranges.
 - `action.type` is required.
@@ -540,10 +548,15 @@ Required task data:
 - `scope: "instrument"`.
 - `purpose: "take_profit"`.
 - `method: "trailing_pct"`.
-- `reference_price`.
+- `reference_price` or `reference.source: "position_cost_price"`.
 - `params.trail_pct`.
 - One activation gate: `params.activation_profit_pct` or
   `params.activation_price`.
+
+`reference_price` may be omitted when the rule uses
+`reference.source: "position_cost_price"`. In that case the gateway fills it
+from the latest QMT aggregate holding cost after execution, then derives the
+activation price locally.
 
 Trigger line after activation:
 

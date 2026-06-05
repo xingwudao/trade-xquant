@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha1
 import math
 from typing import Any, Literal
 
@@ -37,6 +38,7 @@ CONDITION_PARAM_ALIASES = {
 }
 ConditionStatus = Literal[
     "received",
+    "pending_reference",
     "armed",
     "triggered",
     "submitting",
@@ -615,7 +617,7 @@ class ConditionEngine:
         quantity = min(requested_quantity, self._floor_lot(position.sellable_quantity))
         if quantity <= 0:
             return None
-        condition_task_id = f"condition:{order.condition_id}"
+        condition_task_id = _condition_task_id(order)
         planned_order = PlannedOrder(
             task_id=condition_task_id,
             symbol=order.symbol,
@@ -664,34 +666,60 @@ def extract_condition_orders(task: RebalanceTask) -> list[ConditionOrder]:
             continue
         if _condition_spec_disabled(spec):
             continue
-        try:
-            order = ConditionOrder.model_validate(
-                {
-                    **spec,
-                    "task_id": task.task_id,
-                    "portfolio_id": task.portfolio_id,
-                    "account_id": task.account_id,
-                    "mode": task.mode,
-                    "raw": spec,
-                    "status": spec.get("status", "armed"),
-                }
-            )
-        except ValidationError as exc:
-            condition_id = spec.get("condition_id", "<unknown>")
-            raise ValueError(
-                f"condition {condition_id} invalid condition order: {exc}"
-            ) from exc
-        if not order.enabled:
-            continue
-        invalid = validate_condition_hyperparameters(order)
-        if invalid:
-            invalid_keys = ", ".join(invalid)
-            raise ValueError(
-                f"condition {order.condition_id} missing/invalid "
-                f"condition params: {invalid_keys}"
-            )
-        orders.append(order)
+        for expanded_spec in _expand_condition_spec(task, spec):
+            try:
+                order = ConditionOrder.model_validate(
+                    {
+                        **expanded_spec,
+                        "task_id": task.task_id,
+                        "portfolio_id": task.portfolio_id,
+                        "account_id": task.account_id,
+                        "mode": task.mode,
+                        "raw": expanded_spec,
+                        "status": expanded_spec.get("status", "armed"),
+                    }
+                )
+            except ValidationError as exc:
+                condition_id = expanded_spec.get("condition_id", "<unknown>")
+                raise ValueError(
+                    f"condition {condition_id} invalid condition order: {exc}"
+                ) from exc
+            if not order.enabled:
+                continue
+            invalid = validate_condition_hyperparameters(order)
+            if invalid:
+                invalid_keys = ", ".join(invalid)
+                raise ValueError(
+                    f"condition {order.condition_id} missing/invalid "
+                    f"condition params: {invalid_keys}"
+                )
+            orders.append(order)
     return orders
+
+
+def _expand_condition_spec(task: RebalanceTask, spec: dict[str, Any]) -> list[dict[str, Any]]:
+    if spec.get("symbol") is not None:
+        return [spec]
+    template_id = spec.get("id") or spec.get("condition_id")
+    if not isinstance(template_id, str) or not template_id.strip():
+        return [spec]
+    return [
+        {
+            **spec,
+            "template_id": template_id,
+            "condition_id": f"cond-{task.portfolio_id}-{target.symbol}-{template_id}",
+            "symbol": target.symbol,
+        }
+        for target in task.targets
+    ]
+
+
+def _condition_task_id(order: ConditionOrder) -> str:
+    candidate = f"condition:{order.task_id}:{order.condition_id}"
+    if len(candidate) <= 160:
+        return candidate
+    source_hash = sha1(order.task_id.encode("utf-8")).hexdigest()[:12]
+    return f"condition:{source_hash}:{order.condition_id}"
 
 
 def _condition_spec_disabled(spec: dict[str, Any]) -> bool:
@@ -761,14 +789,18 @@ def validate_condition_hyperparameters(order: ConditionOrder) -> list[str]:
 
 
 def _requires_reference_price(order: ConditionOrder) -> bool:
+    if _uses_position_cost_reference(order):
+        return False
     if order.method == "static_pct":
         return True
-    if order.method in TRAILING_CONDITION_METHODS and order.purpose == "take_profit":
-        return (
-            order.params.get("activation_profit_pct") is not None
-            and order.params.get("activation_price") is None
-        )
     return False
+
+
+def _uses_position_cost_reference(order: ConditionOrder) -> bool:
+    reference = order.raw.get("reference") if isinstance(order.raw, dict) else None
+    if not isinstance(reference, dict):
+        return False
+    return reference.get("source") == "position_cost_price"
 
 
 def _has_condition_param(order: ConditionOrder, key: str) -> bool:
