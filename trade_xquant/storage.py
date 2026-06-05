@@ -347,6 +347,18 @@ class Storage:
             ).fetchall()
         return [self._condition_order_from_row(row) for row in rows]
 
+    def list_pending_reference_condition_orders(self) -> list[ConditionOrder]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM condition_orders
+                WHERE enabled=1
+                  AND status='pending_reference'
+                ORDER BY created_at, condition_id
+                """
+            ).fetchall()
+        return [self._condition_order_from_row(row) for row in rows]
+
     def get_condition_order(self, condition_id: str) -> ConditionOrder:
         with self._connection() as conn:
             row = conn.execute(

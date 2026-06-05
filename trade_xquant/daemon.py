@@ -169,13 +169,23 @@ class GatewayService:
     def condition_poll_once(self) -> list[dict[str, object]]:
         self.storage.initialize()
         active_orders = self.storage.list_active_condition_orders()
-        if not active_orders:
+        pending_reference_orders = self.storage.list_pending_reference_condition_orders()
+        if not active_orders and not pending_reference_orders:
             logger.info("no active condition orders")
             return []
 
         self.qmt.connect()
         account = self.qmt.get_account_snapshot()
         positions = self.qmt.get_positions()
+        if pending_reference_orders:
+            self._refresh_pending_condition_references(
+                pending_reference_orders,
+                {position.symbol: position for position in positions},
+            )
+            active_orders = self.storage.list_active_condition_orders()
+            if not active_orders:
+                logger.info("no active condition orders after reference refresh")
+                return []
         symbols = sorted({order.symbol for order in active_orders})
         prices = self._condition_prices(symbols)
         now = datetime.now(ZoneInfo(self.settings.risk.timezone))
@@ -807,6 +817,41 @@ class GatewayService:
                 },
             )
 
+    def _refresh_pending_condition_references(
+        self,
+        orders: list[ConditionOrder],
+        position_map: dict[str, Position],
+    ) -> None:
+        refreshed_orders = [
+            self._condition_order_with_position_reference(order, position_map)
+            for order in orders
+        ]
+        self.storage.upsert_condition_orders(refreshed_orders)
+        for order in refreshed_orders:
+            if order.status == "pending_reference":
+                self.storage.record_condition_event(
+                    order.condition_id,
+                    "pending_reference",
+                    {
+                        "task_id": order.task_id,
+                        "symbol": order.symbol,
+                        "reason": "missing position cost_price",
+                        "reference": self._condition_reference_payload(order),
+                    },
+                )
+                continue
+            if order.reference_price is None:
+                continue
+            self.storage.record_condition_event(
+                order.condition_id,
+                "reference_updated",
+                {
+                    "task_id": order.task_id,
+                    "symbol": order.symbol,
+                    "reference": self._condition_reference_payload(order),
+                },
+            )
+
     def _current_position_map(self) -> dict[str, Position]:
         try:
             return {position.symbol: position for position in self.qmt.get_positions()}
@@ -1080,9 +1125,10 @@ def _payload_matches_task(
 ) -> bool:
     if _payload_remark(payload) == task_id:
         return True
-    if _payload_matches_planned_order_remark(payload, planned_orders or []):
-        return True
-    if _payload_matches_condition_remark(payload, task_id):
+    if not _is_condition_task_id(task_id) and _payload_matches_planned_order_remark(
+        payload,
+        planned_orders or [],
+    ):
         return True
     return any(_payload_matches_submitted_order(payload, submitted) for submitted in submitted_orders)
 
@@ -1110,7 +1156,7 @@ def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -
     same_symbol = _payload_symbol(payload) == submitted_order.symbol
     if _payload_remark(payload) == submitted_order.task_id and same_symbol:
         return True
-    return bool(same_symbol and _payload_matches_condition_remark(payload, submitted_order.task_id))
+    return False
 
 
 def _payload_matches_synced_order(
@@ -1120,6 +1166,8 @@ def _payload_matches_synced_order(
 ) -> bool:
     if _payload_matches_submitted_order(payload, submitted_order):
         return True
+    if _is_condition_task_id(submitted_order.task_id):
+        return False
     return _payload_matches_planned_order_remark(payload, planned_orders)
 
 

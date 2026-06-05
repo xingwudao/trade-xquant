@@ -176,10 +176,58 @@ def test_gateway_arms_static_template_reference_from_position_cost(tmp_path) -> 
     result = service.poll_once(force_dry_run=True)
 
     assert result == [{"task_id": "task-static-template-reference", "status": "dry_run_success"}]
-    order = service.storage.get_condition_order("cond-prod-513100.SH-stop_loss-static_pct-1")
+    order = service.storage.get_condition_order("cond-acct-prod-513100.SH-stop_loss-static_pct-1")
     assert order.status == "armed"
     assert order.reference_price == 1.0
     assert order.raw["template_id"] == "stop_loss-static_pct-1"
+
+
+def test_gateway_condition_poll_refreshes_pending_reference_orders(tmp_path) -> None:
+    service = GatewayService(settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-pending-reference",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                status="pending_reference",
+                params={"stop_loss_pct": 0.05},
+                raw={"reference": {"source": "position_cost_price"}},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    service.qmt = PositionBroker(price=1.0)  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == []
+    order = service.storage.get_condition_order("cond-pending-reference")
+    assert order.status == "armed"
+    assert order.reference_price == 1.0
+    assert order.high_water_price == 1.0
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("cond-pending-reference",),
+        ).fetchone()
+    assert row["event_type"] == "reference_updated"
+    payload = json.loads(row["payload_json"])
+    assert payload["reference"]["source"] == "position_cost_price"
+    assert payload["reference"]["price"] == 1.0
 
 
 def test_gateway_preserves_explicit_reference_price(tmp_path) -> None:

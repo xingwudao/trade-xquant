@@ -709,7 +709,9 @@ def _expand_condition_spec(task: RebalanceTask, spec: dict[str, Any]) -> list[di
         {
             **spec,
             "template_id": template_id,
-            "condition_id": f"cond-{task.portfolio_id}-{target.symbol}-{template_id}",
+            "condition_id": (
+                f"cond-{task.account_id}-{task.portfolio_id}-{target.symbol}-{template_id}"
+            ),
             "symbol": target.symbol,
         }
         for target in task.targets

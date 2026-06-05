@@ -153,10 +153,10 @@ def test_condition_rule_templates_expand_to_target_symbols(tmp_path) -> None:
 
     assert len(orders) == 4
     assert [order.condition_id for order in orders] == [
-        "cond-prod-513100.SH-stop_loss-trailing_pct-1",
-        "cond-prod-510300.SH-stop_loss-trailing_pct-1",
-        "cond-prod-513100.SH-take_profit-trailing_pct-2",
-        "cond-prod-510300.SH-take_profit-trailing_pct-2",
+        "cond-acct-prod-513100.SH-stop_loss-trailing_pct-1",
+        "cond-acct-prod-510300.SH-stop_loss-trailing_pct-1",
+        "cond-acct-prod-513100.SH-take_profit-trailing_pct-2",
+        "cond-acct-prod-510300.SH-take_profit-trailing_pct-2",
     ]
     assert {order.symbol for order in orders} == {"513100.SH", "510300.SH"}
     assert all(order.raw["reference"]["source"] == "position_cost_price" for order in orders)

@@ -117,6 +117,7 @@ class ColonConditionRemarkBroker(FilledBroker):
     def get_orders(self):
         return [
             SimpleNamespace(
+                order_id=1082169287,
                 stock_code="513100.SH",
                 order_status=56,
                 traded_volume=1000,
@@ -128,6 +129,7 @@ class ColonConditionRemarkBroker(FilledBroker):
     def get_trades(self):
         return [
             SimpleNamespace(
+                order_id=1082169287,
                 stock_code="513100.SH",
                 quantity=1000,
                 price=1.0,
@@ -288,6 +290,7 @@ def submitted_colon_condition_result() -> ExecutionResult:
         quantity=1000,
         price=1.0,
         amount=1000.0,
+        local_order_id="1082169287",
         status="submitted",
     )
     return ExecutionResult(
@@ -379,16 +382,16 @@ def test_sync_results_reports_condition_tasks_to_condition_result_endpoint(tmp_p
     assert service.storage.get_condition_order("cond-sync").status == "completed"
 
 
-def test_sync_results_matches_condition_tasks_by_cond_remark(tmp_path) -> None:
+def test_sync_results_does_not_match_condition_tasks_by_cond_remark_only(tmp_path) -> None:
     service = make_service_with_condition_result(tmp_path, result_status="submitted")
     service.qmt = ConditionRemarkBroker()  # type: ignore[assignment]
 
     result = service.sync_results(task_id="condition:cond-sync")
 
-    assert result == [{"task_id": "condition:cond-sync", "status": "success"}]
+    assert result == [{"task_id": "condition:cond-sync", "status": "submitted"}]
     payload = service.xquant.condition_results[0][2]  # type: ignore[attr-defined]
-    assert payload["execution_result"]["status"] == "success"
-    assert payload["execution_result"]["submitted_orders"][0]["status"] == "filled"
+    assert payload["execution_result"]["status"] == "submitted"
+    assert payload["execution_result"]["submitted_orders"][0]["status"] == "submitted"
 
 
 def test_sync_results_preserves_colons_in_condition_id(tmp_path) -> None:
