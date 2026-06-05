@@ -182,6 +182,93 @@ def test_gateway_arms_static_template_reference_from_position_cost(tmp_path) -> 
     assert order.raw["template_id"] == "stop_loss-static_pct-1"
 
 
+def test_gateway_does_not_rearm_in_flight_template_condition(tmp_path) -> None:
+    task_file = tmp_path / "tasks.json"
+    task_file.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-new",
+                        "portfolio_id": "prod",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-06-03T09:35:00+08:00",
+                        "expires_at": None,
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.011}],
+                        "constraints": {
+                            "condition_orders": [
+                                {
+                                    "id": "stop_loss-static_pct-1",
+                                    "scope": "instrument",
+                                    "purpose": "stop_loss",
+                                    "method": "static_pct",
+                                    "params": {"stop_loss_pct": 0.08},
+                                    "reference": {"source": "position_cost_price"},
+                                    "action": {"type": "sell_pct", "pct": 1.0},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = GatewayService(settings_for(tmp_path, task_file))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-acct-prod-513100.SH-stop_loss-static_pct-1",
+                task_id="task-old",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                status="submitted",
+                reference_price=1.2,
+                high_water_price=1.2,
+                params={"stop_loss_pct": 0.08},
+                raw={
+                    "template_id": "stop_loss-static_pct-1",
+                    "reference": {"source": "position_cost_price"},
+                },
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    service.qmt = PositionBroker(price=1.1)  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-new", "status": "dry_run_success"}]
+    order = service.storage.get_condition_order(
+        "cond-acct-prod-513100.SH-stop_loss-static_pct-1"
+    )
+    assert order.status == "submitted"
+    assert order.task_id == "task-old"
+    assert order.reference_price == 1.2
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("cond-acct-prod-513100.SH-stop_loss-static_pct-1",),
+        ).fetchone()
+    assert row["event_type"] == "arm_skipped"
+    payload = json.loads(row["payload_json"])
+    assert payload["task_id"] == "task-new"
+    assert payload["existing_task_id"] == "task-old"
+    assert payload["existing_status"] == "submitted"
+
+
 def test_gateway_condition_poll_refreshes_pending_reference_orders(tmp_path) -> None:
     service = GatewayService(settings_for(tmp_path))
     service.storage.initialize()
@@ -192,6 +279,20 @@ def test_gateway_condition_poll_refreshes_pending_reference_orders(tmp_path) -> 
                 task_id="task-1",
                 portfolio_id="prod",
                 account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                status="pending_reference",
+                params={"stop_loss_pct": 0.05},
+                raw={"reference": {"source": "position_cost_price"}},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-pending-reference-other-account",
+                task_id="task-2",
+                portfolio_id="prod",
+                account_id="other-acct",
                 mode="dry_run",
                 symbol="513100.SH",
                 purpose="stop_loss",
@@ -213,6 +314,11 @@ def test_gateway_condition_poll_refreshes_pending_reference_orders(tmp_path) -> 
     assert order.status == "armed"
     assert order.reference_price == 1.0
     assert order.high_water_price == 1.0
+    other_order = service.storage.get_condition_order(
+        "cond-pending-reference-other-account"
+    )
+    assert other_order.status == "pending_reference"
+    assert other_order.reference_price is None
     with closing(service.storage._connect()) as conn:
         row = conn.execute(
             """

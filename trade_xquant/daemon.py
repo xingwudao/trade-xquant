@@ -35,6 +35,13 @@ from trade_xquant.xquant_adapter import XquantAdapter, XquantAdapterError
 
 logger = logging.getLogger(__name__)
 
+_CONDITION_REARM_BLOCKING_STATUSES = {
+    "triggered",
+    "submitting",
+    "submitted",
+    "needs_reconcile",
+}
+
 
 class GatewaySyncReportError(RuntimeError):
     def __init__(self, results: list[dict[str, object]]) -> None:
@@ -169,7 +176,9 @@ class GatewayService:
     def condition_poll_once(self) -> list[dict[str, object]]:
         self.storage.initialize()
         active_orders = self.storage.list_active_condition_orders()
-        pending_reference_orders = self.storage.list_pending_reference_condition_orders()
+        pending_reference_orders = self.storage.list_pending_reference_condition_orders(
+            account_id=self.settings.qmt.account_id
+        )
         if not active_orders and not pending_reference_orders:
             logger.info("no active condition orders")
             return []
@@ -765,6 +774,13 @@ class GatewayService:
             self._condition_order_with_position_reference(order, position_map)
             for order in condition_orders
         ]
+        refreshed_orders = [
+            order
+            for order in refreshed_orders
+            if self._can_arm_condition_order_refresh(order)
+        ]
+        if not refreshed_orders:
+            return
         self.storage.upsert_condition_orders(refreshed_orders)
         for order in refreshed_orders:
             event_type = "armed" if order.status == "armed" else order.status
@@ -781,6 +797,25 @@ class GatewayService:
                 event_type,
                 payload,
             )
+
+    def _can_arm_condition_order_refresh(self, order: ConditionOrder) -> bool:
+        try:
+            existing_order = self.storage.get_condition_order(order.condition_id)
+        except KeyError:
+            return True
+        if existing_order.status in _CONDITION_REARM_BLOCKING_STATUSES:
+            self.storage.record_condition_event(
+                order.condition_id,
+                "arm_skipped",
+                {
+                    "task_id": order.task_id,
+                    "existing_task_id": existing_order.task_id,
+                    "existing_status": existing_order.status,
+                    "reason": "condition execution already in flight",
+                },
+            )
+            return False
+        return True
 
     def _refresh_condition_orders_for_task(self, task_id: str) -> None:
         orders = self.storage.list_condition_orders_for_task(task_id)
