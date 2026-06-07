@@ -41,12 +41,19 @@ is idempotent and can be run again after changing account metadata.
 ## Heartbeat
 
 ```bash
-trade-xquant heartbeat --config config.yaml --qmt-connected
+trade-xquant heartbeat --config config.yaml
 ```
 
-Sends account liveness and runtime metadata to Xquant. The daemon can also
-use the same contract for periodic liveness reporting. When QMT is connected,
-the heartbeat payload includes current `cash`, `total_asset`, and `holdings`.
+Sends account liveness and runtime metadata to Xquant. Before each heartbeat,
+`trade-xquant` checks QMT with the same connection path as `check-qmt` and
+uploads the real `qmt_connected` result. When QMT is connected, the heartbeat
+payload includes current `cash`, `total_asset`, and `holdings`.
+
+Xquant should render heartbeat state as:
+
+- fresh heartbeat and `qmt_connected=true`: green.
+- fresh heartbeat and `qmt_connected=false`: yellow.
+- stale or missing heartbeat: red.
 
 ## Check QMT
 
@@ -117,9 +124,10 @@ trade-xquant daemon --config config.yaml
 ```
 
 Runs the same poll loop every `runtime.poll_interval_seconds`. Each loop
-also sends a heartbeat to Xquant. If QMT can be queried, the heartbeat
-refreshes the account's current holdings in Xquant even when there are no
-pending tasks.
+also sends a heartbeat to Xquant after checking QMT. If QMT can be queried,
+the heartbeat refreshes the account's current holdings in Xquant even when
+there are no pending tasks. If QMT cannot be queried, the heartbeat still
+arrives with `qmt_connected=false` and the related error.
 
 ## Show Local Status
 

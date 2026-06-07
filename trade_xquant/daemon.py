@@ -17,6 +17,11 @@ from trade_xquant.condition_orders import (
 )
 from trade_xquant.config import Settings
 from trade_xquant.execution_engine import ExecutionEngine
+from trade_xquant.heartbeat import (
+    account_result_snapshot,
+    check_qmt_connection_for_heartbeat,
+    xtquant_importable,
+)
 from trade_xquant.local_task_file import LocalTaskFileAdapter
 from trade_xquant.models import (
     AccountSnapshot,
@@ -502,33 +507,16 @@ class GatewayService:
             time.sleep(max(0.1, sleep_until - time.monotonic()))
 
     def heartbeat_once(self, last_error: str | None = None) -> dict[str, Any]:
-        snapshot: dict[str, Any] | None = None
-        qmt_connected = False
-        try:
-            self.qmt.connect()
-            qmt_connected = True
-            account = self.qmt.get_account_snapshot()
-            positions = self.qmt.get_positions()
-            price_symbols = sorted({position.symbol for position in positions})
-            prices: dict[str, float] = {}
-            if price_symbols:
-                try:
-                    prices = self.qmt.get_prices(price_symbols)
-                except Exception as exc:  # noqa: BLE001 - holdings can still use market_value
-                    logger.exception("failed to query account prices during heartbeat")
-                    last_error = _append_error(last_error, f"heartbeat price query failed: {exc}")
-            snapshot = account_result_snapshot(account, positions, prices)
-        except Exception as exc:  # noqa: BLE001 - liveness should still be reported
-            logger.exception("failed to query account snapshot during heartbeat")
-            last_error = _append_error(last_error, f"heartbeat snapshot failed: {exc}")
+        qmt_status = check_qmt_connection_for_heartbeat(self.qmt, last_error, logger)
+        snapshot = qmt_status.snapshot
 
         return self.xquant.heartbeat(
             account_id=self.settings.qmt.account_id,
             client_version=__version__,
             hostname=socket.gethostname(),
-            qmt_connected=qmt_connected,
-            xtquant_importable=_xtquant_importable(),
-            last_error=last_error,
+            qmt_connected=qmt_status.qmt_connected,
+            xtquant_importable=xtquant_importable(),
+            last_error=qmt_status.last_error,
             cash=snapshot["cash"] if snapshot else None,
             total_asset=snapshot["total_asset"] if snapshot else None,
             holdings=snapshot["holdings"] if snapshot else None,
@@ -946,33 +934,6 @@ def attach_account_snapshot(
     result.holdings = snapshot["holdings"]
 
 
-def account_result_snapshot(
-    account: AccountSnapshot,
-    positions: list[Position],
-    prices: dict[str, float],
-    task: RebalanceTask | None = None,
-) -> dict[str, Any]:
-    target_weights = {target.symbol: target.target_weight for target in task.targets} if task else {}
-    holdings = []
-    for position in positions:
-        reference_price = prices.get(position.symbol)
-        market_value = position.market_value
-        if not market_value and reference_price is not None:
-            market_value = position.quantity * reference_price
-        weight = market_value / account.total_asset if account.total_asset > 0 else None
-        holdings.append(
-            {
-                "symbol": position.symbol,
-                "shares": position.quantity,
-                "reference_price": reference_price,
-                "market_value": market_value,
-                "weight": weight,
-                "target_weight": target_weights.get(position.symbol),
-            }
-        )
-    return {"cash": account.cash, "total_asset": account.total_asset, "holdings": holdings}
-
-
 def _position_cost_price(position: Position | None) -> float | None:
     if position is None or position.cost_price is None:
         return None
@@ -1289,14 +1250,6 @@ def _normalize_trade_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if order_id not in (None, ""):
         result["order_id"] = str(order_id)
     return result
-
-
-def _xtquant_importable() -> bool:
-    try:
-        import xtquant  # noqa: F401
-    except ImportError:
-        return False
-    return True
 
 
 def _append_error(last_error: str | None, error: str) -> str:

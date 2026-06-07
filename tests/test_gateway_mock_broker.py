@@ -174,6 +174,35 @@ def test_daemon_loop_sends_heartbeat_with_holdings_when_no_tasks(tmp_path, monke
     ]
 
 
+def test_daemon_heartbeat_reports_qmt_disconnected_when_check_fails(tmp_path) -> None:
+    settings = Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="mock",
+            db_path=str(tmp_path / "audit.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(),
+    )
+    service = GatewayService(settings)
+    fake_xquant = FakeXquant()
+    service.xquant = fake_xquant  # type: ignore[assignment]
+
+    class FailingBroker:
+        def connect(self) -> None:
+            raise ConnectionError("qmt offline")
+
+    service.qmt = FailingBroker()  # type: ignore[assignment]
+
+    assert service.heartbeat_once()["ok"] is True
+
+    heartbeat = fake_xquant.heartbeats[0]
+    assert heartbeat["qmt_connected"] is False
+    assert "heartbeat qmt check failed: qmt offline" in heartbeat["last_error"]
+    assert heartbeat["cash"] is None
+
+
 def test_gateway_mock_broker_records_events_trades_and_submitted_orders(tmp_path) -> None:
     settings = Settings(
         xquant=XquantConfig(base_url="http://xquant/api/v1"),

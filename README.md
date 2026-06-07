@@ -215,19 +215,24 @@ trade-xquant register-account --config config.yaml --default-mode real
 trade-xquant heartbeat --config config.yaml
 ```
 
-如果刚刚已经确认 QMT 连接正常，可以带上连接状态：
-
-```bash
-trade-xquant heartbeat --config config.yaml --qmt-connected
-```
+发送心跳前，`trade-xquant` 会执行与 `check-qmt` 同类的 QMT 连接检查。
+不要用人工参数声明 QMT 状态；心跳里上传的是本次实际检查结果。
 
 心跳会让 Xquant 看到：
 
 - 网关账号。
 - 客户端版本。
 - 主机名。
-- QMT 是否连接。
+- QMT 本次检查是否连接。
 - `xtquant` 是否可导入。
+- 最近错误。
+- 如果 QMT 可连接，还会带上当前 `cash`、`total_asset` 和 `holdings`。
+
+Xquant 侧状态建议按 heartbeat 新鲜度和 `qmt_connected` 判断：
+
+- heartbeat 新鲜且 `qmt_connected=true`：绿灯。
+- heartbeat 新鲜且 `qmt_connected=false`：黄灯。
+- heartbeat 过期或缺失：红灯。
 
 ## 基础诊断
 
@@ -399,8 +404,10 @@ trade-xquant daemon --config config.yaml
 ```
 
 每轮 daemon 会先处理 pending task，再向 Xquant 发送一次 heartbeat。
-如果 QMT 可连接，heartbeat 会带上当前 `cash`、`total_asset` 和
-`holdings`，用于刷新页面上的在线状态和当前持仓结果。
+每次 heartbeat 都会先检查 QMT 连接状态。如果 QMT 可连接，
+heartbeat 会带上当前 `cash`、`total_asset` 和 `holdings`，
+用于刷新页面上的在线状态和当前持仓结果；如果 QMT 不可连接，
+仍会发送 heartbeat，并上报 `qmt_connected=false` 和错误信息。
 
 轮询间隔来自：
 

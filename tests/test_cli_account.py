@@ -44,20 +44,31 @@ def test_register_account_command_uses_config_defaults(tmp_path) -> None:
 def test_heartbeat_command_posts_status(tmp_path) -> None:
     config_path = tmp_path / "config.yaml"
     write_config(config_path)
+    seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen.append(json.loads(request.read().decode()))
         return httpx.Response(200, json={"ok": True})
 
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://xquant")
 
     result = heartbeat_command(
         config_path=str(config_path),
-        qmt_connected=False,
         last_error=None,
         client=client,
+        broker=FailingBroker(),
     )
 
     assert result["ok"] is True
+    assert seen[0]["qmt_connected"] is False
+    assert "heartbeat qmt check failed" in seen[0]["last_error"]
+
+
+class FailingBroker:
+    def connect(self) -> None:
+        raise ConnectionError("qmt offline")
 
 
 class FakeBroker:
@@ -100,7 +111,6 @@ def test_heartbeat_command_uploads_holdings_when_qmt_connected(tmp_path) -> None
 
     result = heartbeat_command(
         config_path=str(config_path),
-        qmt_connected=True,
         last_error=None,
         client=client,
         broker=broker,
@@ -108,6 +118,7 @@ def test_heartbeat_command_uploads_holdings_when_qmt_connected(tmp_path) -> None
 
     assert result["ok"] is True
     assert broker.connected is True
+    assert seen[0]["qmt_connected"] is True
     assert seen[0]["cash"] == 98000.0
     assert seen[0]["total_asset"] == 100000.0
     assert seen[0]["holdings"] == [

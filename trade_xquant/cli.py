@@ -28,7 +28,6 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--display-name")
     register.add_argument("--default-mode", choices=["dry_run", "real"], default="dry_run")
     heartbeat = sub.add_parser("heartbeat", parents=[common])
-    heartbeat.add_argument("--qmt-connected", action="store_true")
     heartbeat.add_argument("--last-error")
     sub.add_parser("check-qmt", parents=[common])
     poll = sub.add_parser("poll-once", parents=[common])
@@ -74,7 +73,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "heartbeat":
         result = heartbeat_command(
             config_path=args.config,
-            qmt_connected=args.qmt_connected,
             last_error=args.last_error,
         )
         print_json(result)
@@ -239,7 +237,6 @@ def register_account_command(
 
 def heartbeat_command(
     config_path: str,
-    qmt_connected: bool,
     last_error: str | None,
     client=None,
     broker=None,
@@ -248,7 +245,7 @@ def heartbeat_command(
 
     from trade_xquant import __version__
     from trade_xquant.config import load_settings
-    from trade_xquant.daemon import account_result_snapshot
+    from trade_xquant.heartbeat import check_qmt_connection_for_heartbeat, xtquant_importable
     from trade_xquant.xquant_adapter import XquantAdapter
 
     settings = load_settings(config_path)
@@ -259,31 +256,18 @@ def heartbeat_command(
         trust_env=settings.xquant.trust_env,
         client=client,
     )
-    try:
-        import xtquant  # noqa: F401
-
-        xtquant_importable = True
-    except ImportError:
-        xtquant_importable = False
-    snapshot: dict | None = None
-    if qmt_connected:
-        try:
-            broker = broker or _build_broker_adapter(settings)
-            broker.connect()
-            account = broker.get_account_snapshot()
-            positions = broker.get_positions()
-            symbols = sorted({position.symbol for position in positions})
-            prices = broker.get_prices(symbols) if symbols else {}
-            snapshot = account_result_snapshot(account, positions, prices)
-        except Exception as exc:  # noqa: BLE001 - heartbeat should still reach Xquant
-            last_error = _append_last_error(last_error, f"heartbeat snapshot failed: {exc}")
+    qmt_status = check_qmt_connection_for_heartbeat(
+        broker or _build_broker_adapter(settings),
+        last_error,
+    )
+    snapshot = qmt_status.snapshot
     return adapter.heartbeat(
         account_id=settings.qmt.account_id,
         client_version=__version__,
         hostname=socket.gethostname(),
-        qmt_connected=qmt_connected,
-        xtquant_importable=xtquant_importable,
-        last_error=last_error,
+        qmt_connected=qmt_status.qmt_connected,
+        xtquant_importable=xtquant_importable(),
+        last_error=qmt_status.last_error,
         cash=snapshot["cash"] if snapshot else None,
         total_asset=snapshot["total_asset"] if snapshot else None,
         holdings=snapshot["holdings"] if snapshot else None,
@@ -306,10 +290,6 @@ def _build_broker_adapter(settings):
     if settings.runtime.broker_adapter == "qmt":
         return QmtAdapter(settings.qmt)
     raise ValueError("runtime.broker_adapter must be 'qmt' or 'mock'")
-
-
-def _append_last_error(last_error: str | None, error: str) -> str:
-    return f"{last_error}; {error}" if last_error else error
 
 
 def _run_gateway_command(callback) -> int:
