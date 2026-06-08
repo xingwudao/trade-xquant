@@ -571,9 +571,19 @@ def test_condition_audit_report_status_update_missing_raises(tmp_path) -> None:
     assert exc.value.args == ("condition:missing",)
 
 
-def test_storage_loads_latest_submitted_order_created_at(tmp_path) -> None:
+def test_storage_loads_latest_submitted_order_created_at(tmp_path, monkeypatch) -> None:
     storage = Storage(tmp_path / "audit.db")
     storage.initialize()
+    created_at_values = iter(
+        [
+            "2026-06-03T02:00:00+00:00",
+            "2026-06-03T02:01:00+00:00",
+        ]
+    )
+    monkeypatch.setattr("trade_xquant.storage.utc_now", lambda: next(created_at_values))
+
+    assert storage.latest_submitted_order_created_at("missing-task") is None
+
     storage.record_execution_result(
         ExecutionResult(
             task_id="task-1",
@@ -594,10 +604,31 @@ def test_storage_loads_latest_submitted_order_created_at(tmp_path) -> None:
         )
     )
 
-    value = storage.latest_submitted_order_created_at("task-1")
+    first_created_at = storage.latest_submitted_order_created_at("task-1")
+    storage.record_execution_result(
+        ExecutionResult(
+            task_id="task-1",
+            status="submitted",
+            mode="real",
+            planned_orders=[],
+            submitted_orders=[
+                SubmittedOrder(
+                    task_id="task-1",
+                    symbol="513100.SH",
+                    side="buy",
+                    quantity=200,
+                    price=1.0,
+                    amount=200.0,
+                    local_order_id="2",
+                )
+            ],
+        )
+    )
+    latest_created_at = storage.latest_submitted_order_created_at("task-1")
 
-    assert isinstance(value, str)
-    assert value
+    assert isinstance(first_created_at, str)
+    assert first_created_at
+    assert latest_created_at == "2026-06-03T02:01:00+00:00"
 
 
 def test_storage_loads_task_result_payload(tmp_path) -> None:
@@ -612,3 +643,4 @@ def test_storage_loads_task_result_payload(tmp_path) -> None:
     payload = storage.load_task_result_payload("task-1")
 
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 2
+    assert storage.load_task_result_payload("missing-task") is None
