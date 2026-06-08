@@ -1026,6 +1026,7 @@ def test_sync_submitted_orders_marks_empty_retry_plan_noop(tmp_path) -> None:
     service.storage.record_task_received(empty_plan_task, status="submitted")
     service.settings.runtime.submitted_order_timeout_seconds = 0
     service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
 
     result = service.sync_submitted_orders_once()
 
@@ -1037,6 +1038,32 @@ def test_sync_submitted_orders_marks_empty_retry_plan_noop(tmp_path) -> None:
     assert payload["planned_orders"] == []
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
     assert payload["meta"]["order_lifecycle"]["reason"] == "submitted_order_timeout"
+
+
+def test_sync_submitted_orders_validates_empty_retry_plan(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    empty_plan_task = task()
+    empty_plan_task.targets[0].target_weight = 0.02
+    service.storage.record_task_received(empty_plan_task, status="submitted")
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["status"] == "failed"
+    assert broker.cancelled == ["1082169287"]
+    assert broker.placed == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "failed"
+    assert payload["errors"] == ["real order disabled by config"]
+    assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+    assert service.xquant.results[-1][1] == "failed"  # type: ignore[attr-defined]
 
 
 def test_sync_submitted_orders_reports_retry_plan(tmp_path, monkeypatch) -> None:

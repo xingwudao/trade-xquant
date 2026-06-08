@@ -695,8 +695,7 @@ class GatewayService:
                 cancelled_order_ids=cancelled_order_ids,
                 reason=reason,
             )
-            if plan.orders:
-                self.risk.validate(task, account, plan, known_symbols=set(prices))
+            self.risk.validate(task, account, plan, known_symbols=set(prices))
             self.storage.record_plan(plan)
             self.xquant.report_plan(task_id, plan.model_dump(mode="json"))
             if not plan.orders:
