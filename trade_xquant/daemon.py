@@ -49,6 +49,12 @@ _CONDITION_REARM_BLOCKING_STATUSES = {
     "needs_reconcile",
 }
 
+_TERMINAL_ORDER_LIFECYCLE_REASONS = {
+    "retry_budget_exhausted",
+    "submitted_order_cancel_failed",
+    "retry_preflight_failed",
+}
+
 
 class GatewaySyncReportError(RuntimeError):
     def __init__(self, results: list[dict[str, object]]) -> None:
@@ -600,6 +606,13 @@ class GatewayService:
             return None
         return dict(lifecycle)
 
+    def _has_terminal_order_lifecycle(self, task_id: str) -> bool:
+        lifecycle = self._stored_order_lifecycle_meta(task_id)
+        return bool(
+            lifecycle
+            and lifecycle.get("reason") in _TERMINAL_ORDER_LIFECYCLE_REASONS
+        )
+
     def _retry_count(self, task_id: str) -> int:
         value = self._order_lifecycle_meta(task_id).get("retry_count", 0)
         try:
@@ -679,7 +692,16 @@ class GatewayService:
         retry_count = self._retry_count(task_id)
         task = self.storage.load_task(task_id)
         if retry_count >= self.settings.runtime.max_rebalance_retries:
-            return {"task_id": task_id, "status": "ok"}
+            logger.info("rebalance retry budget exhausted before cancellation: task_id=%s", task_id)
+            return self._record_failed_retry_result(
+                task_id,
+                task=task,
+                planned_orders=None,
+                retry_count=retry_count,
+                cancelled_order_ids=[],
+                reason="retry_budget_exhausted",
+                error=RuntimeError("retry budget exhausted"),
+            )
         if task is None:
             logger.error("cannot preflight missing task: task_id=%s", task_id)
             return {"task_id": task_id, "status": "missing_task"}
@@ -891,7 +913,14 @@ class GatewayService:
 
     def sync_results(self, task_id: str | None = None, status: str = "all") -> list[dict[str, object]]:
         self.storage.initialize()
-        task_ids = self.storage.list_syncable_task_ids(task_id=task_id, status=status)
+        task_ids = [
+            syncable_task_id
+            for syncable_task_id in self.storage.list_syncable_task_ids(
+                task_id=task_id,
+                status=status,
+            )
+            if not self._has_terminal_order_lifecycle(syncable_task_id)
+        ]
         task_id_set = set(task_ids)
         audit_task_ids = [
             audit_task_id
