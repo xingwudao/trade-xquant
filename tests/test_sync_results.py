@@ -902,6 +902,29 @@ def test_sync_submitted_orders_cancels_timed_out_pending_order(tmp_path, caplog)
     assert "1082169287" in caplog.text
 
 
+def test_sync_submitted_orders_retries_after_timeout_cancel(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+    service.settings.runtime.mock_prices = {"513100.SH": 1.0}
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["task_id"] == "task-1"
+    assert broker.cancelled == ["1082169287"]
+    assert len(broker.placed) == 1
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+
+
 def test_cancel_pending_submitted_orders_skips_duplicate_order_id(tmp_path) -> None:
     broker = PendingBroker()
     service = make_service_with_result(

@@ -538,7 +538,7 @@ class GatewayService:
         results = self.sync_results(status="submitted")
         for partial_task_id in partial_task_ids:
             results.extend(self.sync_results(task_id=partial_task_id, status="partial"))
-        for result_item in results:
+        for result_item in list(results):
             task_id = str(result_item.get("task_id") or "")
             status = str(result_item.get("status") or "")
             if status not in {"submitted", "partial"}:
@@ -562,7 +562,79 @@ class GatewayService:
                 cancelled,
                 errors,
             )
+            if errors:
+                continue
+            if cancelled:
+                retry_result = self._retry_rebalance_task(
+                    task_id,
+                    cancelled_order_ids=cancelled,
+                    reason="submitted_order_timeout",
+                )
+                if retry_result.get("status") != "retry_budget_exhausted":
+                    results.append(retry_result)
         return results
+
+    def _order_lifecycle_meta(self, task_id: str) -> dict[str, object]:
+        payload = self.storage.load_task_result_payload(task_id) or {}
+        meta = payload.get("meta") if isinstance(payload, dict) else {}
+        if not isinstance(meta, dict):
+            return {"retry_count": 0}
+        lifecycle = meta.get("order_lifecycle")
+        if not isinstance(lifecycle, dict):
+            return {"retry_count": 0}
+        return dict(lifecycle)
+
+    def _retry_count(self, task_id: str) -> int:
+        value = self._order_lifecycle_meta(task_id).get("retry_count", 0)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _retry_rebalance_task(
+        self,
+        task_id: str,
+        *,
+        cancelled_order_ids: list[str],
+        reason: str,
+    ) -> dict[str, object]:
+        retry_count = self._retry_count(task_id)
+        if retry_count >= self.settings.runtime.max_rebalance_retries:
+            logger.info("rebalance retry budget exhausted: task_id=%s", task_id)
+            return {"task_id": task_id, "status": "retry_budget_exhausted"}
+
+        task = self.storage.load_task(task_id)
+        if task is None:
+            logger.error("cannot retry missing task: task_id=%s", task_id)
+            return {"task_id": task_id, "status": "missing_task"}
+
+        self.qmt.connect()
+        account = self.qmt.get_account_snapshot()
+        positions = self.qmt.get_positions()
+        symbols = [target.symbol for target in task.targets] + [position.symbol for position in positions]
+        prices = self.qmt.get_prices(symbols)
+        plan = self.portfolio.build_plan(task, account, positions, prices)
+        self.risk.validate(task, account, plan, known_symbols=set(prices))
+        self.storage.record_plan(plan)
+        result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
+        result.meta["order_lifecycle"] = {
+            "retry_count": retry_count + 1,
+            "last_retry_at": datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
+            "cancelled_order_ids": cancelled_order_ids,
+            "reason": reason,
+        }
+        self._attach_current_account_snapshot(
+            result,
+            task,
+            fallback_account=account,
+            fallback_positions=positions,
+            fallback_prices=prices,
+        )
+        self.storage.record_execution_result(result)
+        status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
+        self.storage.mark_task_result(task_id, status, result.model_dump(mode="json"))
+        self.xquant.report_result(task_id, status, result)
+        return {"task_id": task_id, "status": status, "retry_count": retry_count + 1}
 
     def _submitted_order_timed_out(self, task_id: str, now: datetime | None = None) -> bool:
         created_at = self.storage.latest_submitted_order_created_at(task_id)
