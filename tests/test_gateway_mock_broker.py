@@ -174,6 +174,45 @@ def test_daemon_loop_sends_heartbeat_with_holdings_when_no_tasks(tmp_path, monke
     ]
 
 
+def test_daemon_loop_runs_submitted_order_sync(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="mock",
+            poll_interval_seconds=60,
+            condition_poll_interval_seconds=60,
+            order_sync_interval_seconds=1,
+            db_path=str(tmp_path / "audit.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(),
+    )
+    service = GatewayService(settings)
+    calls = {"sync": 0, "sleep": 0}
+    service.poll_once = lambda: []  # type: ignore[method-assign]
+    service.condition_poll_once = lambda: []  # type: ignore[method-assign]
+    service.heartbeat_once = lambda last_error=None: {"ok": True}  # type: ignore[method-assign]
+
+    def sync_once():
+        calls["sync"] += 1
+        if calls["sync"] >= 2:
+            raise KeyboardInterrupt
+        return []
+
+    service.sync_submitted_orders_once = sync_once  # type: ignore[method-assign]
+
+    def fake_sleep(seconds):
+        calls["sleep"] += 1
+
+    monkeypatch.setattr("trade_xquant.daemon.time.sleep", fake_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        service.run_forever()
+
+    assert calls["sync"] == 2
+
+
 def test_daemon_heartbeat_reports_qmt_disconnected_when_check_fails(tmp_path) -> None:
     settings = Settings(
         xquant=XquantConfig(base_url="http://xquant/api/v1"),

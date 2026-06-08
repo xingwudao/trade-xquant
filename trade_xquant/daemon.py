@@ -480,6 +480,7 @@ class GatewayService:
     def run_forever(self) -> None:
         next_task_poll = 0.0
         next_condition_poll = 0.0
+        next_order_sync = 0.0
         last_error: str | None = None
         while True:
             current = time.monotonic()
@@ -498,13 +499,20 @@ class GatewayService:
                     logger.exception("condition poll loop failed")
                     last_error = _append_error(last_error, str(exc))
                 next_condition_poll = current + self.settings.runtime.condition_poll_interval_seconds
+            if current >= next_order_sync:
+                try:
+                    self.sync_submitted_orders_once()
+                except Exception as exc:  # noqa: BLE001 - order sync must not stop daemon
+                    logger.exception("submitted order sync loop failed")
+                    last_error = _append_error(last_error, str(exc))
+                next_order_sync = current + self.settings.runtime.order_sync_interval_seconds
             if task_poll_due:
                 try:
                     self.heartbeat_once(last_error=last_error)
                     last_error = None
                 except Exception:  # noqa: BLE001 - heartbeat failure must not stop polling
                     logger.exception("failed to report heartbeat to Xquant")
-            sleep_until = min(next_task_poll, next_condition_poll)
+            sleep_until = min(next_task_poll, next_condition_poll, next_order_sync)
             time.sleep(max(0.1, sleep_until - time.monotonic()))
 
     def heartbeat_once(self, last_error: str | None = None) -> dict[str, Any]:
