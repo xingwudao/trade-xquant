@@ -83,6 +83,22 @@ class FailingFirstResultXquant(FakeXquant):
         return super().report_result(task_id, status, payload)
 
 
+class FailingFirstFailedResultXquant(FakeXquant):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_report_attempts = 0
+
+    def report_result(self, task_id: str, status: str, payload) -> None:
+        if status == "failed":
+            self.failed_report_attempts += 1
+            if self.failed_report_attempts == 1:
+                raise XquantAdapterError(
+                    'Xquant API error 503: {"detail":"result_unavailable"}',
+                    status_code=503,
+                )
+        return super().report_result(task_id, status, payload)
+
+
 class ConflictXquant:
     def report_result(self, task_id: str, status: str, payload) -> None:
         raise XquantAdapterError(
@@ -328,6 +344,38 @@ class FailingSecondCancelRetryBroker(CurrentRetryBroker):
         if self.placed:
             raise RuntimeError(f"cannot cancel {order_id}")
         super().cancel_order(order_id)
+
+
+class FilledRetryBroker(CurrentRetryBroker):
+    def get_orders(self):
+        if not self.placed:
+            return super().get_orders()
+        quantity = self.placed[-1].quantity
+        return [
+            SimpleNamespace(
+                order_id=self.current_order_id,
+                stock_code="513100.SH",
+                order_status=56,
+                traded_volume=quantity,
+                price=1.0,
+                m_strRemark="task-1",
+            )
+        ]
+
+    def get_trades(self):
+        if not self.placed:
+            return []
+        quantity = self.placed[-1].quantity
+        return [
+            SimpleNamespace(
+                order_id=self.current_order_id,
+                stock_code="513100.SH",
+                quantity=quantity,
+                price=1.0,
+                amount=float(quantity),
+                m_strRemark="task-1",
+            )
+        ]
 
 
 class NoPendingBroker(PendingBroker):
@@ -1090,6 +1138,35 @@ def test_terminal_order_lifecycle_failure_is_not_overwritten_by_failed_sync(tmp_
     assert payload["meta"]["order_lifecycle"]["reason"] == "retry_budget_exhausted"
 
 
+def test_terminal_order_lifecycle_report_failure_retries_and_marks_synced(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.xquant = FailingFirstFailedResultXquant()  # type: ignore[assignment]
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 0
+
+    service.sync_submitted_orders_once()
+    failed_payload = service.storage.load_task_result_payload("task-1")
+    assert failed_payload["status"] == "failed"
+    assert failed_payload["meta"]["xquant_synced"] is False
+    assert "result_unavailable" in failed_payload["meta"]["xquant_report_error"]
+
+    result = service.sync_results(status="failed")
+
+    assert result == [{"task_id": "task-1", "status": "failed", "xquant_synced": True}]
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "failed"
+    assert payload["errors"] == failed_payload["errors"]
+    assert payload["meta"]["xquant_synced"] is True
+    assert "xquant_report_error" not in payload["meta"]
+    assert service.xquant.failed_report_attempts == 2  # type: ignore[attr-defined]
+
+
 def test_sync_submitted_orders_retries_after_timeout_cancel(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
     broker = PendingBroker()
@@ -1111,6 +1188,33 @@ def test_sync_submitted_orders_retries_after_timeout_cancel(tmp_path, monkeypatc
     assert len(broker.placed) == 1
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+
+
+def test_sync_results_retry_fill_ignores_cancelled_original_attempt(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = FilledRetryBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    service.sync_submitted_orders_once()
+    result = service.sync_results(status="submitted")
+
+    assert result == [{"task_id": "task-1", "status": "success"}]
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "success"
+    assert payload["submitted_orders"][0]["local_order_id"] == "retry-1"
+    assert payload["submitted_orders"][0]["status"] == "filled"
+    assert payload["meta"]["order_lifecycle"]["cancelled_order_ids_history"] == ["1082169287"]
 
 
 def test_sync_submitted_orders_continues_after_initial_report_failure(
@@ -1305,7 +1409,7 @@ def test_sync_submitted_orders_historical_trade_does_not_fill_current_retry(
     service.sync_submitted_orders_once()
     result = service.sync_submitted_orders_once()
 
-    assert result[0]["status"] == "partial"
+    assert result[0]["status"] == "submitted"
     assert result[-1]["retry_count"] == 2
     assert broker.cancelled == ["1082169287", "retry-1"]
     assert len(broker.placed) == 2

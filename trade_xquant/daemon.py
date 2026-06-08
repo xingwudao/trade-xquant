@@ -615,6 +615,43 @@ class GatewayService:
         except GatewaySyncReportError as exc:
             return exc.results
 
+    def _retry_terminal_lifecycle_report(self, task_id: str) -> dict[str, object]:
+        payload = self.storage.load_task_result_payload(task_id) or {}
+        if not isinstance(payload, dict):
+            return {"task_id": task_id, "status": "missing_result", "xquant_synced": False}
+        status = str(payload.get("status") or "failed")
+        result = ExecutionResult.model_validate(payload)
+        try:
+            self.xquant.report_result(task_id, status, result)
+        except Exception as exc:  # noqa: BLE001 - sync retries should return report failures
+            meta = payload.setdefault("meta", {})
+            if isinstance(meta, dict):
+                meta["xquant_synced"] = False
+                meta["xquant_report_error"] = str(exc)
+                if isinstance(exc, XquantAdapterError):
+                    meta["xquant_status_code"] = exc.status_code
+                    hint = _xquant_report_error_hint(exc)
+                    if hint:
+                        meta["xquant_error_hint"] = hint
+            self.storage.mark_task_result(task_id, status, payload)
+            return {
+                "task_id": task_id,
+                "status": status,
+                "xquant_synced": False,
+                "status_code": exc.status_code if isinstance(exc, XquantAdapterError) else None,
+                "error": str(exc),
+                "hint": _xquant_report_error_hint(exc) if isinstance(exc, XquantAdapterError) else None,
+            }
+
+        meta = payload.setdefault("meta", {})
+        if isinstance(meta, dict):
+            meta["xquant_synced"] = True
+            meta.pop("xquant_report_error", None)
+            meta.pop("xquant_status_code", None)
+            meta.pop("xquant_error_hint", None)
+        self.storage.mark_task_result(task_id, status, payload)
+        return {"task_id": task_id, "status": status, "xquant_synced": True}
+
     def _order_lifecycle_meta(self, task_id: str) -> dict[str, object]:
         lifecycle = self._stored_order_lifecycle_meta(task_id)
         if lifecycle is None:
@@ -637,6 +674,34 @@ class GatewayService:
             lifecycle
             and lifecycle.get("reason") in _TERMINAL_ORDER_LIFECYCLE_REASONS
         )
+
+    def _terminal_lifecycle_report_pending(self, task_id: str) -> bool:
+        payload = self.storage.load_task_result_payload(task_id) or {}
+        meta = payload.get("meta") if isinstance(payload, dict) else {}
+        return bool(
+            self._has_terminal_order_lifecycle(task_id)
+            and isinstance(meta, dict)
+            and meta.get("xquant_synced") is False
+        )
+
+    def _cancelled_order_id_history(self, task_id: str) -> set[str]:
+        lifecycle = self._stored_order_lifecycle_meta(task_id)
+        if not lifecycle:
+            return set()
+        values = lifecycle.get("cancelled_order_ids_history")
+        if not isinstance(values, list):
+            values = lifecycle.get("cancelled_order_ids", [])
+        if not isinstance(values, list):
+            return set()
+        return {str(value) for value in values if value not in (None, "")}
+
+    def _active_submitted_orders(self, task_id: str) -> list[SubmittedOrder]:
+        cancelled_ids = self._cancelled_order_id_history(task_id)
+        return [
+            order
+            for order in self.storage.load_submitted_orders(task_id)
+            if str(order.local_order_id or order.broker_order_id or "") not in cancelled_ids
+        ]
 
     def _retry_count(self, task_id: str) -> int:
         value = self._order_lifecycle_meta(task_id).get("retry_count", 0)
@@ -723,8 +788,25 @@ class GatewayService:
         self.storage.mark_task_result(task_id, "failed", payload)
         try:
             self.xquant.report_result(task_id, "failed", failure)
-        except Exception:  # noqa: BLE001 - retry failure is already audited locally
+            payload_meta = payload.setdefault("meta", {})
+            if isinstance(payload_meta, dict):
+                payload_meta["xquant_synced"] = True
+                payload_meta.pop("xquant_report_error", None)
+                payload_meta.pop("xquant_status_code", None)
+                payload_meta.pop("xquant_error_hint", None)
+            self.storage.mark_task_result(task_id, "failed", payload)
+        except Exception as exc:  # noqa: BLE001 - retry failure is already audited locally
             logger.exception("failed to report retry failure to Xquant: task_id=%s", task_id)
+            payload_meta = payload.setdefault("meta", {})
+            if isinstance(payload_meta, dict):
+                payload_meta["xquant_synced"] = False
+                payload_meta["xquant_report_error"] = str(exc)
+                if isinstance(exc, XquantAdapterError):
+                    payload_meta["xquant_status_code"] = exc.status_code
+                    hint = _xquant_report_error_hint(exc)
+                    if hint:
+                        payload_meta["xquant_error_hint"] = hint
+            self.storage.mark_task_result(task_id, "failed", payload)
         return {
             "task_id": task_id,
             "status": "failed",
@@ -1012,13 +1094,19 @@ class GatewayService:
 
     def sync_results(self, task_id: str | None = None, status: str = "all") -> list[dict[str, object]]:
         self.storage.initialize()
+        syncable_task_ids = self.storage.list_syncable_task_ids(
+            task_id=task_id,
+            status=status,
+        )
         task_ids = [
             syncable_task_id
-            for syncable_task_id in self.storage.list_syncable_task_ids(
-                task_id=task_id,
-                status=status,
-            )
+            for syncable_task_id in syncable_task_ids
             if not self._has_terminal_order_lifecycle(syncable_task_id)
+        ]
+        terminal_lifecycle_report_task_ids = [
+            syncable_task_id
+            for syncable_task_id in syncable_task_ids
+            if self._terminal_lifecycle_report_pending(syncable_task_id)
         ]
         task_id_set = set(task_ids)
         audit_task_ids = [
@@ -1029,7 +1117,7 @@ class GatewayService:
             )
             if audit_task_id not in task_id_set
         ]
-        if not task_ids and not audit_task_ids:
+        if not task_ids and not audit_task_ids and not terminal_lifecycle_report_task_ids:
             logger.info("no matching tasks to sync")
             return []
 
@@ -1042,7 +1130,7 @@ class GatewayService:
 
             for submitted_task_id in task_ids:
                 planned_orders = self.storage.load_planned_orders(submitted_task_id)
-                submitted_orders = self.storage.load_submitted_orders(submitted_task_id)
+                submitted_orders = self._active_submitted_orders(submitted_task_id)
                 matched_orders = [
                     payload
                     for payload in qmt_orders
@@ -1134,6 +1222,9 @@ class GatewayService:
 
         for audit_task_id in audit_task_ids:
             results.append(self._retry_condition_audit_report(audit_task_id))
+
+        for terminal_task_id in terminal_lifecycle_report_task_ids:
+            results.append(self._retry_terminal_lifecycle_report(terminal_task_id))
 
         if any(result.get("xquant_synced") is False for result in results):
             raise GatewaySyncReportError(results)
