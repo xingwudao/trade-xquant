@@ -575,13 +575,19 @@ class GatewayService:
         return results
 
     def _order_lifecycle_meta(self, task_id: str) -> dict[str, object]:
+        lifecycle = self._stored_order_lifecycle_meta(task_id)
+        if lifecycle is None:
+            return {"retry_count": 0}
+        return lifecycle
+
+    def _stored_order_lifecycle_meta(self, task_id: str) -> dict[str, object] | None:
         payload = self.storage.load_task_result_payload(task_id) or {}
         meta = payload.get("meta") if isinstance(payload, dict) else {}
         if not isinstance(meta, dict):
-            return {"retry_count": 0}
+            return None
         lifecycle = meta.get("order_lifecycle")
         if not isinstance(lifecycle, dict):
-            return {"retry_count": 0}
+            return None
         return dict(lifecycle)
 
     def _retry_count(self, task_id: str) -> int:
@@ -590,6 +596,68 @@ class GatewayService:
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+    def _retry_lifecycle_meta(
+        self,
+        *,
+        retry_count: int,
+        cancelled_order_ids: list[str],
+        reason: str,
+    ) -> dict[str, object]:
+        return {
+            "retry_count": retry_count,
+            "last_retry_at": datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
+            "cancelled_order_ids": cancelled_order_ids,
+            "reason": reason,
+        }
+
+    def _record_failed_retry_result(
+        self,
+        task_id: str,
+        *,
+        task: RebalanceTask | None,
+        planned_orders: list[PlannedOrder] | None,
+        retry_count: int,
+        cancelled_order_ids: list[str],
+        reason: str,
+        error: Exception,
+        fallback_account: AccountSnapshot | None = None,
+        fallback_positions: list[Position] | None = None,
+        fallback_prices: dict[str, float] | None = None,
+    ) -> dict[str, object]:
+        failure = ExecutionResult(
+            task_id=task_id,
+            status="failed",
+            mode=task.mode if task is not None else self.storage.load_task_mode(task_id),  # type: ignore[arg-type]
+            planned_orders=planned_orders or [],
+            errors=[str(error)],
+            meta={
+                "order_lifecycle": self._retry_lifecycle_meta(
+                    retry_count=retry_count,
+                    cancelled_order_ids=cancelled_order_ids,
+                    reason=reason,
+                )
+            },
+        )
+        self._attach_current_account_snapshot(
+            failure,
+            task,
+            fallback_account=fallback_account,
+            fallback_positions=fallback_positions,
+            fallback_prices=fallback_prices,
+        )
+        payload = failure.model_dump(mode="json")
+        self.storage.mark_task_result(task_id, "failed", payload)
+        try:
+            self.xquant.report_result(task_id, "failed", failure)
+        except Exception:  # noqa: BLE001 - retry failure is already audited locally
+            logger.exception("failed to report retry failure to Xquant: task_id=%s", task_id)
+        return {
+            "task_id": task_id,
+            "status": "failed",
+            "retry_count": retry_count,
+            "error": str(error),
+        }
 
     def _retry_rebalance_task(
         self,
@@ -608,33 +676,69 @@ class GatewayService:
             logger.error("cannot retry missing task: task_id=%s", task_id)
             return {"task_id": task_id, "status": "missing_task"}
 
-        self.qmt.connect()
-        account = self.qmt.get_account_snapshot()
-        positions = self.qmt.get_positions()
-        symbols = [target.symbol for target in task.targets] + [position.symbol for position in positions]
-        prices = self.qmt.get_prices(symbols)
-        plan = self.portfolio.build_plan(task, account, positions, prices)
-        self.risk.validate(task, account, plan, known_symbols=set(prices))
-        self.storage.record_plan(plan)
-        result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
-        result.meta["order_lifecycle"] = {
-            "retry_count": retry_count + 1,
-            "last_retry_at": datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
-            "cancelled_order_ids": cancelled_order_ids,
-            "reason": reason,
-        }
-        self._attach_current_account_snapshot(
-            result,
-            task,
-            fallback_account=account,
-            fallback_positions=positions,
-            fallback_prices=prices,
-        )
-        self.storage.record_execution_result(result)
-        status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
-        self.storage.mark_task_result(task_id, status, result.model_dump(mode="json"))
-        self.xquant.report_result(task_id, status, result)
-        return {"task_id": task_id, "status": status, "retry_count": retry_count + 1}
+        next_retry_count = retry_count + 1
+        account: AccountSnapshot | None = None
+        positions: list[Position] | None = None
+        prices: dict[str, float] | None = None
+        plan: OrderPlan | None = None
+        try:
+            self.qmt.connect()
+            account = self.qmt.get_account_snapshot()
+            positions = self.qmt.get_positions()
+            symbols = [target.symbol for target in task.targets] + [
+                position.symbol for position in positions
+            ]
+            prices = self.qmt.get_prices(symbols)
+            plan = self.portfolio.build_plan(task, account, positions, prices)
+            lifecycle = self._retry_lifecycle_meta(
+                retry_count=next_retry_count,
+                cancelled_order_ids=cancelled_order_ids,
+                reason=reason,
+            )
+            if plan.orders:
+                self.risk.validate(task, account, plan, known_symbols=set(prices))
+            self.storage.record_plan(plan)
+            self.xquant.report_plan(task_id, plan.model_dump(mode="json"))
+            if not plan.orders:
+                result = ExecutionResult(
+                    task_id=task_id,
+                    status="dry_run_success",
+                    mode=task.mode,
+                    planned_orders=[],
+                    meta={
+                        "order_lifecycle": lifecycle,
+                        "noop_reason": "empty_retry_plan",
+                    },
+                )
+            else:
+                result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
+                result.meta["order_lifecycle"] = lifecycle
+            self._attach_current_account_snapshot(
+                result,
+                task,
+                fallback_account=account,
+                fallback_positions=positions,
+                fallback_prices=prices,
+            )
+            self.storage.record_execution_result(result)
+            status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
+            self.storage.mark_task_result(task_id, status, result.model_dump(mode="json"))
+            self.xquant.report_result(task_id, status, result)
+            return {"task_id": task_id, "status": status, "retry_count": next_retry_count}
+        except Exception as exc:  # noqa: BLE001 - cancelled retries must be audited
+            logger.exception("rebalance retry failed after cancellation: task_id=%s", task_id)
+            return self._record_failed_retry_result(
+                task_id,
+                task=task,
+                planned_orders=plan.orders if plan is not None else None,
+                retry_count=next_retry_count,
+                cancelled_order_ids=cancelled_order_ids,
+                reason=reason,
+                error=exc,
+                fallback_account=account,
+                fallback_positions=positions,
+                fallback_prices=prices,
+            )
 
     def _submitted_order_timed_out(self, task_id: str, now: datetime | None = None) -> bool:
         created_at = self.storage.latest_submitted_order_created_at(task_id)
@@ -750,6 +854,9 @@ class GatewayService:
                     errors=errors,
                     meta={"sync_source": "qmt_query", "sync_summary": sync_summary},
                 )
+                lifecycle = self._stored_order_lifecycle_meta(submitted_task_id)
+                if lifecycle is not None:
+                    result.meta["order_lifecycle"] = lifecycle
                 self._attach_current_account_snapshot(result, self.storage.load_task(submitted_task_id))
                 self.storage.mark_task_result(submitted_task_id, synced_status, result.model_dump(mode="json"))
                 result_item: dict[str, object] = {
