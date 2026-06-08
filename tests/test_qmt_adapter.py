@@ -129,3 +129,46 @@ def test_connect_is_idempotent_after_success(monkeypatch) -> None:
     assert len(created_traders) == 1
     assert created_traders[0].connect_calls == 1
     assert created_traders[0].subscribe_calls == 1
+
+
+def test_cancel_order_accepts_zero_return_code() -> None:
+    class Trader:
+        def __init__(self) -> None:
+            self.cancelled: list[int] = []
+
+        def cancel_order_stock(self, account, order_id):
+            self.cancelled.append(order_id)
+            return 0
+
+    trader = Trader()
+    adapter = QmtAdapter(
+        QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct")
+    )
+    adapter.trader = trader
+    adapter.account = SimpleNamespace(account_id="acct")
+    adapter._connected = True
+
+    adapter.cancel_order("1082169287")
+
+    assert trader.cancelled == [1082169287]
+
+
+@pytest.mark.parametrize("return_code", [-1, 1])
+def test_cancel_order_rejects_nonzero_return_code(return_code: int) -> None:
+    class Trader:
+        def cancel_order_stock(self, account, order_id):
+            return return_code
+
+    adapter = QmtAdapter(
+        QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct")
+    )
+    adapter.trader = Trader()
+    adapter.account = SimpleNamespace(account_id="acct")
+    adapter._connected = True
+
+    with pytest.raises(RuntimeError) as exc:
+        adapter.cancel_order("1082169287")
+
+    message = str(exc.value)
+    assert "order_id=1082169287" in message
+    assert f"return_code={return_code}" in message

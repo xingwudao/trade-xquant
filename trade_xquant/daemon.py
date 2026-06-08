@@ -1170,7 +1170,11 @@ class GatewayService:
             seen_order_ids.add(order_id)
             context = submitted_by_id.get(order_id, order)
             try:
-                self.qmt.cancel_order(order_id)
+                result = self.qmt.cancel_order(order_id)
+                if result not in (None, 0):
+                    raise RuntimeError(
+                        f"cancel_order failed for order_id={order_id}: return_code={result}"
+                    )
                 cancelled.append(order_id)
             except Exception as exc:  # noqa: BLE001 - cancellation failures must be audited
                 errors.append(f"{context.symbol} {context.side} cancel failed: {exc}")

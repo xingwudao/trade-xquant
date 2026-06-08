@@ -132,9 +132,13 @@ class QmtAdapter:
             raise RuntimeError("order_stock returned -1")
         return int(order_id)
 
-    def cancel_order(self, order_id: str) -> Any:
+    def cancel_order(self, order_id: str) -> None:
         self._ensure_connected()
-        return self.trader.cancel_order_stock(self.account, int(order_id))
+        result = self.trader.cancel_order_stock(self.account, int(order_id))
+        if result != 0:
+            raise RuntimeError(
+                f"cancel_order_stock failed for order_id={order_id}: return_code={result}"
+            )
 
     def check_connection(self) -> dict[str, Any]:
         self.connect()

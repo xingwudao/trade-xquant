@@ -460,6 +460,12 @@ class FailingCancelBroker(PendingBroker):
         raise RuntimeError(f"cannot cancel {order_id}")
 
 
+class NonzeroCancelBroker(PendingBroker):
+    def cancel_order(self, order_id: str) -> int:
+        self.cancelled.append(str(order_id))
+        return -1
+
+
 class FailingCancelThenFilledBroker(PendingThenFilledBroker):
     def cancel_order(self, order_id: str) -> None:
         raise RuntimeError(f"cannot cancel {order_id}")
@@ -1810,6 +1816,34 @@ def test_sync_submitted_orders_audits_cancel_failure(tmp_path) -> None:
     assert lifecycle["cancel_errors"] == payload["errors"]
     assert lifecycle["submitted_order_ids"] == ["1082169287"]
     assert service.storage.list_syncable_task_ids(status="submitted") == ["task-1"]
+
+
+def test_sync_submitted_orders_treats_nonzero_cancel_return_as_failure(tmp_path) -> None:
+    broker = NonzeroCancelBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["status"] == "submitted"
+    assert result[-1]["retry_blocked"] is True
+    assert result[-1]["reason"] == "submitted_order_cancel_failed"
+    assert broker.cancelled == ["1082169287"]
+    assert broker.placed == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert payload["submitted_orders"][0]["local_order_id"] == "1082169287"
+    assert "return_code=-1" in payload["errors"][0]
+    lifecycle = payload["meta"]["order_lifecycle"]
+    assert lifecycle["reason"] == "submitted_order_cancel_failed"
+    assert lifecycle["cancelled_order_ids"] == []
 
 
 def test_sync_submitted_orders_cancel_failure_can_later_sync_fill(tmp_path) -> None:
