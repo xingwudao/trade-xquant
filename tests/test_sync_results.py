@@ -1645,7 +1645,7 @@ def test_sync_submitted_orders_audits_retry_failure_after_cancel(tmp_path) -> No
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["status"] == "submitted"
     assert payload["errors"] == ["prices unavailable"]
-    assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+    assert payload["meta"]["order_lifecycle"]["retry_count"] == 0
     assert payload["meta"]["order_lifecycle"]["reason"] == "retry_preflight_failed"
 
 
@@ -1762,6 +1762,43 @@ def test_sync_submitted_orders_preflight_blocked_order_can_later_succeed(tmp_pat
     assert payload["meta"]["order_lifecycle"]["reason"] == "retry_preflight_failed"
 
 
+def test_sync_submitted_orders_preflight_block_does_not_consume_retry_budget(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    expired_task = task()
+    expired_task.expires_at = expired_task.created_at - timedelta(minutes=1)
+    service.storage.record_task_received(expired_task, status="submitted")
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    blocked = service.sync_submitted_orders_once()
+    blocked_payload = service.storage.load_task_result_payload("task-1")
+    service.storage.record_task_received(task(), status="submitted")
+    retried = service.sync_submitted_orders_once()
+
+    assert blocked[-1]["retry_blocked"] is True
+    assert blocked_payload["status"] == "submitted"
+    assert blocked_payload["meta"]["order_lifecycle"]["retry_count"] == 0
+    assert blocked_payload["meta"]["order_lifecycle"]["reason"] == "retry_preflight_failed"
+    assert broker.cancelled == ["1082169287"]
+    assert len(broker.placed) == 1
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+    assert payload["meta"]["order_lifecycle"]["reason"] == "submitted_order_timeout"
+    assert retried[-1]["retry_count"] == 1
+
+
 def test_sync_submitted_orders_audits_retry_report_failure(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
     broker = PendingBroker()
@@ -1842,7 +1879,7 @@ def test_sync_submitted_orders_validates_empty_retry_plan(tmp_path) -> None:
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["status"] == "submitted"
     assert payload["errors"] == ["real order disabled by config"]
-    assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+    assert payload["meta"]["order_lifecycle"]["retry_count"] == 0
     assert payload["meta"]["order_lifecycle"]["reason"] == "retry_preflight_failed"
 
 

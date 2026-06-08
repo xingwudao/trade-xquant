@@ -893,7 +893,7 @@ class GatewayService:
                 "task_id": task_id,
                 "status": "submitted",
                 "retry_blocked": True,
-                "retry_count": retry_count + 1,
+                "retry_count": retry_count,
                 "reason": "retry_preflight_failed",
                 "error": str(exc),
             }
