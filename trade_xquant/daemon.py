@@ -559,8 +559,8 @@ class GatewayService:
             logger.info(
                 "submitted order timeout handled: task_id=%s cancelled=%s errors=%s",
                 task_id,
-                len(cancelled),
-                len(errors),
+                cancelled,
+                errors,
             )
         return results
 

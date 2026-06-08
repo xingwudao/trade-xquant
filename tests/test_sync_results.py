@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import closing
 from types import SimpleNamespace
 
@@ -863,7 +864,7 @@ def test_sync_submitted_orders_keeps_fresh_pending_order(tmp_path) -> None:
     assert broker.placed == []
 
 
-def test_sync_submitted_orders_cancels_timed_out_pending_order(tmp_path) -> None:
+def test_sync_submitted_orders_cancels_timed_out_pending_order(tmp_path, caplog) -> None:
     broker = PendingBroker()
     service = make_service_with_result(
         tmp_path,
@@ -874,11 +875,13 @@ def test_sync_submitted_orders_cancels_timed_out_pending_order(tmp_path) -> None
     service.settings.runtime.submitted_order_timeout_seconds = 0
     service.settings.runtime.max_rebalance_retries = 0
 
-    result = service.sync_submitted_orders_once()
+    with caplog.at_level(logging.INFO, logger="trade_xquant.daemon"):
+        result = service.sync_submitted_orders_once()
 
     assert result == [{"task_id": "task-1", "status": "submitted"}]
     assert broker.cancelled == ["1082169287"]
     assert broker.placed == []
+    assert "1082169287" in caplog.text
 
 
 def test_sync_submitted_orders_once_reconciles_pre_existing_partial_result(tmp_path) -> None:
