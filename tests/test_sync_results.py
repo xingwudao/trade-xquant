@@ -201,6 +201,34 @@ class SnapshotBroker(FilledBroker):
         return {symbol: 2.0 for symbol in symbols}
 
 
+class PendingBroker(SnapshotBroker):
+    def __init__(self) -> None:
+        self.cancelled: list[str] = []
+        self.placed: list[PlannedOrder] = []
+
+    def get_orders(self):
+        return [
+            SimpleNamespace(
+                order_id=1082169287,
+                stock_code="513100.SH",
+                order_status=50,
+                traded_volume=0,
+                price=1.0,
+                m_strRemark="task-1",
+            )
+        ]
+
+    def get_trades(self):
+        return []
+
+    def cancel_order(self, order_id: str) -> None:
+        self.cancelled.append(str(order_id))
+
+    def place_order(self, order: PlannedOrder):
+        self.placed.append(order)
+        return {"order_id": f"retry-{len(self.placed)}"}
+
+
 def task() -> RebalanceTask:
     return RebalanceTask.model_validate(
         {
@@ -816,6 +844,23 @@ def test_sync_submitted_orders_once_does_not_resync_new_partial_result(tmp_path)
     assert [(task_id, status) for task_id, status, _ in service.xquant.results] == [  # type: ignore[attr-defined]
         ("task-1", "partial")
     ]
+
+
+def test_sync_submitted_orders_keeps_fresh_pending_order(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 3600
+
+    result = service.sync_submitted_orders_once()
+
+    assert result == [{"task_id": "task-1", "status": "submitted"}]
+    assert broker.cancelled == []
+    assert broker.placed == []
 
 
 def test_sync_submitted_orders_once_reconciles_pre_existing_partial_result(tmp_path) -> None:
