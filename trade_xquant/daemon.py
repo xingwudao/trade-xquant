@@ -562,9 +562,13 @@ class GatewayService:
                 for order in payload.get("submitted_orders", [])
                 if isinstance(order, dict)
             ]
+            current_pending_orders = self._current_pending_synced_orders(
+                payload,
+                synced_orders,
+            )
             cancelled, errors = self._cancel_pending_submitted_orders(
                 submitted_orders,
-                synced_orders,
+                current_pending_orders,
             )
             logger.info(
                 "submitted order timeout handled: task_id=%s cancelled=%s errors=%s",
@@ -880,20 +884,52 @@ class GatewayService:
             current.astimezone(submitted_at.tzinfo) - submitted_at
         ).total_seconds() >= self.settings.runtime.submitted_order_timeout_seconds
 
+    def _current_pending_synced_orders(
+        self,
+        payload: dict[str, object],
+        synced_orders: list[SubmittedOrder],
+    ) -> list[SubmittedOrder]:
+        pending_orders = [
+            order
+            for order in synced_orders
+            if order.status in {"submitted", "partial"}
+        ]
+        current_order_ids: set[str] = set()
+        events = payload.get("events") if isinstance(payload, dict) else []
+        if isinstance(events, list):
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                order_id = event.get("order_id")
+                if order_id not in (None, ""):
+                    current_order_ids.add(str(order_id))
+                event_payload = event.get("payload")
+                if isinstance(event_payload, dict):
+                    current_order_ids.update(_payload_order_ids(event_payload))
+        if not current_order_ids:
+            return pending_orders
+        return [
+            order
+            for order in pending_orders
+            if str(order.local_order_id or order.broker_order_id or "") in current_order_ids
+        ]
+
     def _cancel_pending_submitted_orders(
         self,
         submitted_orders: list,
         synced_orders: list,
     ) -> tuple[list[str], list[str]]:
-        synced_by_id = {
+        submitted_by_id = {
             str(order.local_order_id or order.broker_order_id): order
-            for order in synced_orders
+            for order in submitted_orders
             if order.local_order_id or order.broker_order_id
         }
         cancelled: list[str] = []
         errors: list[str] = []
         seen_order_ids: set[str] = set()
-        for order in submitted_orders:
+        for order in synced_orders:
+            if order.status not in {"submitted", "partial"}:
+                continue
             order_id = str(order.local_order_id or order.broker_order_id or "")
             if not order_id:
                 errors.append(f"{order.symbol} {order.side} missing order id for cancel")
@@ -901,14 +937,12 @@ class GatewayService:
             if order_id in seen_order_ids:
                 continue
             seen_order_ids.add(order_id)
-            synced = synced_by_id.get(order_id)
-            if synced is not None and synced.status not in {"submitted", "partial"}:
-                continue
+            context = submitted_by_id.get(order_id, order)
             try:
                 self.qmt.cancel_order(order_id)
                 cancelled.append(order_id)
             except Exception as exc:  # noqa: BLE001 - cancellation failures must be audited
-                errors.append(f"{order.symbol} {order.side} cancel failed: {exc}")
+                errors.append(f"{context.symbol} {context.side} cancel failed: {exc}")
         return cancelled, errors
 
     def sync_results(self, task_id: str | None = None, status: str = "all") -> list[dict[str, object]]:
