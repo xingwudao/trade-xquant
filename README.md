@@ -416,6 +416,27 @@ runtime:
   poll_interval_seconds: 30
 ```
 
+订单生命周期同步相关默认值：
+
+```yaml
+runtime:
+  order_sync_interval_seconds: 30
+  submitted_order_timeout_seconds: 180
+  max_rebalance_retries: 3
+```
+
+daemon 会按 `runtime.order_sync_interval_seconds` 周期同步
+`submitted` 和 `partial` 状态的 QMT 委托。全部成交后任务成功；
+部分成交会保留为 `partial` 并继续同步；仍未成交会保持 `submitted`。
+超过 `runtime.submitted_order_timeout_seconds` 后，只把 QMT 当前仍 pending
+的订单作为撤单候选。撤单成功后，daemon 会重新刷新账户、持仓和价格，
+在 `runtime.max_rebalance_retries` 预算内按原目标权重继续调仓；
+撤单失败不会重试。
+
+如果风控或 preflight 拦截后本地仍有 live pending 订单，
+这些订单会继续可同步，不会被隐藏。condition task retry 的结果通过
+condition result path 上报。
+
 建议使用受控终端、Windows 服务包装器或进程管理器运行，并保留 `logs/`。
 
 ## 查看本地状态
