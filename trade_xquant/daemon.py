@@ -576,6 +576,8 @@ class GatewayService:
                 continue
             preflight = self._preflight_retry_rebalance_task(task_id)
             if preflight.get("status") != "ok":
+                if preflight.get("retry_blocked"):
+                    preflight = self._record_retry_blocked_result(task_id, preflight)
                 results.append(preflight)
                 continue
             cancelled, errors = self._cancel_pending_submitted_orders(
@@ -818,20 +820,55 @@ class GatewayService:
             "error": str(error),
         }
 
+    def _record_retry_blocked_result(
+        self,
+        task_id: str,
+        blocked: dict[str, object],
+    ) -> dict[str, object]:
+        payload = self.storage.load_task_result_payload(task_id) or {}
+        if not isinstance(payload, dict):
+            return blocked
+        status = str(payload.get("status") or "submitted")
+        meta = payload.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+            payload["meta"] = meta
+        retry_count = blocked.get("retry_count", self._retry_count(task_id))
+        try:
+            retry_count = int(retry_count)
+        except (TypeError, ValueError):
+            retry_count = self._retry_count(task_id)
+        meta["order_lifecycle"] = self._retry_lifecycle_meta(
+            task_id,
+            retry_count=retry_count,
+            cancelled_order_ids=[],
+            reason=str(blocked.get("reason") or "retry_preflight_failed"),
+        )
+        error = blocked.get("error")
+        if error:
+            payload["errors"] = [str(error)]
+        self.storage.mark_task_result(task_id, status, payload)
+        return {
+            "task_id": task_id,
+            "status": status,
+            "retry_blocked": True,
+            "reason": meta["order_lifecycle"]["reason"],
+            "error": str(error) if error else None,
+        }
+
     def _preflight_retry_rebalance_task(self, task_id: str) -> dict[str, object]:
         retry_count = self._retry_count(task_id)
         task = self.storage.load_task(task_id)
         if retry_count >= self.settings.runtime.max_rebalance_retries:
             logger.info("rebalance retry budget exhausted before cancellation: task_id=%s", task_id)
-            return self._record_failed_retry_result(
-                task_id,
-                task=task,
-                planned_orders=None,
-                retry_count=retry_count,
-                cancelled_order_ids=[],
-                reason="retry_budget_exhausted",
-                error=RuntimeError("retry budget exhausted"),
-            )
+            return {
+                "task_id": task_id,
+                "status": "submitted",
+                "retry_blocked": True,
+                "retry_count": retry_count,
+                "reason": "retry_budget_exhausted",
+                "error": "retry budget exhausted",
+            }
         if task is None:
             logger.error("cannot preflight missing task: task_id=%s", task_id)
             return {"task_id": task_id, "status": "missing_task"}
@@ -852,18 +889,14 @@ class GatewayService:
             self.risk.validate(task, account, plan, known_symbols=set(prices))
         except Exception as exc:  # noqa: BLE001 - pre-cancel guard must be audited
             logger.exception("retry preflight failed before cancellation: task_id=%s", task_id)
-            return self._record_failed_retry_result(
-                task_id,
-                task=task,
-                planned_orders=plan.orders if plan is not None else None,
-                retry_count=retry_count + 1,
-                cancelled_order_ids=[],
-                reason="retry_preflight_failed",
-                error=exc,
-                fallback_account=account,
-                fallback_positions=positions,
-                fallback_prices=prices,
-            )
+            return {
+                "task_id": task_id,
+                "status": "submitted",
+                "retry_blocked": True,
+                "retry_count": retry_count + 1,
+                "reason": "retry_preflight_failed",
+                "error": str(exc),
+            }
         return {"task_id": task_id, "status": "ok"}
 
     def _record_cancel_failure_result(
