@@ -31,6 +31,9 @@ class QmtConfig(BaseModel):
 class RuntimeConfig(BaseModel):
     poll_interval_seconds: int = 30
     condition_poll_interval_seconds: int = 3
+    order_sync_interval_seconds: int = 30
+    submitted_order_timeout_seconds: int = 180
+    max_rebalance_retries: int = 3
     allow_real_order: bool = False
     dry_run_default: bool = True
     broker_adapter: str = "qmt"

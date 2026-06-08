@@ -153,3 +153,16 @@ def test_heartbeat_command_uploads_holdings_when_qmt_connected(tmp_path) -> None
             "target_weight": None,
         }
     ]
+
+
+def test_runtime_config_includes_order_lifecycle_defaults(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path)
+
+    from trade_xquant.config import load_settings
+
+    settings = load_settings(config_path)
+
+    assert settings.runtime.order_sync_interval_seconds == 30
+    assert settings.runtime.submitted_order_timeout_seconds == 180
+    assert settings.runtime.max_rebalance_retries == 3
