@@ -1626,6 +1626,45 @@ def test_sync_results_preserves_order_lifecycle_retry_count(tmp_path, monkeypatc
     assert payload["meta"]["sync_source"] == "qmt_query"
 
 
+def test_sync_results_persisted_retry_budget_blocks_new_retry(tmp_path) -> None:
+    broker = PendingBroker()
+    result = submitted_result()
+    result.meta["order_lifecycle"] = {"retry_count": 1}
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=result,
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+
+    refreshed = service.sync_results(task_id="task-1", status="submitted")
+
+    assert refreshed == [{"task_id": "task-1", "status": "submitted"}]
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["meta"]["sync_source"] == "qmt_query"
+    assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+
+    blocked = service.sync_submitted_orders_once()
+
+    assert blocked[0] == {"task_id": "task-1", "status": "submitted"}
+    assert blocked[-1]["status"] == "submitted"
+    assert blocked[-1]["retry_blocked"] is True
+    assert blocked[-1]["reason"] == "retry_budget_exhausted"
+    assert blocked[-1]["error"] == "retry budget exhausted"
+    assert broker.cancelled == []
+    assert broker.placed == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert payload["submitted_orders"][0]["status"] == "submitted"
+    assert payload["errors"] == ["retry budget exhausted"]
+    assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+    assert payload["meta"]["order_lifecycle"]["reason"] == "retry_budget_exhausted"
+    assert payload["meta"]["order_lifecycle"]["cancelled_order_ids"] == []
+    assert service.storage.list_syncable_task_ids(status="submitted") == ["task-1"]
+
+
 def test_sync_submitted_orders_audits_retry_failure_after_cancel(tmp_path) -> None:
     broker = FailingPricesBroker()
     service = make_service_with_result(
