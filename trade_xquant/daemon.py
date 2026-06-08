@@ -928,25 +928,43 @@ class GatewayService:
         cancelled_order_ids: list[str],
         cancel_errors: list[str],
     ) -> dict[str, object]:
-        task = self.storage.load_task(task_id)
         submitted_order_ids = [
             str(order.local_order_id or order.broker_order_id)
             for order in self.storage.load_submitted_orders(task_id)
             if order.local_order_id or order.broker_order_id
         ]
-        return self._record_failed_retry_result(
+        payload = self.storage.load_task_result_payload(task_id) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        status = str(payload.get("status") or "submitted")
+        if status not in {"submitted", "partial"}:
+            status = "submitted"
+        payload["status"] = status
+        payload["errors"] = list(cancel_errors)
+        meta = payload.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+            payload["meta"] = meta
+        retry_count = self._retry_count(task_id)
+        meta["order_lifecycle"] = self._retry_lifecycle_meta(
             task_id,
-            task=task,
-            planned_orders=self.storage.load_planned_orders(task_id),
-            retry_count=self._retry_count(task_id),
+            retry_count=retry_count,
             cancelled_order_ids=cancelled_order_ids,
             reason="submitted_order_cancel_failed",
-            error=RuntimeError("; ".join(cancel_errors)),
             extra_lifecycle={
                 "cancel_errors": cancel_errors,
                 "submitted_order_ids": submitted_order_ids,
             },
         )
+        self.storage.mark_task_result(task_id, status, payload)
+        return {
+            "task_id": task_id,
+            "status": status,
+            "retry_blocked": True,
+            "retry_count": retry_count,
+            "reason": "submitted_order_cancel_failed",
+            "error": "; ".join(cancel_errors),
+        }
 
     def _retry_rebalance_task(
         self,

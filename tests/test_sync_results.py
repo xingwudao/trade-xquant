@@ -460,6 +460,11 @@ class FailingCancelBroker(PendingBroker):
         raise RuntimeError(f"cannot cancel {order_id}")
 
 
+class FailingCancelThenFilledBroker(PendingThenFilledBroker):
+    def cancel_order(self, order_id: str) -> None:
+        raise RuntimeError(f"cannot cancel {order_id}")
+
+
 class FailingPricesBroker(PendingBroker):
     def get_prices(self, symbols):
         raise RuntimeError("prices unavailable")
@@ -1625,7 +1630,7 @@ def test_sync_submitted_orders_stale_original_event_does_not_cancel_again(
     assert lifecycle["cancelled_order_ids_history"] == ["1082169287", "retry-1"]
 
 
-def test_sync_submitted_orders_terminal_failure_preserves_cancel_history(
+def test_sync_submitted_orders_cancel_failure_preserves_cancel_history(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1644,14 +1649,20 @@ def test_sync_submitted_orders_terminal_failure_preserves_cancel_history(
     service.sync_submitted_orders_once()
     result = service.sync_submitted_orders_once()
 
-    assert result[-1]["status"] == "failed"
+    assert result[-1]["status"] == "submitted"
+    assert result[-1]["retry_blocked"] is True
     assert broker.cancelled == ["1082169287"]
     assert len(broker.placed) == 1
     payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert payload["submitted_orders"][0]["local_order_id"] == "retry-1"
+    assert len(payload["errors"]) == 1
+    assert "cannot cancel retry-1" in payload["errors"][0]
     lifecycle = payload["meta"]["order_lifecycle"]
     assert lifecycle["reason"] == "submitted_order_cancel_failed"
     assert lifecycle["cancelled_order_ids"] == []
     assert lifecycle["cancelled_order_ids_history"] == ["1082169287"]
+    assert lifecycle["cancel_errors"] == payload["errors"]
 
 
 def test_sync_results_preserves_order_lifecycle_retry_count(tmp_path, monkeypatch) -> None:
@@ -1782,12 +1793,15 @@ def test_sync_submitted_orders_audits_cancel_failure(tmp_path) -> None:
 
     result = service.sync_submitted_orders_once()
 
-    assert result[-1]["status"] == "failed"
+    assert result[-1]["status"] == "submitted"
+    assert result[-1]["retry_blocked"] is True
     assert result[-1]["retry_count"] == 0
     assert "cancel failed" in result[-1]["error"]
     assert broker.placed == []
     payload = service.storage.load_task_result_payload("task-1")
-    assert payload["status"] == "failed"
+    assert payload["status"] == "submitted"
+    assert payload["submitted_orders"][0]["local_order_id"] == "1082169287"
+    assert payload["submitted_orders"][0]["status"] == "submitted"
     assert "cancel failed" in payload["errors"][0]
     lifecycle = payload["meta"]["order_lifecycle"]
     assert lifecycle["retry_count"] == 0
@@ -1795,7 +1809,34 @@ def test_sync_submitted_orders_audits_cancel_failure(tmp_path) -> None:
     assert lifecycle["cancelled_order_ids"] == []
     assert lifecycle["cancel_errors"] == payload["errors"]
     assert lifecycle["submitted_order_ids"] == ["1082169287"]
-    assert service.xquant.results[-1][1] == "failed"  # type: ignore[attr-defined]
+    assert service.storage.list_syncable_task_ids(status="submitted") == ["task-1"]
+
+
+def test_sync_submitted_orders_cancel_failure_can_later_sync_fill(tmp_path) -> None:
+    broker = FailingCancelThenFilledBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    blocked = service.sync_submitted_orders_once()
+    broker.filled = True
+    result = service.sync_results(status="submitted")
+
+    assert blocked[-1]["status"] == "submitted"
+    assert blocked[-1]["retry_blocked"] is True
+    assert broker.placed == []
+    assert result == [{"task_id": "task-1", "status": "success"}]
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "success"
+    assert payload["submitted_orders"][0]["local_order_id"] == "1082169287"
+    assert payload["submitted_orders"][0]["status"] == "filled"
+    assert payload["meta"]["order_lifecycle"]["reason"] == "submitted_order_cancel_failed"
 
 
 def test_sync_submitted_orders_preflight_rejects_before_cancel(tmp_path) -> None:
