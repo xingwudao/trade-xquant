@@ -30,6 +30,7 @@ from trade_xquant.models import (
     OrderPlan,
     Position,
     RebalanceTask,
+    SubmittedOrder,
     TargetPosition,
 )
 from trade_xquant.mock_qmt_adapter import MockBrokerAdapter
@@ -537,7 +538,70 @@ class GatewayService:
         results = self.sync_results(status="submitted")
         for partial_task_id in partial_task_ids:
             results.extend(self.sync_results(task_id=partial_task_id, status="partial"))
+        for result_item in results:
+            task_id = str(result_item.get("task_id") or "")
+            status = str(result_item.get("status") or "")
+            if status not in {"submitted", "partial"}:
+                continue
+            if not self._submitted_order_timed_out(task_id):
+                continue
+            submitted_orders = self.storage.load_submitted_orders(task_id)
+            payload = self.storage.load_task_result_payload(task_id) or {}
+            synced_orders = [
+                SubmittedOrder.model_validate(order)
+                for order in payload.get("submitted_orders", [])
+                if isinstance(order, dict)
+            ]
+            cancelled, errors = self._cancel_pending_submitted_orders(
+                submitted_orders,
+                synced_orders,
+            )
+            logger.info(
+                "submitted order timeout handled: task_id=%s cancelled=%s errors=%s",
+                task_id,
+                len(cancelled),
+                len(errors),
+            )
         return results
+
+    def _submitted_order_timed_out(self, task_id: str, now: datetime | None = None) -> bool:
+        created_at = self.storage.latest_submitted_order_created_at(task_id)
+        if not created_at:
+            return False
+        submitted_at = datetime.fromisoformat(created_at)
+        current = now or datetime.now(ZoneInfo(self.settings.risk.timezone))
+        if submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=ZoneInfo(self.settings.risk.timezone))
+        return (
+            current.astimezone(submitted_at.tzinfo) - submitted_at
+        ).total_seconds() >= self.settings.runtime.submitted_order_timeout_seconds
+
+    def _cancel_pending_submitted_orders(
+        self,
+        submitted_orders: list,
+        synced_orders: list,
+    ) -> tuple[list[str], list[str]]:
+        synced_by_id = {
+            str(order.local_order_id or order.broker_order_id): order
+            for order in synced_orders
+            if order.local_order_id or order.broker_order_id
+        }
+        cancelled: list[str] = []
+        errors: list[str] = []
+        for order in submitted_orders:
+            order_id = str(order.local_order_id or order.broker_order_id or "")
+            if not order_id:
+                errors.append(f"{order.symbol} {order.side} missing order id for cancel")
+                continue
+            synced = synced_by_id.get(order_id)
+            if synced is not None and synced.status == "filled":
+                continue
+            try:
+                self.qmt.cancel_order(order_id)
+                cancelled.append(order_id)
+            except Exception as exc:  # noqa: BLE001 - cancellation failures must be audited
+                errors.append(f"{order.symbol} {order.side} cancel failed: {exc}")
+        return cancelled, errors
 
     def sync_results(self, task_id: str | None = None, status: str = "all") -> list[dict[str, object]]:
         self.storage.initialize()
