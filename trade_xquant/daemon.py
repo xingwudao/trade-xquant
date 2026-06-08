@@ -541,9 +541,14 @@ class GatewayService:
     def sync_submitted_orders_once(self) -> list[dict[str, object]]:
         self.storage.initialize()
         partial_task_ids = self.storage.list_syncable_task_ids(status="partial")
-        results = self.sync_results(status="submitted")
+        results = self._sync_results_or_report_failures(status="submitted")
         for partial_task_id in partial_task_ids:
-            results.extend(self.sync_results(task_id=partial_task_id, status="partial"))
+            results.extend(
+                self._sync_results_or_report_failures(
+                    task_id=partial_task_id,
+                    status="partial",
+                )
+            )
         for result_item in list(results):
             task_id = str(result_item.get("task_id") or "")
             status = str(result_item.get("status") or "")
@@ -599,6 +604,16 @@ class GatewayService:
                 )
                 results.append(retry_result)
         return results
+
+    def _sync_results_or_report_failures(
+        self,
+        task_id: str | None = None,
+        status: str = "all",
+    ) -> list[dict[str, object]]:
+        try:
+            return self.sync_results(task_id=task_id, status=status)
+        except GatewaySyncReportError as exc:
+            return exc.results
 
     def _order_lifecycle_meta(self, task_id: str) -> dict[str, object]:
         lifecycle = self._stored_order_lifecycle_meta(task_id)
@@ -862,7 +877,8 @@ class GatewayService:
                 fallback_prices=prices,
             )
             self.storage.record_execution_result(result)
-            status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
+            status = self._retry_result_status(result)
+            result.status = status
             self.storage.mark_task_result(task_id, status, result.model_dump(mode="json"))
         except Exception as exc:  # noqa: BLE001 - cancelled retries must be audited
             logger.exception("rebalance retry failed after cancellation: task_id=%s", task_id)
@@ -897,6 +913,17 @@ class GatewayService:
                 "hint": _xquant_report_error_hint(exc) if isinstance(exc, XquantAdapterError) else None,
             }
         return {"task_id": task_id, "status": status, "retry_count": next_retry_count}
+
+    def _retry_result_status(self, result: ExecutionResult) -> str:
+        if result.status in {"dry_run_success", "submitted"}:
+            return result.status
+        has_live_submitted_orders = any(
+            order.status in {"submitted", "partial"}
+            for order in result.submitted_orders
+        )
+        if has_live_submitted_orders:
+            return "partial" if result.errors else "submitted"
+        return "failed"
 
     def _submitted_order_timed_out(self, task_id: str, now: datetime | None = None) -> bool:
         created_at = self.storage.latest_submitted_order_created_at(task_id)

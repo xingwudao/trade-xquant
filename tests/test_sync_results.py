@@ -68,6 +68,21 @@ class FailingSecondResultXquant(FakeXquant):
         )
 
 
+class FailingFirstResultXquant(FakeXquant):
+    def __init__(self) -> None:
+        super().__init__()
+        self.report_attempts = 0
+
+    def report_result(self, task_id: str, status: str, payload) -> None:
+        self.report_attempts += 1
+        if self.report_attempts == 1:
+            raise XquantAdapterError(
+                'Xquant API error 409: {"detail":"invalid_task_transition"}',
+                status_code=409,
+            )
+        return super().report_result(task_id, status, payload)
+
+
 class ConflictXquant:
     def report_result(self, task_id: str, status: str, payload) -> None:
         raise XquantAdapterError(
@@ -328,6 +343,13 @@ class FailingCancelBroker(PendingBroker):
 class FailingPricesBroker(PendingBroker):
     def get_prices(self, symbols):
         raise RuntimeError("prices unavailable")
+
+
+class MixedRetryPlacementBroker(PendingBroker):
+    def place_order(self, order: PlannedOrder):
+        if self.placed:
+            raise RuntimeError(f"cannot place {order.symbol}")
+        return super().place_order(order)
 
 
 def submitted_order_with_id(order_id: str | None, *, status: str = "submitted") -> SubmittedOrder:
@@ -1089,6 +1111,75 @@ def test_sync_submitted_orders_retries_after_timeout_cancel(tmp_path, monkeypatc
     assert len(broker.placed) == 1
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+
+
+def test_sync_submitted_orders_continues_after_initial_report_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.xquant = FailingFirstResultXquant()  # type: ignore[assignment]
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[0]["xquant_synced"] is False
+    assert result[0]["status_code"] == 409
+    assert result[-1]["status"] == "submitted"
+    assert broker.cancelled == ["1082169287"]
+    assert len(broker.placed) == 1
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert payload["submitted_orders"][0]["local_order_id"] == "retry-1"
+
+
+def test_sync_submitted_orders_keeps_mixed_retry_submission_syncable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = MixedRetryPlacementBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    retry_task = RebalanceTask.model_validate(
+        {
+            **task().model_dump(),
+            "targets": [
+                {"symbol": "510300.SH", "target_weight": 0.5},
+                {"symbol": "513100.SH", "target_weight": 0.5},
+            ],
+        }
+    )
+    service.storage.record_task_received(retry_task, status="submitted")
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+    service.settings.risk.max_single_order_amount = 100_000
+    service.settings.risk.max_turnover_ratio = 1.0
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["status"] == "partial"
+    assert broker.cancelled == ["1082169287"]
+    assert len(broker.placed) == 1
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "partial"
+    assert payload["submitted_orders"][0]["local_order_id"] == "retry-1"
+    assert payload["errors"]
+    assert service.storage.list_syncable_task_ids(status="partial") == ["task-1"]
 
 
 def test_sync_submitted_orders_does_not_cancel_without_current_qmt_order(
