@@ -1212,13 +1212,13 @@ class GatewayService:
                 self._refresh_condition_orders_for_task(submitted_task_id)
                 try:
                     self.xquant.report_result(submitted_task_id, synced_status, result)
-                except XquantAdapterError as exc:
+                except Exception as exc:  # noqa: BLE001 - local sync must survive report transport failures
                     result_item.update(
                         {
                             "xquant_synced": False,
-                            "status_code": exc.status_code,
+                            "status_code": exc.status_code if isinstance(exc, XquantAdapterError) else None,
                             "error": str(exc),
-                            "hint": _xquant_report_error_hint(exc),
+                            "hint": _xquant_report_error_hint(exc) if isinstance(exc, XquantAdapterError) else None,
                             "sync_summary": sync_summary,
                         }
                     )

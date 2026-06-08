@@ -83,6 +83,18 @@ class FailingFirstResultXquant(FakeXquant):
         return super().report_result(task_id, status, payload)
 
 
+class RuntimeFailingFirstResultXquant(FakeXquant):
+    def __init__(self) -> None:
+        super().__init__()
+        self.report_attempts = 0
+
+    def report_result(self, task_id: str, status: str, payload) -> None:
+        self.report_attempts += 1
+        if self.report_attempts == 1:
+            raise RuntimeError("network unavailable")
+        return super().report_result(task_id, status, payload)
+
+
 class FailingFirstFailedResultXquant(FakeXquant):
     def __init__(self) -> None:
         super().__init__()
@@ -1287,6 +1299,37 @@ def test_sync_submitted_orders_continues_after_initial_report_failure(
 
     assert result[0]["xquant_synced"] is False
     assert result[0]["status_code"] == 409
+    assert result[-1]["status"] == "submitted"
+    assert broker.cancelled == ["1082169287"]
+    assert len(broker.placed) == 1
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert payload["submitted_orders"][0]["local_order_id"] == "retry-1"
+
+
+def test_sync_submitted_orders_continues_after_initial_runtime_report_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.xquant = RuntimeFailingFirstResultXquant()  # type: ignore[assignment]
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[0]["xquant_synced"] is False
+    assert result[0]["status_code"] is None
+    assert result[0]["hint"] is None
+    assert result[0]["error"] == "network unavailable"
     assert result[-1]["status"] == "submitted"
     assert broker.cancelled == ["1082169287"]
     assert len(broker.placed) == 1
