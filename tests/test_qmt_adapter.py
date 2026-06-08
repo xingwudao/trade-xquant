@@ -81,3 +81,51 @@ def test_subscribe_failure_message_includes_result_and_account_diagnostics(monke
     assert "subscribe_result=-1" in message
     assert "wrong-acct" in message
     assert "actual-acct" in message
+
+
+def test_connect_is_idempotent_after_success(monkeypatch) -> None:
+    created_traders = []
+
+    class Trader:
+        def __init__(self, path, session_id):
+            self.path = path
+            self.session_id = session_id
+            self.connect_calls = 0
+            self.subscribe_calls = 0
+            created_traders.append(self)
+
+        def register_callback(self, callback):
+            self.callback = callback
+
+        def start(self):
+            pass
+
+        def connect(self):
+            self.connect_calls += 1
+            return 0
+
+        def subscribe(self, account):
+            self.subscribe_calls += 1
+            return 0
+
+    class Callback:
+        pass
+
+    class Account:
+        def __init__(self, account_id):
+            self.account_id = account_id
+
+    monkeypatch.setattr(
+        "trade_xquant.qmt_adapter.load_xtquant",
+        lambda: (Trader, Callback, Account),
+    )
+    adapter = QmtAdapter(
+        QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct")
+    )
+
+    adapter.connect()
+    adapter.connect()
+
+    assert len(created_traders) == 1
+    assert created_traders[0].connect_calls == 1
+    assert created_traders[0].subscribe_calls == 1

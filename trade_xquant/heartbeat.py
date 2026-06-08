@@ -6,6 +6,10 @@ from typing import Any
 
 from trade_xquant.models import AccountSnapshot, Position, RebalanceTask
 
+MAX_HEARTBEAT_ERROR_LENGTH = 1024
+_ERROR_SEPARATOR = "; "
+_TRUNCATION_PREFIX = "... "
+
 
 @dataclass(frozen=True)
 class QmtHeartbeatStatus:
@@ -30,7 +34,7 @@ def check_qmt_connection_for_heartbeat(
         return QmtHeartbeatStatus(
             qmt_connected=True,
             snapshot=snapshot,
-            last_error=last_error,
+            last_error=normalize_heartbeat_error(last_error),
         )
     except Exception as exc:  # noqa: BLE001 - heartbeat must still reach Xquant
         if logger is not None:
@@ -104,4 +108,39 @@ def xtquant_importable() -> bool:
 
 
 def append_heartbeat_error(last_error: str | None, error: str) -> str:
-    return f"{last_error}; {error}" if last_error else error
+    error = error.strip()
+    if not error:
+        return normalize_heartbeat_error(last_error) or ""
+    parts = _error_parts(last_error)
+    if not parts or parts[-1] != error:
+        parts.append(error)
+    return _cap_heartbeat_error(_ERROR_SEPARATOR.join(parts))
+
+
+def normalize_heartbeat_error(last_error: str | None) -> str | None:
+    if last_error is None:
+        return None
+    parts = _error_parts(last_error)
+    if not parts:
+        return None
+    return _cap_heartbeat_error(_ERROR_SEPARATOR.join(parts))
+
+
+def _error_parts(last_error: str | None) -> list[str]:
+    if not last_error:
+        return []
+    parts: list[str] = []
+    for raw_part in last_error.split(_ERROR_SEPARATOR):
+        part = raw_part.strip()
+        if part and (not parts or parts[-1] != part):
+            parts.append(part)
+    return parts
+
+
+def _cap_heartbeat_error(value: str) -> str:
+    if len(value) <= MAX_HEARTBEAT_ERROR_LENGTH:
+        return value
+    tail_length = MAX_HEARTBEAT_ERROR_LENGTH - len(_TRUNCATION_PREFIX)
+    if tail_length <= 0:
+        return value[-MAX_HEARTBEAT_ERROR_LENGTH:]
+    return f"{_TRUNCATION_PREFIX}{value[-tail_length:]}"

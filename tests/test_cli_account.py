@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 
 from trade_xquant.cli import heartbeat_command, register_account_command
+from trade_xquant.heartbeat import MAX_HEARTBEAT_ERROR_LENGTH, append_heartbeat_error
 from trade_xquant.models import AccountSnapshot, Position
 
 
@@ -64,6 +65,27 @@ def test_heartbeat_command_posts_status(tmp_path) -> None:
     assert result["ok"] is True
     assert seen[0]["qmt_connected"] is False
     assert "heartbeat qmt check failed" in seen[0]["last_error"]
+    assert len(seen[0]["last_error"]) <= MAX_HEARTBEAT_ERROR_LENGTH
+
+
+def test_append_heartbeat_error_deduplicates_consecutive_errors() -> None:
+    error = "QMT connect failed"
+
+    last_error = error
+    for _ in range(10):
+        last_error = append_heartbeat_error(last_error, error)
+
+    assert last_error == error
+
+
+def test_append_heartbeat_error_caps_payload_length() -> None:
+    last_error = None
+    for index in range(200):
+        last_error = append_heartbeat_error(last_error, f"error-{index:03d}-" + "x" * 40)
+
+    assert last_error is not None
+    assert len(last_error) <= MAX_HEARTBEAT_ERROR_LENGTH
+    assert "error-199" in last_error
 
 
 class FailingBroker:

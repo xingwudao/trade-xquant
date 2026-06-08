@@ -19,6 +19,7 @@ from trade_xquant.config import Settings
 from trade_xquant.execution_engine import ExecutionEngine
 from trade_xquant.heartbeat import (
     account_result_snapshot,
+    append_heartbeat_error,
     check_qmt_connection_for_heartbeat,
     xtquant_importable,
 )
@@ -1253,4 +1254,4 @@ def _normalize_trade_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _append_error(last_error: str | None, error: str) -> str:
-    return f"{last_error}; {error}" if last_error else error
+    return append_heartbeat_error(last_error, error)

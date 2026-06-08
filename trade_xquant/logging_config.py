@@ -31,5 +31,10 @@ def configure_logging(log_path: str, verbose: bool = False) -> None:
     root.addHandler(file_handler)
 
     console = logging.StreamHandler()
-    console.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    console.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
     root.addHandler(console)

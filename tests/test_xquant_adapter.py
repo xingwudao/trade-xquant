@@ -4,6 +4,7 @@ import httpx
 
 import pytest
 
+from trade_xquant.heartbeat import MAX_HEARTBEAT_ERROR_LENGTH
 from trade_xquant.xquant_adapter import XquantAdapter, XquantAdapterError
 
 
@@ -204,6 +205,30 @@ def test_register_account_and_heartbeat_contracts() -> None:
     assert seen[1][2]["cash"] == 98000.0
     assert seen[1][2]["total_asset"] == 100000.0
     assert seen[1][2]["holdings"][0]["symbol"] == "510300.SH"
+
+
+def test_heartbeat_caps_last_error_before_posting() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen.append(json.loads(request.read().decode()))
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://xquant")
+    adapter = XquantAdapter("http://xquant/api/v1", api_token="token", client=client)
+
+    adapter.heartbeat(
+        account_id="acct",
+        client_version="0.1.0",
+        hostname="WIN-QMT-01",
+        qmt_connected=False,
+        xtquant_importable=True,
+        last_error="x" * 5000,
+    )
+
+    assert len(seen[0]["last_error"]) <= MAX_HEARTBEAT_ERROR_LENGTH
 
 
 def test_default_client_ignores_environment_proxy(monkeypatch) -> None:

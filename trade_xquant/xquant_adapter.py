@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 
+from trade_xquant.heartbeat import normalize_heartbeat_error
 from trade_xquant.models import ExecutionResult, RebalanceTask
 
 
@@ -112,7 +113,7 @@ class XquantAdapter:
             "hostname": hostname,
             "qmt_connected": qmt_connected,
             "xtquant_importable": xtquant_importable,
-            "last_error": last_error,
+            "last_error": normalize_heartbeat_error(last_error),
         }
         if cash is not None:
             payload["cash"] = cash

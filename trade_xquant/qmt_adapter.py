@@ -19,23 +19,28 @@ class QmtAdapter:
         self.event_handler = event_handler
         self.trader: Any | None = None
         self.account: Any | None = None
+        self._connected = False
 
     def connect(self) -> None:
+        if self._connected:
+            return
         trader_cls, callback_base, account_cls = load_xtquant()
         session_id = self.config.session_id or generate_session_id()
-        self.trader = trader_cls(self.config.userdata_mini_path, session_id)
-        if hasattr(self.trader, "register_callback"):
-            self.trader.register_callback(make_callback(callback_base, self._emit_event))
-        self.trader.start()
-        connect_result = self.trader.connect()
+        trader = trader_cls(self.config.userdata_mini_path, session_id)
+        if hasattr(trader, "register_callback"):
+            trader.register_callback(make_callback(callback_base, self._emit_event))
+        trader.start()
+        connect_result = trader.connect()
         if connect_result != 0:
             raise ConnectionError(
                 "QMT connect failed. connect() must return 0. "
                 "Confirm MiniQMT is logged in, userdata_mini path is correct, "
                 "and 独立交易 is checked."
             )
-        self.account = account_cls(self.config.account_id)
-        subscribe_result = self.trader.subscribe(self.account)
+        account = account_cls(self.config.account_id)
+        self.trader = trader
+        self.account = account
+        subscribe_result = trader.subscribe(account)
         if subscribe_result != 0:
             diagnostics = self._collect_account_diagnostics()
             raise ConnectionError(
@@ -47,6 +52,7 @@ class QmtAdapter:
                 "stock account, QMT trade login is active, and strategy trading "
                 "permission is enabled."
             )
+        self._connected = True
 
     def get_account_snapshot(self) -> AccountSnapshot:
         self._ensure_connected()
@@ -137,7 +143,7 @@ class QmtAdapter:
         return {"account": account.model_dump(), "positions_count": len(positions)}
 
     def _ensure_connected(self) -> None:
-        if self.trader is None or self.account is None:
+        if not self._connected or self.trader is None or self.account is None:
             raise RuntimeError("QMT adapter is not connected")
 
     def _emit_event(self, event_type: str, obj: Any) -> None:
