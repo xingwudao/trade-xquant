@@ -784,6 +784,24 @@ def test_sync_submitted_orders_once_only_reconciles_submitted_and_partial(tmp_pa
     assert service.xquant.results[0][1] == "success"  # type: ignore[attr-defined]
 
 
+def test_sync_submitted_orders_once_initializes_storage(tmp_path) -> None:
+    settings = Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="mock",
+            db_path=str(tmp_path / "fresh.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(),
+    )
+    service = GatewayService(settings)
+
+    result = service.sync_submitted_orders_once()
+
+    assert result == []
+
+
 def test_sync_submitted_orders_once_does_not_resync_new_partial_result(tmp_path) -> None:
     service = make_service_with_result(
         tmp_path,

@@ -524,6 +524,7 @@ class GatewayService:
         )
 
     def sync_submitted_orders_once(self) -> list[dict[str, object]]:
+        self.storage.initialize()
         partial_task_ids = self.storage.list_syncable_task_ids(status="partial")
         results = self.sync_results(status="submitted")
         for partial_task_id in partial_task_ids:
