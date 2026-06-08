@@ -1578,8 +1578,8 @@ def _payload_matches_submitted_order(payload: dict[str, Any], submitted_order) -
         for value in (submitted_order.local_order_id, submitted_order.broker_order_id)
         if value not in (None, "")
     }
-    if payload_ids and submitted_ids and payload_ids.intersection(submitted_ids):
-        return True
+    if payload_ids and submitted_ids:
+        return bool(payload_ids.intersection(submitted_ids))
     same_symbol = _payload_symbol(payload) == submitted_order.symbol
     if _payload_remark(payload) == submitted_order.task_id and same_symbol:
         return True
@@ -1593,6 +1593,14 @@ def _payload_matches_synced_order(
 ) -> bool:
     if _payload_matches_submitted_order(payload, submitted_order):
         return True
+    payload_ids = _payload_order_ids(payload)
+    submitted_ids = {
+        str(value)
+        for value in (submitted_order.local_order_id, submitted_order.broker_order_id)
+        if value not in (None, "")
+    }
+    if payload_ids and submitted_ids:
+        return False
     if _is_condition_task_id(submitted_order.task_id):
         return False
     return _payload_matches_planned_order_remark(payload, planned_orders)

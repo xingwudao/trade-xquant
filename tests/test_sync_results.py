@@ -268,6 +268,22 @@ class CurrentRetryBroker(PendingBroker):
         return response
 
 
+class HistoricalTradeRetryBroker(CurrentRetryBroker):
+    def get_trades(self):
+        if not self.placed:
+            return []
+        return [
+            SimpleNamespace(
+                order_id=1082169287,
+                stock_code="513100.SH",
+                quantity=1000,
+                price=1.0,
+                amount=1000.0,
+                m_strRemark="task-1",
+            )
+        ]
+
+
 class NoPendingBroker(PendingBroker):
     def get_orders(self):
         return []
@@ -1099,6 +1115,34 @@ def test_sync_submitted_orders_second_timeout_cancels_current_retry_only(
     lifecycle = payload["meta"]["order_lifecycle"]
     assert lifecycle["retry_count"] == 2
     assert lifecycle["cancelled_order_ids"] == ["retry-1"]
+    assert payload["submitted_orders"][0]["local_order_id"] == "retry-2"
+
+
+def test_sync_submitted_orders_historical_trade_does_not_fill_current_retry(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = HistoricalTradeRetryBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 2
+    service.settings.runtime.simulate_real_orders = True
+
+    service.sync_submitted_orders_once()
+    result = service.sync_submitted_orders_once()
+
+    assert result[0]["status"] == "partial"
+    assert result[-1]["retry_count"] == 2
+    assert broker.cancelled == ["1082169287", "retry-1"]
+    assert len(broker.placed) == 2
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["meta"]["order_lifecycle"]["cancelled_order_ids"] == ["retry-1"]
     assert payload["submitted_orders"][0]["local_order_id"] == "retry-2"
 
 
