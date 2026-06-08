@@ -53,6 +53,7 @@ _TERMINAL_ORDER_LIFECYCLE_REASONS = {
     "retry_budget_exhausted",
     "submitted_order_cancel_failed",
     "retry_preflight_failed",
+    "submitted_order_timeout",
 }
 
 
@@ -669,6 +670,9 @@ class GatewayService:
         return dict(lifecycle)
 
     def _has_terminal_order_lifecycle(self, task_id: str) -> bool:
+        payload = self.storage.load_task_result_payload(task_id) or {}
+        if not isinstance(payload, dict) or payload.get("status") != "failed":
+            return False
         lifecycle = self._stored_order_lifecycle_meta(task_id)
         return bool(
             lifecycle
@@ -1708,6 +1712,10 @@ def _payload_matches_task(
     submitted_orders,
     planned_orders=None,
 ) -> bool:
+    payload_ids = _payload_order_ids(payload)
+    submitted_ids = _submitted_order_ids(submitted_orders)
+    if payload_ids and submitted_ids:
+        return bool(payload_ids.intersection(submitted_ids))
     if _payload_remark(payload) == task_id:
         return True
     if not _is_condition_task_id(task_id) and _payload_matches_planned_order_remark(
@@ -1716,6 +1724,15 @@ def _payload_matches_task(
     ):
         return True
     return any(_payload_matches_submitted_order(payload, submitted) for submitted in submitted_orders)
+
+
+def _submitted_order_ids(submitted_orders) -> set[str]:
+    return {
+        str(value)
+        for submitted in submitted_orders
+        for value in (submitted.local_order_id, submitted.broker_order_id)
+        if value not in (None, "")
+    }
 
 
 def _is_condition_task_id(task_id: str) -> bool:

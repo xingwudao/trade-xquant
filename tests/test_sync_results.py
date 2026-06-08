@@ -136,6 +136,32 @@ class FilledBroker:
         ]
 
 
+class ConflictingRemarkBroker(FilledBroker):
+    def get_orders(self):
+        return [
+            SimpleNamespace(
+                order_id=999999,
+                stock_code="513100.SH",
+                order_status=56,
+                traded_volume=1000,
+                price=1.0,
+                m_strRemark="task-1",
+            )
+        ]
+
+    def get_trades(self):
+        return [
+            SimpleNamespace(
+                order_id=999999,
+                stock_code="513100.SH",
+                quantity=1000,
+                price=1.0,
+                amount=1000.0,
+                m_strRemark="task-1",
+            )
+        ]
+
+
 class ConditionRemarkBroker(FilledBroker):
     def get_orders(self):
         return [
@@ -400,6 +426,11 @@ class MixedRetryPlacementBroker(PendingBroker):
         return super().place_order(order)
 
 
+class FailingRetryPlacementBroker(PendingBroker):
+    def place_order(self, order: PlannedOrder):
+        raise RuntimeError(f"cannot place {order.symbol}")
+
+
 def submitted_order_with_id(order_id: str | None, *, status: str = "submitted") -> SubmittedOrder:
     return SubmittedOrder(
         task_id="task-1",
@@ -577,6 +608,24 @@ def test_sync_results_reports_success_when_qmt_orders_are_fully_traded(tmp_path)
     assert body["submitted_orders"][0]["local_order_id"] == "1082169287"
     assert body["trades"][0]["order_id"] == "1082169287"
     assert body["trades"][0]["symbol"] == "513100.SH"
+
+
+def test_sync_results_does_not_match_conflicting_order_id_by_remark(tmp_path) -> None:
+    service = make_service_with_result(
+        tmp_path,
+        broker=ConflictingRemarkBroker(),
+        result=submitted_result(),
+        result_status="submitted",
+    )
+
+    result = service.sync_results(task_id="task-1")
+
+    assert result == [{"task_id": "task-1", "status": "submitted"}]
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert payload["events"] == []
+    assert payload["trades"] == []
+    assert payload["submitted_orders"][0]["status"] == "submitted"
 
 
 def test_sync_results_reports_condition_tasks_to_condition_result_endpoint(tmp_path) -> None:
@@ -1517,6 +1566,37 @@ def test_sync_submitted_orders_audits_retry_failure_after_cancel(tmp_path) -> No
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
     assert payload["meta"]["order_lifecycle"]["reason"] == "retry_preflight_failed"
     assert service.xquant.results[-1][1] == "failed"  # type: ignore[attr-defined]
+
+
+def test_failed_retry_after_cancel_is_not_overwritten_by_failed_sync(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = FailingRetryPlacementBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    retry_result = service.sync_submitted_orders_once()
+    failed_payload = service.storage.load_task_result_payload("task-1")
+
+    result = service.sync_results(status="failed")
+
+    assert retry_result[-1]["status"] == "failed"
+    assert broker.cancelled == ["1082169287"]
+    assert broker.placed == []
+    assert result == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "failed"
+    assert payload["errors"] == failed_payload["errors"]
+    assert payload["meta"]["order_lifecycle"]["reason"] == "submitted_order_timeout"
 
 
 def test_sync_submitted_orders_audits_cancel_failure(tmp_path) -> None:
