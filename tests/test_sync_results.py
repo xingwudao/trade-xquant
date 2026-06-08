@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import closing
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -1007,12 +1008,66 @@ def test_sync_submitted_orders_audits_retry_failure_after_cancel(tmp_path) -> No
     result = service.sync_submitted_orders_once()
 
     assert result[-1]["status"] == "failed"
-    assert broker.cancelled == ["1082169287"]
+    assert broker.cancelled == []
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["status"] == "failed"
     assert payload["errors"] == ["prices unavailable"]
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
-    assert payload["meta"]["order_lifecycle"]["reason"] == "submitted_order_timeout"
+    assert payload["meta"]["order_lifecycle"]["reason"] == "retry_preflight_failed"
+    assert service.xquant.results[-1][1] == "failed"  # type: ignore[attr-defined]
+
+
+def test_sync_submitted_orders_audits_cancel_failure(tmp_path) -> None:
+    broker = FailingCancelBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["status"] == "failed"
+    assert broker.placed == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "failed"
+    assert "cancel failed" in payload["errors"][0]
+    lifecycle = payload["meta"]["order_lifecycle"]
+    assert lifecycle["retry_count"] == 0
+    assert lifecycle["reason"] == "submitted_order_cancel_failed"
+    assert lifecycle["cancel_errors"] == payload["errors"]
+    assert lifecycle["submitted_order_ids"] == ["1082169287"]
+    assert service.xquant.results[-1][1] == "failed"  # type: ignore[attr-defined]
+
+
+def test_sync_submitted_orders_preflight_rejects_before_cancel(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    expired_task = task()
+    expired_task.expires_at = expired_task.created_at - timedelta(minutes=1)
+    service.storage.record_task_received(expired_task, status="submitted")
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["status"] == "failed"
+    assert broker.cancelled == []
+    assert broker.placed == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "failed"
+    assert payload["errors"] == ["task expired"]
+    assert payload["meta"]["order_lifecycle"]["reason"] == "retry_preflight_failed"
     assert service.xquant.results[-1][1] == "failed"  # type: ignore[attr-defined]
 
 
@@ -1090,12 +1145,13 @@ def test_sync_submitted_orders_validates_empty_retry_plan(tmp_path) -> None:
     result = service.sync_submitted_orders_once()
 
     assert result[-1]["status"] == "failed"
-    assert broker.cancelled == ["1082169287"]
+    assert broker.cancelled == []
     assert broker.placed == []
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["status"] == "failed"
     assert payload["errors"] == ["real order disabled by config"]
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+    assert payload["meta"]["order_lifecycle"]["reason"] == "retry_preflight_failed"
     assert service.xquant.results[-1][1] == "failed"  # type: ignore[attr-defined]
 
 

@@ -545,6 +545,10 @@ class GatewayService:
                 continue
             if not self._submitted_order_timed_out(task_id):
                 continue
+            preflight = self._preflight_retry_rebalance_task(task_id)
+            if preflight.get("status") != "ok":
+                results.append(preflight)
+                continue
             submitted_orders = self.storage.load_submitted_orders(task_id)
             payload = self.storage.load_task_result_payload(task_id) or {}
             synced_orders = [
@@ -563,6 +567,13 @@ class GatewayService:
                 errors,
             )
             if errors:
+                results.append(
+                    self._record_cancel_failure_result(
+                        task_id,
+                        cancelled_order_ids=cancelled,
+                        cancel_errors=errors,
+                    )
+                )
                 continue
             if cancelled:
                 retry_result = self._retry_rebalance_task(
@@ -602,13 +613,17 @@ class GatewayService:
         retry_count: int,
         cancelled_order_ids: list[str],
         reason: str,
+        extra_lifecycle: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        return {
+        lifecycle: dict[str, object] = {
             "retry_count": retry_count,
             "last_retry_at": datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
             "cancelled_order_ids": cancelled_order_ids,
             "reason": reason,
         }
+        if extra_lifecycle:
+            lifecycle.update(extra_lifecycle)
+        return lifecycle
 
     def _record_failed_retry_result(
         self,
@@ -623,6 +638,7 @@ class GatewayService:
         fallback_account: AccountSnapshot | None = None,
         fallback_positions: list[Position] | None = None,
         fallback_prices: dict[str, float] | None = None,
+        extra_lifecycle: dict[str, object] | None = None,
     ) -> dict[str, object]:
         failure = ExecutionResult(
             task_id=task_id,
@@ -635,6 +651,7 @@ class GatewayService:
                     retry_count=retry_count,
                     cancelled_order_ids=cancelled_order_ids,
                     reason=reason,
+                    extra_lifecycle=extra_lifecycle,
                 )
             },
         )
@@ -657,6 +674,72 @@ class GatewayService:
             "retry_count": retry_count,
             "error": str(error),
         }
+
+    def _preflight_retry_rebalance_task(self, task_id: str) -> dict[str, object]:
+        retry_count = self._retry_count(task_id)
+        task = self.storage.load_task(task_id)
+        if retry_count >= self.settings.runtime.max_rebalance_retries:
+            return {"task_id": task_id, "status": "ok"}
+        if task is None:
+            logger.error("cannot preflight missing task: task_id=%s", task_id)
+            return {"task_id": task_id, "status": "missing_task"}
+
+        account: AccountSnapshot | None = None
+        positions: list[Position] | None = None
+        prices: dict[str, float] | None = None
+        plan: OrderPlan | None = None
+        try:
+            self.qmt.connect()
+            account = self.qmt.get_account_snapshot()
+            positions = self.qmt.get_positions()
+            symbols = [target.symbol for target in task.targets] + [
+                position.symbol for position in positions
+            ]
+            prices = self.qmt.get_prices(symbols)
+            plan = self.portfolio.build_plan(task, account, positions, prices)
+            self.risk.validate(task, account, plan, known_symbols=set(prices))
+        except Exception as exc:  # noqa: BLE001 - pre-cancel guard must be audited
+            logger.exception("retry preflight failed before cancellation: task_id=%s", task_id)
+            return self._record_failed_retry_result(
+                task_id,
+                task=task,
+                planned_orders=plan.orders if plan is not None else None,
+                retry_count=retry_count + 1,
+                cancelled_order_ids=[],
+                reason="retry_preflight_failed",
+                error=exc,
+                fallback_account=account,
+                fallback_positions=positions,
+                fallback_prices=prices,
+            )
+        return {"task_id": task_id, "status": "ok"}
+
+    def _record_cancel_failure_result(
+        self,
+        task_id: str,
+        *,
+        cancelled_order_ids: list[str],
+        cancel_errors: list[str],
+    ) -> dict[str, object]:
+        task = self.storage.load_task(task_id)
+        submitted_order_ids = [
+            str(order.local_order_id or order.broker_order_id)
+            for order in self.storage.load_submitted_orders(task_id)
+            if order.local_order_id or order.broker_order_id
+        ]
+        return self._record_failed_retry_result(
+            task_id,
+            task=task,
+            planned_orders=self.storage.load_planned_orders(task_id),
+            retry_count=self._retry_count(task_id),
+            cancelled_order_ids=cancelled_order_ids,
+            reason="submitted_order_cancel_failed",
+            error=RuntimeError("; ".join(cancel_errors)),
+            extra_lifecycle={
+                "cancel_errors": cancel_errors,
+                "submitted_order_ids": submitted_order_ids,
+            },
+        )
 
     def _retry_rebalance_task(
         self,
