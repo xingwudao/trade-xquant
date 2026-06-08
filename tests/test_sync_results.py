@@ -308,6 +308,13 @@ class StaleOriginalAndCurrentRetryBroker(CurrentRetryBroker):
         ]
 
 
+class FailingSecondCancelRetryBroker(CurrentRetryBroker):
+    def cancel_order(self, order_id: str) -> None:
+        if self.placed:
+            raise RuntimeError(f"cannot cancel {order_id}")
+        super().cancel_order(order_id)
+
+
 class NoPendingBroker(PendingBroker):
     def get_orders(self):
         return []
@@ -1242,6 +1249,35 @@ def test_sync_submitted_orders_stale_original_event_does_not_cancel_again(
     lifecycle = payload["meta"]["order_lifecycle"]
     assert lifecycle["cancelled_order_ids"] == ["retry-1"]
     assert lifecycle["cancelled_order_ids_history"] == ["1082169287", "retry-1"]
+
+
+def test_sync_submitted_orders_terminal_failure_preserves_cancel_history(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = FailingSecondCancelRetryBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 2
+    service.settings.runtime.simulate_real_orders = True
+
+    service.sync_submitted_orders_once()
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["status"] == "failed"
+    assert broker.cancelled == ["1082169287"]
+    assert len(broker.placed) == 1
+    payload = service.storage.load_task_result_payload("task-1")
+    lifecycle = payload["meta"]["order_lifecycle"]
+    assert lifecycle["reason"] == "submitted_order_cancel_failed"
+    assert lifecycle["cancelled_order_ids"] == []
+    assert lifecycle["cancelled_order_ids_history"] == ["1082169287"]
 
 
 def test_sync_results_preserves_order_lifecycle_retry_count(tmp_path, monkeypatch) -> None:

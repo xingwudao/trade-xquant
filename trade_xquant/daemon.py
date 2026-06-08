@@ -632,17 +632,34 @@ class GatewayService:
 
     def _retry_lifecycle_meta(
         self,
+        task_id: str,
         *,
         retry_count: int,
         cancelled_order_ids: list[str],
         reason: str,
         extra_lifecycle: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        previous_lifecycle = self._order_lifecycle_meta(task_id)
+        previous_cancelled = previous_lifecycle.get("cancelled_order_ids_history")
+        if not isinstance(previous_cancelled, list):
+            previous_cancelled = previous_lifecycle.get("cancelled_order_ids", [])
+        if not isinstance(previous_cancelled, list):
+            previous_cancelled = []
+        cancelled_history: list[str] = []
+        seen_cancelled: set[str] = set()
+        for order_id in [*previous_cancelled, *cancelled_order_ids]:
+            if order_id in (None, ""):
+                continue
+            value = str(order_id)
+            if value in seen_cancelled:
+                continue
+            seen_cancelled.add(value)
+            cancelled_history.append(value)
         lifecycle: dict[str, object] = {
             "retry_count": retry_count,
             "last_retry_at": datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
             "cancelled_order_ids": cancelled_order_ids,
-            "cancelled_order_ids_history": cancelled_order_ids,
+            "cancelled_order_ids_history": cancelled_history,
             "reason": reason,
         }
         if extra_lifecycle:
@@ -672,6 +689,7 @@ class GatewayService:
             errors=[str(error)],
             meta={
                 "order_lifecycle": self._retry_lifecycle_meta(
+                    task_id,
                     retry_count=retry_count,
                     cancelled_order_ids=cancelled_order_ids,
                     reason=reason,
@@ -814,6 +832,7 @@ class GatewayService:
             prices = self.qmt.get_prices(symbols)
             plan = self.portfolio.build_plan(task, account, positions, prices)
             lifecycle = self._retry_lifecycle_meta(
+                task_id,
                 retry_count=next_retry_count,
                 cancelled_order_ids=cancelled_order_ids,
                 reason=reason,
@@ -835,19 +854,6 @@ class GatewayService:
             else:
                 result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
                 result.meta["order_lifecycle"] = lifecycle
-            previous_lifecycle = self._order_lifecycle_meta(task_id)
-            previous_cancelled = previous_lifecycle.get("cancelled_order_ids_history")
-            if not isinstance(previous_cancelled, list):
-                previous_cancelled = previous_lifecycle.get("cancelled_order_ids", [])
-            if not isinstance(previous_cancelled, list):
-                previous_cancelled = []
-            lifecycle["cancelled_order_ids_history"] = sorted(
-                {
-                    str(order_id)
-                    for order_id in [*previous_cancelled, *cancelled_order_ids]
-                    if order_id not in (None, "")
-                }
-            )
             self._attach_current_account_snapshot(
                 result,
                 task,
