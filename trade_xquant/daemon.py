@@ -523,6 +523,11 @@ class GatewayService:
             holdings=snapshot["holdings"] if snapshot else None,
         )
 
+    def sync_submitted_orders_once(self) -> list[dict[str, object]]:
+        results = self.sync_results(status="submitted")
+        partial_results = self.sync_results(status="partial")
+        return results + partial_results
+
     def sync_results(self, task_id: str | None = None, status: str = "all") -> list[dict[str, object]]:
         self.storage.initialize()
         task_ids = self.storage.list_syncable_task_ids(task_id=task_id, status=status)

@@ -773,3 +773,12 @@ def make_service_with_result(
     payload["status"] = result_status
     service.storage.mark_task_result(result.task_id, result_status, payload)
     return service
+
+
+def test_sync_submitted_orders_once_only_reconciles_submitted_and_partial(tmp_path) -> None:
+    service = make_service_with_submitted_task(tmp_path, result_status="submitted")
+
+    result = service.sync_submitted_orders_once()
+
+    assert result == [{"task_id": "task-1", "status": "success"}]
+    assert service.xquant.results[0][1] == "success"  # type: ignore[attr-defined]
