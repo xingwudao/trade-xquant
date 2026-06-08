@@ -268,6 +268,11 @@ class CurrentRetryBroker(PendingBroker):
         return response
 
 
+class NoPendingBroker(PendingBroker):
+    def get_orders(self):
+        return []
+
+
 class FailingCancelBroker(PendingBroker):
     def cancel_order(self, order_id: str) -> None:
         raise RuntimeError(f"cannot cancel {order_id}")
@@ -1037,6 +1042,34 @@ def test_sync_submitted_orders_retries_after_timeout_cancel(tmp_path, monkeypatc
     assert len(broker.placed) == 1
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+
+
+def test_sync_submitted_orders_does_not_cancel_without_current_qmt_order(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = NoPendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result == [{"task_id": "task-1", "status": "submitted"}]
+    assert broker.cancelled == []
+    assert broker.placed == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert payload["submitted_orders"][0]["local_order_id"] == "1082169287"
+    assert payload["meta"]["sync_source"] == "qmt_query"
+    assert "order_lifecycle" not in payload["meta"]
 
 
 def test_sync_submitted_orders_second_timeout_cancels_current_retry_only(

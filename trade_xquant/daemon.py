@@ -906,8 +906,6 @@ class GatewayService:
                 event_payload = event.get("payload")
                 if isinstance(event_payload, dict):
                     current_order_ids.update(_payload_order_ids(event_payload))
-        if not current_order_ids:
-            return pending_orders
         return [
             order
             for order in pending_orders
