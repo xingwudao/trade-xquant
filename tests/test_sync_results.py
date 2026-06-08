@@ -782,3 +782,28 @@ def test_sync_submitted_orders_once_only_reconciles_submitted_and_partial(tmp_pa
 
     assert result == [{"task_id": "task-1", "status": "success"}]
     assert service.xquant.results[0][1] == "success"  # type: ignore[attr-defined]
+
+
+def test_sync_submitted_orders_once_does_not_resync_new_partial_result(tmp_path) -> None:
+    service = make_service_with_result(
+        tmp_path,
+        broker=MixedBroker(),
+        result=mixed_submitted_result(),
+        result_status="submitted",
+    )
+
+    result = service.sync_submitted_orders_once()
+
+    assert result == [{"task_id": "task-1", "status": "partial"}]
+    assert [(task_id, status) for task_id, status, _ in service.xquant.results] == [  # type: ignore[attr-defined]
+        ("task-1", "partial")
+    ]
+
+
+def test_sync_submitted_orders_once_reconciles_pre_existing_partial_result(tmp_path) -> None:
+    service = make_service_with_submitted_task(tmp_path, result_status="partial")
+
+    result = service.sync_submitted_orders_once()
+
+    assert result == [{"task_id": "task-1", "status": "success"}]
+    assert service.xquant.results[0][1] == "success"  # type: ignore[attr-defined]
