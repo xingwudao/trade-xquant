@@ -284,6 +284,30 @@ class HistoricalTradeRetryBroker(CurrentRetryBroker):
         ]
 
 
+class StaleOriginalAndCurrentRetryBroker(CurrentRetryBroker):
+    def get_orders(self):
+        if not self.placed:
+            return super().get_orders()
+        return [
+            SimpleNamespace(
+                order_id=1082169287,
+                stock_code="513100.SH",
+                order_status=50,
+                traded_volume=0,
+                price=1.0,
+                m_strRemark="task-1",
+            ),
+            SimpleNamespace(
+                order_id=self.current_order_id,
+                stock_code="513100.SH",
+                order_status=50,
+                traded_volume=0,
+                price=1.0,
+                m_strRemark="task-1",
+            ),
+        ]
+
+
 class NoPendingBroker(PendingBroker):
     def get_orders(self):
         return []
@@ -1190,6 +1214,34 @@ def test_sync_submitted_orders_historical_trade_does_not_fill_current_retry(
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["meta"]["order_lifecycle"]["cancelled_order_ids"] == ["retry-1"]
     assert payload["submitted_orders"][0]["local_order_id"] == "retry-2"
+
+
+def test_sync_submitted_orders_stale_original_event_does_not_cancel_again(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = StaleOriginalAndCurrentRetryBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 2
+    service.settings.runtime.simulate_real_orders = True
+
+    service.sync_submitted_orders_once()
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["retry_count"] == 2
+    assert broker.cancelled == ["1082169287", "retry-1"]
+    assert len(broker.placed) == 2
+    payload = service.storage.load_task_result_payload("task-1")
+    lifecycle = payload["meta"]["order_lifecycle"]
+    assert lifecycle["cancelled_order_ids"] == ["retry-1"]
+    assert lifecycle["cancelled_order_ids_history"] == ["1082169287", "retry-1"]
 
 
 def test_sync_results_preserves_order_lifecycle_retry_count(tmp_path, monkeypatch) -> None:

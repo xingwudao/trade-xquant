@@ -642,6 +642,7 @@ class GatewayService:
             "retry_count": retry_count,
             "last_retry_at": datetime.now(ZoneInfo(self.settings.risk.timezone)).isoformat(),
             "cancelled_order_ids": cancelled_order_ids,
+            "cancelled_order_ids_history": cancelled_order_ids,
             "reason": reason,
         }
         if extra_lifecycle:
@@ -834,6 +835,19 @@ class GatewayService:
             else:
                 result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
                 result.meta["order_lifecycle"] = lifecycle
+            previous_lifecycle = self._order_lifecycle_meta(task_id)
+            previous_cancelled = previous_lifecycle.get("cancelled_order_ids_history")
+            if not isinstance(previous_cancelled, list):
+                previous_cancelled = previous_lifecycle.get("cancelled_order_ids", [])
+            if not isinstance(previous_cancelled, list):
+                previous_cancelled = []
+            lifecycle["cancelled_order_ids_history"] = sorted(
+                {
+                    str(order_id)
+                    for order_id in [*previous_cancelled, *cancelled_order_ids]
+                    if order_id not in (None, "")
+                }
+            )
             self._attach_current_account_snapshot(
                 result,
                 task,
@@ -900,6 +914,19 @@ class GatewayService:
             for order in synced_orders
             if order.status in {"submitted", "partial"}
         ]
+        lifecycle = payload.get("meta") if isinstance(payload, dict) else {}
+        lifecycle = lifecycle.get("order_lifecycle") if isinstance(lifecycle, dict) else {}
+        cancelled_order_ids = set()
+        if isinstance(lifecycle, dict):
+            cancelled_values = lifecycle.get("cancelled_order_ids_history")
+            if not isinstance(cancelled_values, list):
+                cancelled_values = lifecycle.get("cancelled_order_ids", [])
+            if isinstance(cancelled_values, list):
+                cancelled_order_ids = {
+                    str(order_id)
+                    for order_id in cancelled_values
+                    if order_id not in (None, "")
+                }
         current_order_ids: set[str] = set()
         events = payload.get("events") if isinstance(payload, dict) else []
         if isinstance(events, list):
@@ -916,6 +943,7 @@ class GatewayService:
             order
             for order in pending_orders
             if str(order.local_order_id or order.broker_order_id or "") in current_order_ids
+            and str(order.local_order_id or order.broker_order_id or "") not in cancelled_order_ids
         ]
 
     def _cancel_pending_submitted_orders(
