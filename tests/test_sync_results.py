@@ -1695,6 +1695,8 @@ def test_sync_submitted_orders_audits_cancel_failure(tmp_path) -> None:
     result = service.sync_submitted_orders_once()
 
     assert result[-1]["status"] == "failed"
+    assert result[-1]["retry_count"] == 0
+    assert "cancel failed" in result[-1]["error"]
     assert broker.placed == []
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["status"] == "failed"
@@ -1702,6 +1704,7 @@ def test_sync_submitted_orders_audits_cancel_failure(tmp_path) -> None:
     lifecycle = payload["meta"]["order_lifecycle"]
     assert lifecycle["retry_count"] == 0
     assert lifecycle["reason"] == "submitted_order_cancel_failed"
+    assert lifecycle["cancelled_order_ids"] == []
     assert lifecycle["cancel_errors"] == payload["errors"]
     assert lifecycle["submitted_order_ids"] == ["1082169287"]
     assert service.xquant.results[-1][1] == "failed"  # type: ignore[attr-defined]
