@@ -588,13 +588,17 @@ class GatewayService:
         }
         cancelled: list[str] = []
         errors: list[str] = []
+        seen_order_ids: set[str] = set()
         for order in submitted_orders:
             order_id = str(order.local_order_id or order.broker_order_id or "")
             if not order_id:
                 errors.append(f"{order.symbol} {order.side} missing order id for cancel")
                 continue
+            if order_id in seen_order_ids:
+                continue
+            seen_order_ids.add(order_id)
             synced = synced_by_id.get(order_id)
-            if synced is not None and synced.status == "filled":
+            if synced is not None and synced.status not in {"submitted", "partial"}:
                 continue
             try:
                 self.qmt.cancel_order(order_id)

@@ -230,6 +230,24 @@ class PendingBroker(SnapshotBroker):
         return {"order_id": f"retry-{len(self.placed)}"}
 
 
+class FailingCancelBroker(PendingBroker):
+    def cancel_order(self, order_id: str) -> None:
+        raise RuntimeError(f"cannot cancel {order_id}")
+
+
+def submitted_order_with_id(order_id: str | None, *, status: str = "submitted") -> SubmittedOrder:
+    return SubmittedOrder(
+        task_id="task-1",
+        symbol="513100.SH",
+        side="buy",
+        quantity=1000,
+        price=1.0,
+        amount=1000.0,
+        local_order_id=order_id,
+        status=status,
+    )
+
+
 def task() -> RebalanceTask:
     return RebalanceTask.model_validate(
         {
@@ -882,6 +900,91 @@ def test_sync_submitted_orders_cancels_timed_out_pending_order(tmp_path, caplog)
     assert broker.cancelled == ["1082169287"]
     assert broker.placed == []
     assert "1082169287" in caplog.text
+
+
+def test_cancel_pending_submitted_orders_skips_duplicate_order_id(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+
+    cancelled, errors = service._cancel_pending_submitted_orders(
+        [
+            submitted_order_with_id("1082169287"),
+            submitted_order_with_id("1082169287"),
+        ],
+        [submitted_order_with_id("1082169287", status="submitted")],
+    )
+
+    assert cancelled == ["1082169287"]
+    assert errors == []
+    assert broker.cancelled == ["1082169287"]
+
+
+def test_cancel_pending_submitted_orders_skips_non_pending_synced_statuses(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+
+    cancelled, errors = service._cancel_pending_submitted_orders(
+        [
+            submitted_order_with_id("1082169287"),
+            submitted_order_with_id("1082169288"),
+        ],
+        [
+            submitted_order_with_id("1082169287", status="filled"),
+            submitted_order_with_id("1082169288", status="failed"),
+        ],
+    )
+
+    assert cancelled == []
+    assert errors == []
+    assert broker.cancelled == []
+
+
+def test_cancel_pending_submitted_orders_reports_missing_order_id(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+
+    cancelled, errors = service._cancel_pending_submitted_orders(
+        [submitted_order_with_id(None)],
+        [],
+    )
+
+    assert cancelled == []
+    assert len(errors) == 1
+    assert "missing order id for cancel" in errors[0]
+    assert broker.cancelled == []
+
+
+def test_cancel_pending_submitted_orders_reports_cancel_exception(tmp_path) -> None:
+    service = make_service_with_result(
+        tmp_path,
+        broker=FailingCancelBroker(),
+        result=submitted_result(),
+        result_status="submitted",
+    )
+
+    cancelled, errors = service._cancel_pending_submitted_orders(
+        [submitted_order_with_id("1082169287")],
+        [submitted_order_with_id("1082169287", status="submitted")],
+    )
+
+    assert cancelled == []
+    assert len(errors) == 1
+    assert "cancel failed" in errors[0]
 
 
 def test_sync_submitted_orders_once_reconciles_pre_existing_partial_result(tmp_path) -> None:
