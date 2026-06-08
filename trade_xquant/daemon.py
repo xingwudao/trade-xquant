@@ -624,16 +624,15 @@ class GatewayService:
             return {"task_id": task_id, "status": "missing_result", "xquant_synced": False}
         status = str(payload.get("status") or "failed")
         result = ExecutionResult.model_validate(payload)
-        try:
-            self.xquant.report_result(task_id, status, result)
-        except Exception as exc:  # noqa: BLE001 - sync retries should return report failures
+        report_error = self._report_execution_result(task_id, status, result)
+        if report_error is not None:
             meta = payload.setdefault("meta", {})
             if isinstance(meta, dict):
                 meta["xquant_synced"] = False
-                meta["xquant_report_error"] = str(exc)
-                if isinstance(exc, XquantAdapterError):
-                    meta["xquant_status_code"] = exc.status_code
-                    hint = _xquant_report_error_hint(exc)
+                meta["xquant_report_error"] = str(report_error)
+                if isinstance(report_error, XquantAdapterError):
+                    meta["xquant_status_code"] = report_error.status_code
+                    hint = _xquant_report_error_hint(report_error)
                     if hint:
                         meta["xquant_error_hint"] = hint
             self.storage.mark_task_result(task_id, status, payload)
@@ -641,9 +640,13 @@ class GatewayService:
                 "task_id": task_id,
                 "status": status,
                 "xquant_synced": False,
-                "status_code": exc.status_code if isinstance(exc, XquantAdapterError) else None,
-                "error": str(exc),
-                "hint": _xquant_report_error_hint(exc) if isinstance(exc, XquantAdapterError) else None,
+                "status_code": report_error.status_code
+                if isinstance(report_error, XquantAdapterError)
+                else None,
+                "error": str(report_error),
+                "hint": _xquant_report_error_hint(report_error)
+                if isinstance(report_error, XquantAdapterError)
+                else None,
             }
 
         meta = payload.setdefault("meta", {})
@@ -654,6 +657,21 @@ class GatewayService:
             meta.pop("xquant_error_hint", None)
         self.storage.mark_task_result(task_id, status, payload)
         return {"task_id": task_id, "status": status, "xquant_synced": True}
+
+    def _report_execution_result(
+        self,
+        task_id: str,
+        status: str,
+        result: ExecutionResult,
+    ) -> Exception | None:
+        if _is_condition_task_id(task_id):
+            result.status = status
+            return self._record_and_report_synced_condition_result(task_id, result)
+        try:
+            self.xquant.report_result(task_id, status, result)
+        except Exception as exc:  # noqa: BLE001 - callers persist local report failures
+            return exc
+        return None
 
     def _order_lifecycle_meta(self, task_id: str) -> dict[str, object]:
         lifecycle = self._stored_order_lifecycle_meta(task_id)
@@ -792,8 +810,8 @@ class GatewayService:
         )
         payload = failure.model_dump(mode="json")
         self.storage.mark_task_result(task_id, "failed", payload)
-        try:
-            self.xquant.report_result(task_id, "failed", failure)
+        report_error = self._report_execution_result(task_id, "failed", failure)
+        if report_error is None:
             payload_meta = payload.setdefault("meta", {})
             if isinstance(payload_meta, dict):
                 payload_meta["xquant_synced"] = True
@@ -801,15 +819,19 @@ class GatewayService:
                 payload_meta.pop("xquant_status_code", None)
                 payload_meta.pop("xquant_error_hint", None)
             self.storage.mark_task_result(task_id, "failed", payload)
-        except Exception as exc:  # noqa: BLE001 - retry failure is already audited locally
-            logger.exception("failed to report retry failure to Xquant: task_id=%s", task_id)
+        else:
+            logger.error(
+                "failed to report retry failure to Xquant: task_id=%s error=%s",
+                task_id,
+                report_error,
+            )
             payload_meta = payload.setdefault("meta", {})
             if isinstance(payload_meta, dict):
                 payload_meta["xquant_synced"] = False
-                payload_meta["xquant_report_error"] = str(exc)
-                if isinstance(exc, XquantAdapterError):
-                    payload_meta["xquant_status_code"] = exc.status_code
-                    hint = _xquant_report_error_hint(exc)
+                payload_meta["xquant_report_error"] = str(report_error)
+                if isinstance(report_error, XquantAdapterError):
+                    payload_meta["xquant_status_code"] = report_error.status_code
+                    hint = _xquant_report_error_hint(report_error)
                     if hint:
                         payload_meta["xquant_error_hint"] = hint
             self.storage.mark_task_result(task_id, "failed", payload)
@@ -1013,23 +1035,30 @@ class GatewayService:
                 fallback_positions=positions,
                 fallback_prices=prices,
             )
-        try:
-            self.xquant.report_result(task_id, status, result)
-        except Exception as exc:  # noqa: BLE001 - local active orders must remain durable
-            logger.exception("failed to report retry result to Xquant: task_id=%s", task_id)
+        report_error = self._report_execution_result(task_id, status, result)
+        if report_error is not None:
+            logger.error(
+                "failed to report retry result to Xquant: task_id=%s error=%s",
+                task_id,
+                report_error,
+            )
             payload = result.model_dump(mode="json")
             payload_meta = payload.setdefault("meta", {})
             if isinstance(payload_meta, dict):
-                payload_meta["xquant_report_error"] = str(exc)
+                payload_meta["xquant_report_error"] = str(report_error)
             self.storage.mark_task_result(task_id, status, payload)
             return {
                 "task_id": task_id,
                 "status": status,
                 "retry_count": next_retry_count,
                 "xquant_synced": False,
-                "status_code": exc.status_code if isinstance(exc, XquantAdapterError) else None,
-                "error": str(exc),
-                "hint": _xquant_report_error_hint(exc) if isinstance(exc, XquantAdapterError) else None,
+                "status_code": report_error.status_code
+                if isinstance(report_error, XquantAdapterError)
+                else None,
+                "error": str(report_error),
+                "hint": _xquant_report_error_hint(report_error)
+                if isinstance(report_error, XquantAdapterError)
+                else None,
             }
         return {"task_id": task_id, "status": status, "retry_count": next_retry_count}
 

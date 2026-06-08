@@ -1289,6 +1289,55 @@ def test_sync_submitted_orders_retries_after_timeout_cancel(tmp_path, monkeypatc
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
 
 
+def test_sync_submitted_orders_retries_condition_timeout_via_condition_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = PendingBroker()
+    service = make_service_with_condition_result(tmp_path, result_status="submitted")
+    service.qmt = broker  # type: ignore[assignment]
+    condition_task = RebalanceTask(
+        task_id="condition:cond-sync",
+        portfolio_id="prod",
+        account_id="acct",
+        mode="real",
+        created_at=task().created_at,
+        expires_at=None,
+        targets=[{"symbol": "513100.SH", "target_weight": 0}],
+        raw={"condition_id": "cond-sync", "source_task_id": "task-1"},
+    )
+    service.storage.record_task_received(condition_task, status="submitted")
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1] == {
+        "task_id": "condition:cond-sync",
+        "status": "submitted",
+        "retry_count": 1,
+    }
+    assert broker.cancelled == ["1082169287"]
+    assert len(broker.placed) == 1
+    assert service.xquant.results == []  # type: ignore[attr-defined]
+    assert len(service.xquant.condition_results) == 2  # type: ignore[attr-defined]
+    source_task_id, condition_id, payload = (
+        service.xquant.condition_results[-1]  # type: ignore[attr-defined]
+    )
+    assert source_task_id == "task-1"
+    assert condition_id == "cond-sync"
+    assert payload["condition_task_id"] == "condition:cond-sync"
+    assert payload["execution_result"]["status"] == "submitted"
+    submitted_orders = payload["execution_result"]["submitted_orders"]
+    assert submitted_orders[0]["local_order_id"] == "retry-1"
+    stored = service.storage.load_task_result_payload("condition:cond-sync")
+    assert stored["meta"]["order_lifecycle"]["retry_count"] == 1
+    stored_submitted_orders = service.storage.load_submitted_orders("condition:cond-sync")
+    assert stored_submitted_orders[-1].local_order_id == "retry-1"
+
+
 def test_sync_results_retry_fill_ignores_cancelled_original_attempt(
     tmp_path,
     monkeypatch,
