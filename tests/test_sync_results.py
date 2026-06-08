@@ -111,6 +111,22 @@ class FailingFirstFailedResultXquant(FakeXquant):
         return super().report_result(task_id, status, payload)
 
 
+class FailingFirstDryRunSuccessXquant(FakeXquant):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dry_run_success_attempts = 0
+
+    def report_result(self, task_id: str, status: str, payload) -> None:
+        if status == "dry_run_success":
+            self.dry_run_success_attempts += 1
+            if self.dry_run_success_attempts == 1:
+                raise XquantAdapterError(
+                    'Xquant API error 503: {"detail":"result_unavailable"}',
+                    status_code=503,
+                )
+        return super().report_result(task_id, status, payload)
+
+
 class ConflictXquant:
     def report_result(self, task_id: str, status: str, payload) -> None:
         raise XquantAdapterError(
@@ -2020,6 +2036,50 @@ def test_sync_submitted_orders_marks_empty_retry_plan_noop(tmp_path) -> None:
     assert payload["planned_orders"] == []
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
     assert payload["meta"]["order_lifecycle"]["reason"] == "submitted_order_timeout"
+
+
+def test_empty_retry_plan_report_failure_retries_and_marks_synced(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.xquant = FailingFirstDryRunSuccessXquant()  # type: ignore[assignment]
+    empty_plan_task = task()
+    empty_plan_task.targets[0].target_weight = 0.02
+    service.storage.record_task_received(empty_plan_task, status="submitted")
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    retry_result = service.sync_submitted_orders_once()
+    payload = service.storage.load_task_result_payload("task-1")
+
+    assert retry_result[-1]["status"] == "dry_run_success"
+    assert retry_result[-1]["xquant_synced"] is False
+    assert broker.cancelled == ["1082169287"]
+    assert broker.placed == []
+    assert payload["status"] == "dry_run_success"
+    assert payload["meta"]["xquant_synced"] is False
+    assert "result_unavailable" in payload["meta"]["xquant_report_error"]
+    assert payload["meta"]["order_lifecycle"]["reason"] == "submitted_order_timeout"
+
+    result = service.sync_results(status="dry_run_success")
+
+    assert result == [
+        {"task_id": "task-1", "status": "dry_run_success", "xquant_synced": True}
+    ]
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "dry_run_success"
+    assert payload["meta"]["xquant_synced"] is True
+    assert "xquant_report_error" not in payload["meta"]
+    assert service.xquant.dry_run_success_attempts == 2  # type: ignore[attr-defined]
 
 
 def test_sync_submitted_orders_validates_empty_retry_plan(tmp_path) -> None:

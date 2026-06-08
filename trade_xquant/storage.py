@@ -757,6 +757,40 @@ class Storage:
             ).fetchall()
         return [row["task_id"] for row in rows]
 
+    def list_lifecycle_report_pending_task_ids(
+        self,
+        task_id: str | None = None,
+        status: str = "all",
+    ) -> list[str]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT task_id, status, payload_json
+                FROM task_results
+                ORDER BY created_at ASC
+                """
+            ).fetchall()
+        task_ids: list[str] = []
+        for row in rows:
+            if task_id and row["task_id"] != task_id:
+                continue
+            if status != "all" and row["status"] != status:
+                continue
+            if row["status"] not in {"failed", "dry_run_success"}:
+                continue
+            try:
+                payload = json.loads(row["payload_json"])
+            except json.JSONDecodeError:
+                continue
+            meta = payload.get("meta") if isinstance(payload, dict) else {}
+            if not isinstance(meta, dict) or meta.get("xquant_synced") is not False:
+                continue
+            lifecycle = meta.get("order_lifecycle")
+            if not isinstance(lifecycle, dict):
+                continue
+            task_ids.append(row["task_id"])
+        return task_ids
+
     def list_submitted_task_ids(self, task_id: str | None = None) -> list[str]:
         return self.list_syncable_task_ids(task_id=task_id, status="submitted")
 

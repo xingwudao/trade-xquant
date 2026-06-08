@@ -1063,7 +1063,13 @@ class GatewayService:
             payload = result.model_dump(mode="json")
             payload_meta = payload.setdefault("meta", {})
             if isinstance(payload_meta, dict):
+                payload_meta["xquant_synced"] = False
                 payload_meta["xquant_report_error"] = str(report_error)
+                if isinstance(report_error, XquantAdapterError):
+                    payload_meta["xquant_status_code"] = report_error.status_code
+                    hint = _xquant_report_error_hint(report_error)
+                    if hint:
+                        payload_meta["xquant_error_hint"] = hint
             self.storage.mark_task_result(task_id, status, payload)
             return {
                 "task_id": task_id,
@@ -1186,15 +1192,23 @@ class GatewayService:
             task_id=task_id,
             status=status,
         )
+        terminal_lifecycle_report_task_ids = self.storage.list_lifecycle_report_pending_task_ids(
+            task_id=task_id,
+            status=status,
+        )
+        terminal_lifecycle_report_seen = set(terminal_lifecycle_report_task_ids)
+        terminal_lifecycle_report_task_ids.extend(
+            syncable_task_id
+            for syncable_task_id in syncable_task_ids
+            if self._terminal_lifecycle_report_pending(syncable_task_id)
+            and syncable_task_id not in terminal_lifecycle_report_seen
+        )
+        terminal_lifecycle_report_seen = set(terminal_lifecycle_report_task_ids)
         task_ids = [
             syncable_task_id
             for syncable_task_id in syncable_task_ids
             if not self._has_terminal_order_lifecycle(syncable_task_id)
-        ]
-        terminal_lifecycle_report_task_ids = [
-            syncable_task_id
-            for syncable_task_id in syncable_task_ids
-            if self._terminal_lifecycle_report_pending(syncable_task_id)
+            and syncable_task_id not in terminal_lifecycle_report_seen
         ]
         task_id_set = set(task_ids)
         audit_task_ids = [
