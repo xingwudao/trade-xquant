@@ -915,10 +915,38 @@ def test_sync_submitted_orders_cancels_timed_out_pending_order(tmp_path, caplog)
     with caplog.at_level(logging.INFO, logger="trade_xquant.daemon"):
         result = service.sync_submitted_orders_once()
 
-    assert result == [{"task_id": "task-1", "status": "submitted"}]
+    assert result[0] == {"task_id": "task-1", "status": "submitted"}
+    assert result[-1]["status"] == "failed"
     assert broker.cancelled == ["1082169287"]
     assert broker.placed == []
     assert "1082169287" in caplog.text
+
+
+def test_sync_submitted_orders_marks_retry_budget_exhausted_terminal(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 0
+
+    result = service.sync_submitted_orders_once()
+    retry_result = result[-1]
+
+    assert retry_result["status"] == "failed"
+    assert retry_result["error"] == "retry budget exhausted"
+    assert broker.cancelled == ["1082169287"]
+    assert broker.placed == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "failed"
+    assert payload["errors"] == ["retry budget exhausted"]
+    assert payload["meta"]["order_lifecycle"]["retry_count"] == 0
+    assert payload["meta"]["order_lifecycle"]["reason"] == "retry_budget_exhausted"
+    assert payload["meta"]["order_lifecycle"]["cancelled_order_ids"] == ["1082169287"]
+    assert service.storage.list_syncable_task_ids(status="submitted") == []
 
 
 def test_sync_submitted_orders_retries_after_timeout_cancel(tmp_path, monkeypatch) -> None:
@@ -1004,13 +1032,18 @@ def test_sync_submitted_orders_audits_retry_report_failure(tmp_path, monkeypatch
 
     result = service.sync_submitted_orders_once()
 
-    assert result[-1]["status"] == "failed"
+    assert result[-1]["status"] == "submitted"
+    assert result[-1]["xquant_synced"] is False
+    assert result[-1]["status_code"] == 503
+    assert "result_unavailable" in result[-1]["error"]
     assert broker.cancelled == ["1082169287"]
     assert len(broker.placed) == 1
     payload = service.storage.load_task_result_payload("task-1")
-    assert payload["status"] == "failed"
-    assert "result_unavailable" in payload["errors"][0]
+    assert payload["status"] == "submitted"
+    assert payload["submitted_orders"][0]["local_order_id"] == "retry-1"
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+    assert "result_unavailable" in payload["meta"]["xquant_report_error"]
+    assert service.storage.load_submitted_orders("task-1")[-1].local_order_id == "retry-1"
 
 
 def test_sync_submitted_orders_marks_empty_retry_plan_noop(tmp_path) -> None:

@@ -570,8 +570,7 @@ class GatewayService:
                     cancelled_order_ids=cancelled,
                     reason="submitted_order_timeout",
                 )
-                if retry_result.get("status") != "retry_budget_exhausted":
-                    results.append(retry_result)
+                results.append(retry_result)
         return results
 
     def _order_lifecycle_meta(self, task_id: str) -> dict[str, object]:
@@ -667,11 +666,19 @@ class GatewayService:
         reason: str,
     ) -> dict[str, object]:
         retry_count = self._retry_count(task_id)
+        task = self.storage.load_task(task_id)
         if retry_count >= self.settings.runtime.max_rebalance_retries:
             logger.info("rebalance retry budget exhausted: task_id=%s", task_id)
-            return {"task_id": task_id, "status": "retry_budget_exhausted"}
+            return self._record_failed_retry_result(
+                task_id,
+                task=task,
+                planned_orders=None,
+                retry_count=retry_count,
+                cancelled_order_ids=cancelled_order_ids,
+                reason="retry_budget_exhausted",
+                error=RuntimeError("retry budget exhausted"),
+            )
 
-        task = self.storage.load_task(task_id)
         if task is None:
             logger.error("cannot retry missing task: task_id=%s", task_id)
             return {"task_id": task_id, "status": "missing_task"}
@@ -722,8 +729,6 @@ class GatewayService:
             self.storage.record_execution_result(result)
             status = result.status if result.status in {"dry_run_success", "submitted"} else "failed"
             self.storage.mark_task_result(task_id, status, result.model_dump(mode="json"))
-            self.xquant.report_result(task_id, status, result)
-            return {"task_id": task_id, "status": status, "retry_count": next_retry_count}
         except Exception as exc:  # noqa: BLE001 - cancelled retries must be audited
             logger.exception("rebalance retry failed after cancellation: task_id=%s", task_id)
             return self._record_failed_retry_result(
@@ -738,6 +743,25 @@ class GatewayService:
                 fallback_positions=positions,
                 fallback_prices=prices,
             )
+        try:
+            self.xquant.report_result(task_id, status, result)
+        except Exception as exc:  # noqa: BLE001 - local active orders must remain durable
+            logger.exception("failed to report retry result to Xquant: task_id=%s", task_id)
+            payload = result.model_dump(mode="json")
+            payload_meta = payload.setdefault("meta", {})
+            if isinstance(payload_meta, dict):
+                payload_meta["xquant_report_error"] = str(exc)
+            self.storage.mark_task_result(task_id, status, payload)
+            return {
+                "task_id": task_id,
+                "status": status,
+                "retry_count": next_retry_count,
+                "xquant_synced": False,
+                "status_code": exc.status_code if isinstance(exc, XquantAdapterError) else None,
+                "error": str(exc),
+                "hint": _xquant_report_error_hint(exc) if isinstance(exc, XquantAdapterError) else None,
+            }
+        return {"task_id": task_id, "status": status, "retry_count": next_retry_count}
 
     def _submitted_order_timed_out(self, task_id: str, now: datetime | None = None) -> bool:
         created_at = self.storage.latest_submitted_order_created_at(task_id)
