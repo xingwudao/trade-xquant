@@ -1088,6 +1088,52 @@ def test_sync_submitted_orders_does_not_cancel_without_current_qmt_order(
     assert "order_lifecycle" not in payload["meta"]
 
 
+def test_sync_submitted_orders_no_current_qmt_order_skips_retry_budget_terminal(
+    tmp_path,
+) -> None:
+    broker = NoPendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 0
+
+    result = service.sync_submitted_orders_once()
+
+    assert result == [{"task_id": "task-1", "status": "submitted"}]
+    assert broker.cancelled == []
+    assert broker.placed == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert "order_lifecycle" not in payload["meta"]
+
+
+def test_sync_submitted_orders_no_current_qmt_order_skips_preflight_failure(
+    tmp_path,
+) -> None:
+    broker = NoPendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+
+    result = service.sync_submitted_orders_once()
+
+    assert result == [{"task_id": "task-1", "status": "submitted"}]
+    assert broker.cancelled == []
+    assert broker.placed == []
+    payload = service.storage.load_task_result_payload("task-1")
+    assert payload["status"] == "submitted"
+    assert "order_lifecycle" not in payload["meta"]
+
+
 def test_sync_submitted_orders_second_timeout_cancels_current_retry_only(
     tmp_path,
     monkeypatch,

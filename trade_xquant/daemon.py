@@ -551,10 +551,6 @@ class GatewayService:
                 continue
             if not self._submitted_order_timed_out(task_id):
                 continue
-            preflight = self._preflight_retry_rebalance_task(task_id)
-            if preflight.get("status") != "ok":
-                results.append(preflight)
-                continue
             submitted_orders = self.storage.load_submitted_orders(task_id)
             payload = self.storage.load_task_result_payload(task_id) or {}
             synced_orders = [
@@ -566,6 +562,16 @@ class GatewayService:
                 payload,
                 synced_orders,
             )
+            if not current_pending_orders:
+                logger.info(
+                    "submitted order timeout skipped without current pending QMT orders: task_id=%s",
+                    task_id,
+                )
+                continue
+            preflight = self._preflight_retry_rebalance_task(task_id)
+            if preflight.get("status") != "ok":
+                results.append(preflight)
+                continue
             cancelled, errors = self._cancel_pending_submitted_orders(
                 submitted_orders,
                 current_pending_orders,
