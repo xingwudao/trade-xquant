@@ -788,6 +788,28 @@ class Storage:
             ).fetchall()
         return [SubmittedOrder.model_validate_json(row["raw_json"]) for row in rows]
 
+    def latest_submitted_order_created_at(self, task_id: str) -> str | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(created_at) AS created_at
+                FROM submitted_orders
+                WHERE task_id=?
+                """,
+                (task_id,),
+            ).fetchone()
+        return str(row["created_at"]) if row and row["created_at"] else None
+
+    def load_task_result_payload(self, task_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM task_results WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload_json"])
+
     def reset_task(self, task_id: str) -> None:
         with self._connection() as conn:
             conn.execute("DELETE FROM task_results WHERE task_id=?", (task_id,))

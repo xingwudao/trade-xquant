@@ -569,3 +569,46 @@ def test_condition_audit_report_status_update_missing_raises(tmp_path) -> None:
         storage.update_condition_audit_report_status("condition:missing", "failed")
 
     assert exc.value.args == ("condition:missing",)
+
+
+def test_storage_loads_latest_submitted_order_created_at(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.record_execution_result(
+        ExecutionResult(
+            task_id="task-1",
+            status="submitted",
+            mode="real",
+            planned_orders=[],
+            submitted_orders=[
+                SubmittedOrder(
+                    task_id="task-1",
+                    symbol="513100.SH",
+                    side="buy",
+                    quantity=100,
+                    price=1.0,
+                    amount=100.0,
+                    local_order_id="1",
+                )
+            ],
+        )
+    )
+
+    value = storage.latest_submitted_order_created_at("task-1")
+
+    assert isinstance(value, str)
+    assert value
+
+
+def test_storage_loads_task_result_payload(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+    storage.mark_task_result(
+        "task-1",
+        "submitted",
+        {"status": "submitted", "meta": {"order_lifecycle": {"retry_count": 2}}},
+    )
+
+    payload = storage.load_task_result_payload("task-1")
+
+    assert payload["meta"]["order_lifecycle"]["retry_count"] == 2
