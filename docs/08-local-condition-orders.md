@@ -3,7 +3,7 @@
 This file documents the temporary local JSON contract used while the Xquant
 server-side task emitter is still being developed.
 
-See `docs/conditional-stop-take-profit-rules.md` for the full stop-loss and
+See `docs/07-conditional-stop-take-profit-rules.md` for the full stop-loss and
 take-profit rule taxonomy, parameterization requirements, applicability,
 risks, and validation requirements.
 

@@ -85,7 +85,7 @@ report plan/result back to Xquant.
 Read during design:
 
 - Local `hello.py`, already validated against MiniQMT.
-- `docs/qmt-miniqmt-setup-and-hello-validation.md`.
+- `docs/02-qmt-miniqmt-setup-and-validation.md`.
 - QMT Python API PDF sections on `passorder`, callbacks, order objects,
   deal objects, and price/order type constants.
 - GitHub `xingwudao/xquant`, especially API contract and signal/run models.

@@ -87,7 +87,7 @@ Copy `config.example.yaml` to `config.yaml`.
   this file instead of calling Xquant task APIs.
 - This is for developing the trade-xquant side of the contract before Xquant
   emits matching gateway tasks.
-- The schema is documented in `docs/local-condition-orders.md`.
+- The schema is documented in `docs/08-local-condition-orders.md`.
 
 `runtime.simulate_real_orders`
 - Used only with `runtime.broker_adapter: "mock"`.

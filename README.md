@@ -98,7 +98,7 @@ Multiple top-level packages discovered in a flat-layout
 QMT 安装和 hello 验证记录见：
 
 ```text
-docs/qmt-miniqmt-setup-and-hello-validation.md
+docs/02-qmt-miniqmt-setup-and-validation.md
 ```
 
 Mac / Linux 仅做 Xquant API 测试时安装：
@@ -611,10 +611,14 @@ python -m compileall trade_xquant hello.py
 
 ## 更多文档
 
-- `docs/architecture.md`
-- `docs/configuration.md`
-- `docs/operations.md`
-- `docs/daemon-order-lifecycle.md`
-- `docs/xquant-api-contract.md`
-- `docs/qmt-runtime-notes.md`
-- `docs/qmt-miniqmt-setup-and-hello-validation.md`
+- `docs/detailed-design.md`
+- `docs/01-system-architecture.md`
+- `docs/02-qmt-miniqmt-setup-and-validation.md`
+- `docs/03-configuration.md`
+- `docs/04-xquant-api-contract.md`
+- `docs/05-qmt-runtime-notes.md`
+- `docs/06-daemon-order-lifecycle.md`
+- `docs/07-conditional-stop-take-profit-rules.md`
+- `docs/08-local-condition-orders.md`
+- `docs/09-operations.md`
+- `docs/10-order-generation-algorithm.md`
