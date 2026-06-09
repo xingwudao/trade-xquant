@@ -36,6 +36,29 @@ MiniQMT 交易网关。
 请使用 `mock-run`。它会使用本地模拟交易客户端，覆盖任务拉取、
 计划回传、模拟委托、事件回传和成交回传。
 
+## 推荐用户操作流程
+
+首次部署建议按这个顺序操作：
+
+1. 在 Windows QMT 机器上安装并激活 `.venv`。
+2. 复制 `config.example.yaml` 为 `config.yaml`，填写 Xquant 和 QMT 账户信息。
+3. 使用 `login` 登录 Xquant，生成本地 `xquant-token.json`。
+4. 使用 `register-account` 把本地交易网关账户注册到 Xquant。
+5. 使用 `doctor` 检查 Python、配置文件和 `xtquant` 环境。
+6. 使用 `check-qmt` 确认 MiniQMT 已登录、账号正确、`独立交易` 已勾选。
+7. 先用 `dry-run` 检查任务、价格、目标权重和风控，不真实下单。
+8. 小额实盘前，人工确认 Xquant 任务和本地风控参数。
+9. 只在有人值守的交易时段打开真实下单安全门。
+10. 使用 `daemon` 作为日常运行方式。
+
+日常运行时，推荐只保留一个 daemon 进程。daemon 会自动拉取新任务，
+同步 condition order，回传 heartbeat，跟踪已提交订单和成交结果，
+并在安全条件满足时处理超时撤单和重试。
+
+如果只是本地联调 Xquant API，不连接真实 QMT，使用 `mock-run`。
+如果只是临时处理一次任务，可以使用 `poll-once`。正式连续运行使用
+`daemon`。
+
 ## 安装
 
 推荐 Python 3.11，最低需要 Python 3.10。
@@ -397,13 +420,14 @@ trade-xquant poll-once --config config.yaml
 
 ## 常驻轮询
 
-持续轮询：
+正式运行建议使用 daemon：
 
 ```bash
 trade-xquant daemon --config config.yaml
 ```
 
-每轮 daemon 会先处理 pending task，再向 Xquant 发送一次 heartbeat。
+daemon 是推荐的日常使用方式。每轮 daemon 会先处理 pending task，
+再向 Xquant 发送一次 heartbeat。
 每次 heartbeat 都会先检查 QMT 连接状态。如果 QMT 可连接，
 heartbeat 会带上当前 `cash`、`total_asset` 和 `holdings`，
 用于刷新页面上的在线状态和当前持仓结果；如果 QMT 不可连接，
