@@ -617,8 +617,7 @@ python -m compileall trade_xquant hello.py
 - `docs/03-configuration.md`
 - `docs/04-xquant-api-contract.md`
 - `docs/05-qmt-runtime-notes.md`
-- `docs/06-daemon-order-lifecycle.md`
-- `docs/07-conditional-stop-take-profit-rules.md`
-- `docs/08-local-condition-orders.md`
+- `docs/06-order-generation-algorithm.md`
+- `docs/07-daemon-order-lifecycle.md`
+- `docs/08-conditional-stop-take-profit-rules.md`
 - `docs/09-operations.md`
-- `docs/10-order-generation-algorithm.md`

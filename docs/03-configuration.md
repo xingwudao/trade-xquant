@@ -95,8 +95,8 @@
 - 可选本地 JSON 任务文件。
 - 设置后，`poll-once`、`dry-run`、`mock-run` 和 `daemon` 会从该文件读取任务，
   不再调用 Xquant task API。
-- 用于 Xquant 正式发出匹配 gateway task 之前开发 trade-xquant 侧契约。
-- schema 见 `docs/08-local-condition-orders.md`。
+- 仅用于本地开发、联调和回归测试，不属于正式生产契约。
+- 生产环境应使用 Xquant 通过 `/trading-gateway/tasks` 下发的正式任务。
 
 `runtime.simulate_real_orders`
 - 只用于 `runtime.broker_adapter: "mock"`。
