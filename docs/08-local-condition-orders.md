@@ -1,23 +1,20 @@
-# Local Condition Order JSON
+# 本地条件单 JSON
 
-This file documents the temporary local JSON contract used while the Xquant
-server-side task emitter is still being developed.
+本文档说明 Xquant 服务端任务生成器仍在开发期间使用的临时本地 JSON 契约。
 
-See `docs/07-conditional-stop-take-profit-rules.md` for the full stop-loss and
-take-profit rule taxonomy, parameterization requirements, applicability,
-risks, and validation requirements.
+完整止损止盈规则分类、参数化要求、适用范围、风险和校验要求见
+`docs/07-conditional-stop-take-profit-rules.md`。
 
-All numeric condition values in local fixtures are placeholders for local
-development only. Production values must be determined by Xquant-side
-backtests and sent in the trading task payload. trade-xquant must not
-hardcode trading thresholds from examples.
+本地 fixture 中的所有数值条件都只是本地开发占位值。生产数值必须由
+Xquant 侧回测决定，并通过交易任务请求体下发。trade-xquant 不能从示例中
+硬编码交易阈值。
 
-The goal is for Xquant to later emit the same shape through the formal
-`/trading-gateway/tasks` API. The local file is only a development source.
+目标是让 Xquant 后续通过正式 `/trading-gateway/tasks` API 发出同样结构。
+本地文件只是开发数据源。
 
-## Config
+## 配置
 
-Set:
+设置：
 
 ```yaml
 runtime:
@@ -26,17 +23,17 @@ runtime:
   mock_submit_dry_run_orders: true
 ```
 
-Then run an existing command, for example:
+然后运行已有命令，例如：
 
 ```bash
 trade-xquant mock-run --config config.yaml
 ```
 
-No CLI flag is required.
+不需要额外 CLI 参数。
 
-## File Shape
+## 文件结构
 
-The file may contain either:
+文件可以包含以下对象：
 
 ```json
 {
@@ -44,16 +41,16 @@ The file may contain either:
 }
 ```
 
-or a top-level task list:
+也可以是顶层任务列表：
 
 ```json
 []
 ```
 
-Each task is the existing `RebalanceTask` shape. Stop-loss and take-profit
-condition orders live under `constraints.condition_orders`.
+每个任务都使用现有 `RebalanceTask` 结构。止损止盈条件单位于
+`constraints.condition_orders`。
 
-## Example
+## 示例
 
 ```json
 {
@@ -123,30 +120,29 @@ condition orders live under `constraints.condition_orders`.
 }
 ```
 
-## Supported Single-Instrument Rules
+## 支持的单标的规则
 
-Local JSON may mock every Xquant single-instrument sell-side condition rule:
+本地 JSON 可以模拟每一种 Xquant 单标的卖出侧条件规则：
 
-- `static_pct` with `purpose: "stop_loss"`
-- `static_pct` with `purpose: "take_profit"`
-- `trailing_pct` with `purpose: "stop_loss"`
-- `trailing_pct` with `purpose: "take_profit"`
-- `atr_trailing` with `purpose: "stop_loss"`
-- `atr_trailing` with `purpose: "take_profit"`
-- `hv_log_trailing` with `purpose: "stop_loss"`
-- `hv_log_trailing` with `purpose: "take_profit"`
-- `std_trailing` with `purpose: "stop_loss"`
-- `std_trailing` with `purpose: "take_profit"`
+- `static_pct`，搭配 `purpose: "stop_loss"`
+- `static_pct`，搭配 `purpose: "take_profit"`
+- `trailing_pct`，搭配 `purpose: "stop_loss"`
+- `trailing_pct`，搭配 `purpose: "take_profit"`
+- `atr_trailing`，搭配 `purpose: "stop_loss"`
+- `atr_trailing`，搭配 `purpose: "take_profit"`
+- `hv_log_trailing`，搭配 `purpose: "stop_loss"`
+- `hv_log_trailing`，搭配 `purpose: "take_profit"`
+- `std_trailing`，搭配 `purpose: "stop_loss"`
+- `std_trailing`，搭配 `purpose: "take_profit"`
 
-The JSON file mocks Xquant task payloads only. It does not store high-water
-state, activation state, indicator snapshots, trigger evidence, or execution
-audits. Those are stored in SQLite.
+JSON 文件只模拟 Xquant 任务请求体。它不保存高水位状态、激活状态、
+指标快照、触发证据或执行审计。这些内容保存在 SQLite 中。
 
-Task payloads may carry reference prices and rule hyperparameters.
-Market-derived state is created and updated by trade-xquant at runtime.
+任务请求体可以携带基准价格和规则超参数。市场推导出的状态由
+trade-xquant 在运行时创建和更新。
 
-When the rule reference depends on the executed holding cost, local JSON should
-mock the Xquant payload with:
+当规则基准依赖执行后的持仓成本时，本地 JSON 应使用以下结构模拟
+Xquant 请求体：
 
 ```json
 {
@@ -154,15 +150,15 @@ mock the Xquant payload with:
 }
 ```
 
-In that case `reference_price` is omitted from the Xquant payload. After
-execution, trade-xquant reads the latest QMT aggregate position `cost_price`
-and stores it as the condition instance reference price.
+这种情况下，Xquant 请求体会省略 `reference_price`。执行后，
+trade-xquant 读取最新 QMT 聚合持仓的 `cost_price`，并将其保存为条件单实例
+的基准价格。
 
-## Execution
+## 执行
 
-When a condition triggers, trade-xquant creates a normal sell `PlannedOrder`.
+当条件触发时，trade-xquant 会创建普通卖出 `PlannedOrder`。
 
-The order uses:
+订单使用：
 
 ```text
 task_id = condition:{source_task_id}:{condition_id}
@@ -170,23 +166,22 @@ remark = cond:{condition_id}
 price_type = latest
 ```
 
-If the generated `task_id` would exceed Xquant length limits, trade-xquant
-replaces `source_task_id` with a short hash. The audit payload still includes
-the full `source_task_id`.
+如果生成的 `task_id` 会超过 Xquant 长度限制，trade-xquant 会用短哈希替换
+`source_task_id`。审计请求体仍包含完整 `source_task_id`。
 
-The order then goes through the existing `RiskControl` and `ExecutionEngine`.
+订单随后进入现有 `RiskControl` 和 `ExecutionEngine`。
 
-Condition state is stored in SQLite:
+条件单状态保存在 SQLite：
 
 - `condition_orders`
 - `condition_order_events`
 
-Active states are:
+活跃状态：
 
 - `received`
 - `armed`
 
-Terminal or non-active states are:
+终态或非活跃状态：
 
 - `triggered`
 - `submitting`

@@ -1,69 +1,66 @@
-# Architecture
+# 系统架构
 
-## Scope
+## 范围
 
-This MVP is a CLI and background polling service. It does not expose a GUI
-and does not accept inbound callbacks from Xquant. The Windows gateway pulls
-tasks from Xquant and executes through the local MiniQMT process.
+当前 MVP 是一个 CLI 和后台轮询服务。它不提供 GUI，也不接收 Xquant
+主动回调。Windows 网关从 Xquant 拉取任务，并通过本地 MiniQMT 执行。
 
-Xquant is the primary system of record for gateway tasks, plans, submitted
-orders, events, trades, and task results. The local SQLite database is kept
-for idempotency, cross-checking, and debugging.
+Xquant 是网关任务、订单计划、已提交委托、事件、成交和任务结果的主系统。
+本地 SQLite 数据库用于幂等、交叉校验和问题排查。
 
-## Components
+## 组件
 
 `XquantAdapter`
-- Logs in through the Xquant auth API and stores a local JWT token file.
-- Registers the account and sends periodic heartbeat data.
-- Pulls pending target-weight tasks from `/trading-gateway/tasks`.
-- Reports order plans, submitted orders, events, trades, and final results.
+- 通过 Xquant auth API 登录，并保存本地 JWT token 文件。
+- 注册交易账户，并定期发送 heartbeat。
+- 从 `/trading-gateway/tasks` 拉取待处理的目标权重任务。
+- 回传订单计划、已提交委托、事件、成交和最终结果。
 
 `QmtAdapter`
-- Wraps `xtquant.xttrader.XtQuantTrader`.
-- Connects to `userdata_mini`, registers callbacks, subscribes the account,
-  queries assets, holdings, orders, trades, prices, and sends `order_stock`.
-- Normalizes QMT callback objects into `QmtGatewayEvent`.
+- 封装 `xtquant.xttrader.XtQuantTrader`。
+- 连接 `userdata_mini`，注册回调，订阅账户。
+- 查询资产、持仓、委托、成交和价格，并调用 `order_stock` 下单。
+- 将 QMT 回调对象标准化为 `QmtGatewayEvent`。
 
 `PortfolioEngine`
-- Converts target weights, account assets, holdings, and prices into orders.
-- Uses a conservative rule algorithm:
-  sell unwanted exposure first, reserve cash buffer, then buy by target gap.
-- Enforces 100-share lots for buys and sells.
+- 将目标权重、账户资产、持仓和价格转换为订单。
+- 使用保守的规则算法：
+  先卖出不需要的敞口，保留现金 buffer，再按目标缺口买入。
+- 买入和卖出都强制使用 100 股整数手。
 
 `RiskControl`
-- Validates pre-trade gates before execution.
-- Blocks expired, duplicate, account-mismatched, invalid-weight, unknown-price,
-  oversized, high-turnover, and unsafe real-order tasks.
+- 在执行前校验交易安全门。
+- 阻止过期、重复、账户不匹配、权重非法、价格未知、金额过大、
+  换手过高和不安全的真实下单任务。
 
 `ExecutionEngine`
-- Records dry-run plans without submitting.
-- In real mode, checks the double real-order gate and submits one order at a
-  time through the broker adapter.
-- MVP does not implement chasing or slicing.
+- dry-run 只记录计划，不提交委托。
+- real mode 会检查双真实下单安全门，并通过 broker adapter 逐笔提交订单。
+- MVP 不实现追单或拆单算法。
 
 `Storage`
-- SQLite audit database.
-- Tables: `tasks`, `target_positions`, `planned_orders`,
-  `submitted_orders`, `order_events`, `trades`, `task_results`.
-- Terminal tasks are not reprocessed unless explicitly reset.
+- SQLite 审计数据库。
+- 表包括：`tasks`、`target_positions`、`planned_orders`、
+  `submitted_orders`、`order_events`、`trades`、`task_results`。
+- 终态任务不会重复处理，除非显式重置。
 
-## Data Flow
+## 数据流
 
-1. `daemon` or `poll-once` starts and loads `config.yaml`.
-2. The gateway fetches pending formal tasks from Xquant.
-3. Each task is claimed in SQLite.
-4. QMT account, positions, and prices are queried.
-5. `PortfolioEngine` builds an order plan.
-6. `RiskControl` validates the task and plan.
-7. Dry-run records the plan only; real-run submits orders through QMT.
-8. SQLite stores plans, submitted orders, callback events, and task result.
-9. Xquant receives plan and result reports.
-10. In daemon mode, each loop also sends a heartbeat. If QMT can be queried,
-    the heartbeat includes current `cash`, `total_asset`, and `holdings`.
+1. `daemon` 或 `poll-once` 启动并加载 `config.yaml`。
+2. 网关从 Xquant 拉取待处理的正式任务。
+3. 每个任务在 SQLite 中 claim。
+4. 查询 QMT 账户、持仓和价格。
+5. `PortfolioEngine` 生成订单计划。
+6. `RiskControl` 校验任务和计划。
+7. dry-run 只记录计划；real-run 通过 QMT 提交订单。
+8. SQLite 存储计划、已提交委托、回调事件和任务结果。
+9. Xquant 接收计划和结果上报。
+10. daemon mode 下，每轮还会发送 heartbeat。如果 QMT 可查询，
+    heartbeat 会包含当前 `cash`、`total_asset` 和 `holdings`。
 
-## Xquant Task Mode
+## Xquant 任务模式
 
-The default mode assumes Xquant implements:
+默认模式假设 Xquant 实现这些接口：
 
 ```text
 GET /api/v1/trading-gateway/tasks
@@ -71,23 +68,15 @@ POST /api/v1/trading-gateway/tasks/{task_id}/plan
 POST /api/v1/trading-gateway/tasks/{task_id}/result
 ```
 
-Xquant creates account-scoped tasks when a subscribed portfolio generates a
-new signal. The task remains valid until Xquant supersedes it with the next
-signal or returns it in a terminal state. `expires_at` may be `null` in this
-formal contract.
+当订阅组合产生新信号时，Xquant 为账户创建任务。任务在被新信号取代前，
+或被 Xquant 标记为终态前保持有效。正式合约中 `expires_at`
+可以为 `null`。
 
-`poll-once` always uses the formal gateway task API. Legacy
-`xquant.product_code` configuration is ignored so every executed task can
-report plan/result back to Xquant.
+`poll-once` 总是使用正式 gateway task API。旧的 `xquant.product_code`
+配置会被忽略，这样每个执行任务都能绑定到明确的 Xquant `task_id`。
 
-## Source References
+## 来源参考
 
-Read during design:
-
-- Local `hello.py`, already validated against MiniQMT.
-- `docs/02-qmt-miniqmt-setup-and-validation.md`.
-- QMT Python API PDF sections on `passorder`, callbacks, order objects,
-  deal objects, and price/order type constants.
-- GitHub `xingwudao/xquant`, especially API contract and signal/run models.
-- GitHub `xingwudao/open-xquant/src/oxq/contrib`, especially the Alpaca
-  adapter shape that keeps broker-specific REST/WebSocket code isolated.
+- `docs/02-qmt-miniqmt-setup-and-validation.md`。
+- 本地 `hello.py` 验证脚本。
+- QMT PDF 手册位于 `docs/qmt/`。

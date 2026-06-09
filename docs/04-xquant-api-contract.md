@@ -1,28 +1,27 @@
-# Xquant Trading Gateway API Contract
+# Xquant 交易网关 API 契约
 
-## Background
+## 背景
 
-Xquant generates account-scoped trading tasks when a subscribed portfolio
-produces a new signal on its calculation day. A task remains valid until a
-new signal supersedes it or Xquant marks it terminal.
+当订阅组合在计算日产生新信号时，Xquant 会生成账户维度的交易任务。
+任务在被新信号取代前，或被 Xquant 标记为终态前保持有效。
 
-The local gateway uses this contract to authenticate, register its account,
-pull executable tasks, and report plans and execution results.
+本地网关使用本契约完成鉴权、注册账户、拉取可执行任务，并回传订单计划
+和执行结果。
 
-## Authentication
+## 鉴权
 
-Use one of:
+使用以下方式之一：
 
 - `Authorization: Bearer <token>`
-- A future internal token header if Xquant chooses service-token auth.
+- 如果 Xquant 后续选择服务令牌鉴权，也可以使用内部 token header。
 
-The MVP sends `Authorization` when `xquant.api_token` is configured.
+MVP 在配置了 `xquant.api_token` 时发送 `Authorization`。
 
-## Register Account
+## 注册账户
 
 `POST /api/v1/trading-gateway/accounts`
 
-Payload:
+请求体：
 
 ```json
 {
@@ -36,13 +35,13 @@ Payload:
 }
 ```
 
-The endpoint should be idempotent by `account_id`.
+该接口应按 `account_id` 幂等。
 
-## Heartbeat
+## 心跳
 
 `POST /api/v1/trading-gateway/accounts/{account_id}/heartbeat`
 
-Payload:
+请求体：
 
 ```json
 {
@@ -53,11 +52,11 @@ Payload:
 }
 ```
 
-## Fetch Pending Tasks
+## 拉取待处理任务
 
 `GET /api/v1/trading-gateway/tasks?account_id={account_id}&limit=10`
 
-Response:
+响应体：
 
 ```json
 {
@@ -86,22 +85,22 @@ Response:
 }
 ```
 
-Rules:
+规则：
 
-- `task_id` is globally unique and idempotent.
-- `account_id` must match the local QMT account.
-- `signal_as_of_date` is the signal calculation date.
-- `signal_effective_date` is the date encoded into rebalance task IDs.
-- Target weights must sum to `<= 1`; remainder is cash.
-- `expires_at` may be `null`; when null, validity lasts until superseded.
-- Xquant should stop returning superseded or terminal tasks as pending.
-- Unsupported asset classes must not be sent to this MVP.
+- `task_id` 全局唯一，并作为幂等键。
+- `account_id` 必须匹配本地 QMT 账户。
+- `signal_as_of_date` 是信号计算日期。
+- `signal_effective_date` 是写入调仓任务 ID 的生效日期。
+- 目标权重总和必须 `<= 1`，剩余部分视为现金。
+- `expires_at` 可以为 `null`；为空时，任务有效性持续到被新任务取代。
+- Xquant 不应继续把已取代或终态任务作为待处理任务返回。
+- MVP 不支持的资产类别不应下发。
 
-## Manual Task Preview
+## 手动任务预览
 
 `POST /api/v1/trading-gateway/products/{product_code}/manual-tasks/preview`
 
-Payload:
+请求体：
 
 ```json
 {
@@ -110,7 +109,7 @@ Payload:
 }
 ```
 
-Response:
+响应体：
 
 ```json
 {
@@ -133,18 +132,18 @@ Response:
 }
 ```
 
-Rules:
+规则：
 
-- Preview must not create a task.
-- `preview_token` is required by the confirm endpoint.
-- Xquant should generate preview data from the actionable delta signal,
-  not from an empty latest target-only signal.
+- 预览不能创建任务。
+- 确认接口必须携带 `preview_token`。
+- Xquant 应从可执行的增量信号生成预览数据，
+  不应从空的最新 target-only 信号生成。
 
-## Manual Task Confirm
+## 手动任务确认
 
 `POST /api/v1/trading-gateway/products/{product_code}/manual-tasks`
 
-Payload:
+请求体：
 
 ```json
 {
@@ -154,7 +153,7 @@ Payload:
 }
 ```
 
-Response:
+响应体：
 
 ```json
 {
@@ -165,14 +164,14 @@ Response:
 }
 ```
 
-The created task should then be returned by `GET /trading-gateway/tasks`
-until claimed and completed by the gateway.
+创建出的任务随后应由 `GET /trading-gateway/tasks` 返回，直到网关认领
+并完成它。
 
-## Report Plan
+## 上报计划
 
 `POST /api/v1/trading-gateway/tasks/{task_id}/plan`
 
-Payload is the local `OrderPlan` JSON:
+请求体是本地 `OrderPlan` JSON：
 
 ```json
 {
@@ -193,11 +192,11 @@ Payload is the local `OrderPlan` JSON:
 }
 ```
 
-## Report Result
+## 上报结果
 
 `POST /api/v1/trading-gateway/tasks/{task_id}/result`
 
-Payload:
+请求体：
 
 ```json
 {
@@ -212,7 +211,7 @@ Payload:
 }
 ```
 
-Status values:
+状态值：
 
 - `success`
 - `failed`
@@ -220,37 +219,32 @@ Status values:
 - `submitted`
 - `superseded`
 
-Xquant should treat repeated result reports for the same `task_id` as
-idempotent updates.
+Xquant 应把同一个 `task_id` 的重复结果上报视为幂等更新。
 
-## Report Condition Result
+## 上报条件单结果
 
 `POST /api/v1/trading-gateway/tasks/{source_task_id}/condition-results`
 
-The gateway calls this endpoint after a condition rule triggers and local
-condition execution has produced an `ExecutionResult`.
+当条件规则触发且本地条件单执行产生 `ExecutionResult` 后，
+网关调用该接口。
 
-Payload includes:
+请求体包含：
 
-- `source_task_id`.
-- `condition_id`.
-- `condition_task_id`.
-- `account_id`.
-- `portfolio_id`.
-- `symbol`.
-- `status`.
-- `trigger` with `triggered_at`, `latest_price`, `trigger_price`, and
-  `reason`.
-- `rule` with `scope`, `purpose`, `method`, `params`, and `action`.
-- `market_state` with latest price, high-water price, trigger price,
-  activation state, indicator values, computed timestamp, market data
-  source, and nested local state fields.
-- `execution_result`, the local `ExecutionResult` JSON.
+- `source_task_id`
+- `condition_id`
+- `condition_task_id`
+- `account_id`
+- `portfolio_id`
+- `symbol`
+- `status`
+- `trigger`，包含 `triggered_at`、`latest_price`、`trigger_price` 和 `reason`
+- `rule`，包含 `scope`、`purpose`、`method`、`params` 和 `action`
+- `market_state`，包含最新价、高水位价格、触发价格、激活状态、
+  指标值、计算时间、行情数据来源，以及嵌套的本地状态字段
+- `execution_result`，即本地 `ExecutionResult` JSON
 
-Example values are illustrative. Numeric rule parameters are task-supplied
-values determined by Xquant-side research, backtesting, and configuration.
-Market-state values are gateway-derived runtime snapshots, not hardcoded
-thresholds or defaults.
+示例数值只用于说明结构。数值型规则参数由 Xquant 侧研究、回测和配置决定，
+并通过任务下发。`market_state` 是网关运行时快照，不是硬编码阈值或默认值。
 
 ```json
 {
@@ -332,53 +326,49 @@ thresholds or defaults.
 }
 ```
 
-Rules:
+规则：
 
-- `condition_task_id` is idempotent.
-- For condition-triggered trades, trade-xquant uses
-  `condition:{source_task_id}:{condition_id}` when it fits Xquant length
-  limits. If it would exceed 160 characters, trade-xquant uses
-  `condition:{source_task_hash}:{condition_id}` and still sends
-  `source_task_id` in the audit payload.
-- A failed condition-result report must not cause repeated trading.
-- Xquant should accept repeated audit reports for the same
-  `condition_task_id` idempotently.
+- `condition_task_id` 是幂等键。
+- 对条件单触发的交易，trade-xquant 会在长度允许时使用
+  `condition:{source_task_id}:{condition_id}`。如果超过 160 字符，
+  trade-xquant 使用 `condition:{source_task_hash}:{condition_id}`，
+  并仍在审计请求体中发送 `source_task_id`。
+- 条件单结果上报失败不能导致重复交易。
+- Xquant 应按 `condition_task_id` 幂等接受重复审计上报。
 
-## Condition Rule Template Responsibility
+## 条件规则模板职责
 
-Xquant should send condition rule templates as portfolio/account-level
-configuration. The gateway instantiates those templates against the aggregate
-holding for each symbol after local execution and QMT position refresh.
+Xquant 应把条件规则模板作为组合或账户级配置发送。网关在本地执行并刷新
+QMT 持仓后，把这些模板实例化到每个标的的聚合持仓上。
 
-Xquant sends:
+Xquant 发送：
 
-- `id`: stable rule template id, for example `stop_loss-trailing_pct-1`.
-- `scope: "instrument"`.
-- `purpose`.
-- `method`.
-- `params`: backtest-derived hyperparameters only.
-- `action`.
-- `reference.source: "position_cost_price"`.
+- `id`: 稳定的规则模板 ID，例如 `stop_loss-trailing_pct-1`
+- `scope: "instrument"`
+- `purpose`
+- `method`
+- `params`: 仅包含回测得出的超参数
+- `action`
+- `reference.source: "position_cost_price"`
 
-Xquant must not send `reference_price` for rules whose reference depends on
-the executed holding cost. After trading, trade-xquant reads the latest QMT
-position `cost_price`, writes it as the condition instance `reference_price`,
-and derives runtime values such as activation price, high-water price, and
-trigger price locally.
+对于依赖成交后持仓成本作为基准的规则，Xquant 不应发送
+`reference_price`。
+交易完成后，trade-xquant 读取最新 QMT 持仓 `cost_price`，将其写为本地
+条件单实例的 `reference_price`，并在本地推导激活价格、高水位价格、
+触发价格等运行时数值。
 
-For the current MVP, rule instances are bound to aggregate holdings:
+当前 MVP 中，规则实例绑定到聚合持仓：
 
 ```text
 account_id + portfolio_id + symbol + rule_template_id
 ```
 
-trade-xquant expands each template into local condition instances:
+trade-xquant 将每个模板展开为本地条件单实例：
 
 ```text
 condition_id = cond-{portfolio_id}-{symbol}-{rule_template_id}
 ```
 
-When the same portfolio later adds to an existing symbol, Xquant should keep
-the same rule template id. trade-xquant refreshes the aggregate holding
-reference price from QMT and updates the existing condition instance rather
-than requiring Xquant to create lot-level rules.
+当同一组合后续加仓同一 `symbol` 时，Xquant 应保持同一个规则模板 ID。
+trade-xquant 从 QMT 刷新聚合持仓基准价格，并更新已有条件单实例，
+不要求 Xquant 创建批次级规则。

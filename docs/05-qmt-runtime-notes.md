@@ -1,22 +1,22 @@
-# QMT Runtime Notes
+# QMT 运行说明
 
-## Required Runtime State
+## 必要运行状态
 
-- QMT is installed on the Windows trading machine.
-- QMT is logged in with the intended stock account.
-- `独立交易` is checked at login.
-- `userdata_mini` path is configured.
-- Strategy trading permission is enabled for the account.
+- QMT 已安装在 Windows 交易机器上。
+- QMT 已用目标证券账户登录。
+- 登录时已勾选 `独立交易`。
+- 已配置 `userdata_mini` 路径。
+- 账户已开通策略交易权限。
 
-The validated path from local notes is:
+本地验证过的路径为：
 
 ```text
 C:\Apps\QMT\国金证券QMT交易端\userdata_mini
 ```
 
-## MiniQMT Connection
+## MiniQMT 连接
 
-`QmtAdapter.connect()` uses:
+`QmtAdapter.connect()` 使用：
 
 ```python
 trader = XtQuantTrader(userdata_mini_path, session_id)
@@ -25,59 +25,57 @@ connect_result = trader.connect()
 subscribe_result = trader.subscribe(account)
 ```
 
-Both results must be `0`.
+`connect_result` 和 `subscribe_result` 都必须为 `0`。
 
-Session ID defaults to an auto-generated value based on current time. This
-avoids collisions from a fixed session ID. A fixed value can be configured
-only when the operator knows no other process is using it.
+session ID 默认按当前时间自动生成，以避免固定 session ID 冲突。
+只有在操作者确认没有其他进程使用同一 session 时，才应配置固定值。
 
-## Order API
+## 订单 API
 
-The MVP uses `xtquant.xttrader.order_stock`, not model-trading `passorder`.
+MVP 使用 `xtquant.xttrader.order_stock`，不使用模型交易的 `passorder`。
 
-QMT PDF notes:
+QMT PDF 记录：
 
-- `passorder` operation `23` is stock buy.
-- `passorder` operation `24` is stock sell.
-- Price type `5` is latest price.
-- Price type `11` is fixed/model price.
-- Price type `14` is counterparty price.
-- Callback data includes order and deal objects with order sys ID, status,
-  traded volume, trade amount, remark, and error fields.
+- `passorder` 操作 `23` 是股票买入。
+- `passorder` 操作 `24` 是股票卖出。
+- 但 `XtQuantTrader.order_stock` 已提供更直接的 Python API。
 
-`order_stock` is better for this gateway because the process is an external
-Windows service, not a QMT model script.
+`order_stock` 返回 `-1` 表示下单失败。网关必须把它当作错误。
 
-## Callback Handling
+`cancel_order_stock` 返回 `0` 表示撤单成功。任何非 `0` 返回值都必须当作
+撤单失败，不能触发重试。
 
-The adapter registers callbacks for:
+## Callback 处理
 
-- `on_connected`
-- `on_disconnected`
+`QmtAdapter` 注册 `XtQuantTraderCallback`，并将这些对象标准化为事件：
+
 - `on_stock_order`
 - `on_stock_trade`
 - `on_order_error`
-- `on_cancel_error`
-- `on_order_stock_async_response`
-- `on_cancel_order_stock_async_response`
 
-Callbacks are normalized to `QmtGatewayEvent` and stored in SQLite
-`order_events`.
+标准化事件写入本地审计存储，也会包含在任务结果请求体中。
 
-Do not rely only on `order_id` to determine success. A successful API return
-means the request was accepted by the local interface; final state comes from
-order queries, trades, and error callbacks.
+即使回调缺失，daemon 仍会通过 QMT 当前委托和成交查询补充同步状态。
+因此回调是审计增强，不是唯一状态来源。
 
-## Troubleshooting `connect_result=-1`
+## `connect_result=-1` 排查
 
-Checklist:
+常见原因：
 
-- Confirm QMT is running and logged in.
-- Confirm `独立交易` was checked at login.
-- Confirm `userdata_mini` is used, not an unrelated directory.
-- Confirm account has strategy trading permission.
-- Confirm the Python process and QMT run as the same Windows user.
-- Try a different `session_id` or leave it `null` for auto generation.
-- Run the original `hello.py check` to isolate SDK/runtime issues.
-- Check QMT client popups, permission prompts, and network state.
+- MiniQMT 未打开或未登录。
+- 未勾选 `独立交易`。
+- `userdata_mini_path` 指向错误目录。
+- 当前 Python 进程没有权限访问 QMT runtime 文件。
+- `session_id` 与其他进程冲突。
+- QMT 内部 queue 或 writer 资源耗尽。
+- 磁盘空间不足。
 
+处理顺序：
+
+1. 关闭其他 QMT 测试脚本或 daemon。
+2. 确认 MiniQMT 已登录正确账户。
+3. 确认 `userdata_mini_path`。
+4. 保持 `qmt.session_id: null`，使用自动 session。
+5. 清理磁盘空间，尤其是 `userdata_mini` 下的 queue 文件。
+6. 重启 MiniQMT。
+7. 再运行 `trade-xquant check-qmt --config config.yaml`。

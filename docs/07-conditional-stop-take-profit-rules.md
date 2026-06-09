@@ -1,862 +1,710 @@
-# Conditional Stop-Loss And Take-Profit Rules
+# 条件止损止盈规则
 
-This document is the development reference for conditional stop-loss and
-take-profit rules in trade-xquant.
+本文档是 trade-xquant 条件止损止盈规则的开发参考。
 
-Source document:
-- Feishu: `量化交易止盈止损完整体系手册`
-- URL:
-  `https://icnzri2zfn9e.feishu.cn/docx/SCz6dluyqoReycxTcVocdK2Ingb`
-- Fetched with `lark-cli docs +fetch --api-version v2`
-- Source revision read during drafting: `351`
+来源文档：
 
-## Non-Negotiable Parameter Rule
+- 飞书：`量化交易止盈止损完整体系手册`
+- URL: `https://icnzri2zfn9e.feishu.cn/docx/SCz6dluyqoReycxTcVocdK2Ingb`
+- 获取方式：`lark-cli docs +fetch --api-version v2`
+- 起草时读取的来源版本：`351`
 
-Every numeric value from the Feishu document must be treated as a parameter.
+## 不可协商的参数规则
 
-trade-xquant must not hardcode:
+飞书文档中的所有数值都必须被视为参数。
 
-- Stop-loss percentages.
-- Take-profit percentages.
-- Trailing drawdown percentages.
-- ATR windows.
-- ATR multipliers.
-- HV windows.
-- HV annualization factors.
-- HV lambda values.
-- Standard-deviation windows.
-- Standard-deviation multipliers.
-- Minimum reward-risk ratios.
-- Activation thresholds.
-- Execution percentages.
-- Holding-period buckets.
-- Account-level drawdown or profit thresholds.
+trade-xquant 不能硬编码：
 
-Concrete parameter values must be determined by Xquant-side research,
-backtesting, validation, and portfolio configuration. They are then delivered
-to the gateway through Xquant trading tasks.
+- 止损百分比。
+- 止盈百分比。
+- 追踪回撤百分比。
+- ATR 窗口。
+- ATR 倍数。
+- HV 窗口。
+- HV 年化因子。
+- HV lambda 值。
+- 标准差窗口。
+- 标准差倍数。
+- 最小盈亏比。
+- 激活阈值。
+- 执行百分比。
+- 持有周期分桶。
+- 账户级回撤或盈利阈值。
 
-The gateway may validate presence, types, ranges, and consistency. It must not
-invent defaults for trading thresholds.
+具体参数值必须由 Xquant 侧研究、回测、验证和组合配置决定，
+再通过 Xquant 交易任务下发给网关。
 
-## Development Scope
+网关可以校验参数是否存在、类型是否正确、范围是否安全、组合是否一致。
+网关不能为交易阈值发明默认值。
 
-This document describes the full rule taxonomy from the Feishu document and
-normalizes it into implementable contracts.
+## 开发范围
 
-Current MVP implementation:
-- `instrument` scope only.
-- Sell-side conditional exits only.
-- `static_pct`.
-- `trailing_pct`.
-- `atr_trailing`.
-- `hv_log_trailing`.
-- `std_trailing`.
-- Activation gates for trailing take-profit.
-- Condition values under `constraints.condition_orders`.
-- Local SQLite condition state and audit storage.
-- Xquant condition-result audit reporting.
+本文档描述飞书文档中的完整规则分类，并把它归一化为可实现契约。
 
-Bar-based `atr_trailing`, `hv_log_trailing`, and `std_trailing` rules are
-implemented and testable through the engine and mock adapter. The real `qmt`
-adapter does not yet provide historical price bars. In production QMT mode,
-bar-based rules will record per-order evaluation errors until QMT historical
-bars are wired.
+当前 MVP 已实现：
 
-Future implementation may add:
-- Portfolio-scope rules.
-- Portfolio-level liquidation or partial de-risk actions.
+- 仅支持 `instrument` scope。
+- 仅支持卖出侧条件退出。
+- `static_pct`。
+- `trailing_pct`。
+- `atr_trailing`。
+- `hv_log_trailing`。
+- `std_trailing`。
+- 追踪止盈的激活门槛。
+- `constraints.condition_orders` 下发条件值。
+- 本地 SQLite 条件单状态和审计存储。
+- Xquant 条件单结果审计上报。
 
-## Core Concepts
+基于 K 线的 `atr_trailing`、`hv_log_trailing` 和 `std_trailing` 已在引擎
+和模拟 adapter 中实现并可测试。真实 `qmt` adapter 目前尚未提供历史 K 线。
+生产 QMT 模式下，在接入 QMT 历史 K 线前，这些基于 K 线的规则会记录逐条
+条件评估错误。
+
+未来可加入：
+
+- 组合范围规则。
+- 组合级清仓或部分降风险动作。
+
+## 核心概念
 
 `stop_loss`
-- Purpose: control loss or downside risk.
-- Fixed stop-loss usually triggers below entry price.
-- Trailing stop-loss can move upward after price or account wealth makes a
-  new high.
-- It can exit at a loss, breakeven, or profit depending on market path.
+- 目标是控制亏损或下行风险。
+- 固定止损通常在低于入场价时触发。
+- 追踪止损可以在价格或账户财富创新高后上移。
+- 它可能在亏损、回本或盈利状态下退出，取决于市场路径。
 
 `take_profit`
-- Purpose: realize or lock in profit.
-- Fixed take-profit usually triggers above entry price.
-- Trailing take-profit should normally be activated only after a configured
-  profit gate is reached.
-- After activation, it exits on a pullback from the high-water mark.
+- 目标是兑现或锁定收益。
+- 固定止盈通常在高于入场价时触发。
+- 追踪止盈通常应在达到配置的盈利门槛后才激活。
+- 激活后，它在高水位回撤时退出。
 
-Important distinction:
-- Trailing stop-loss and trailing take-profit can use the same mathematical
-  line.
-- They are different business rules because they have different purpose,
-  activation semantics, reporting, and validation requirements.
+重要区别：
 
-## Normalized Symbols
+- 追踪止损和追踪止盈可以使用相同数学线。
+- 它们是不同业务规则，因为目的、激活语义、上报和校验要求不同。
 
-Instrument price variables:
-- `P_t`: latest instrument price.
-- `P_in`: entry or reference price supplied by Xquant.
-- `P_high_t`: high-water price since the condition became active.
-- `H_t`: current bar high, used for ATR calculation.
-- `L_t`: current bar low, used for ATR calculation.
-- `C_t`: current bar close.
-- `ATR_t`: average true range computed from a parameterized window.
-- `HV_t`: annualized historical volatility of log returns.
-- `sigma_P_t`: standard deviation of recent price observations.
+## 归一化符号
 
-Portfolio wealth variables:
-- `W_t`: latest account or portfolio wealth.
-- `W_0`: reference wealth supplied by Xquant.
-- `W_high_t`: high-water wealth since the condition became active.
-- `ATR_W_t`: account or portfolio wealth true range.
-- `HV_W_t`: annualized historical volatility of wealth log returns.
-- `sigma_W_t`: standard deviation of recent wealth observations.
+单标的价格变量：
 
-Parameter naming:
-- Use explicit names in task payloads.
-- Avoid ambiguous names like `N` in the API contract.
-- `N` in the Feishu document maps to method-specific parameters such as
-  `atr_multiple` or `std_multiple`.
+- `P_t`: 最新标的价格。
+- `P_in`: Xquant 提供的入场价或基准价格。
+- `P_high_t`: 条件单激活以来的高水位价格。
+- `H_t`: 当前 K 线最高价，用于 ATR。
+- `L_t`: 当前 K 线最低价，用于 ATR。
+- `C_t`: 当前 K 线收盘价。
+- `ATR_t`: 参数化窗口计算出的平均真实波幅。
+- `HV_t`: 对数收益的年化历史波动率。
+- `sigma_P_t`: 最近价格序列的标准差。
 
-## Condition Order Shape
+组合财富变量：
 
-Condition orders live under:
+- `W_t`: 最新账户或组合财富。
+- `W_0`: Xquant 提供的 reference wealth。
+- `W_high_t`: 条件单激活以来的高水位财富。
+- `ATR_W_t`: 账户或组合财富 true range。
+- `HV_W_t`: 财富对数收益的年化历史波动率。
+- `sigma_W_t`: 最近财富序列的标准差。
+
+参数命名：
+
+- 任务请求体中使用明确参数名。
+- API 契约避免使用 `N` 这种含糊名称。
+- 飞书文档中的 `N` 映射为方法特定参数，例如 `atr_multiple`
+  或 `std_multiple`。
+
+## 条件单结构
+
+条件单位于：
 
 ```text
 constraints.condition_orders[]
 ```
 
-Recommended normalized fields:
+推荐归一化字段：
 
 ```json
 {
-  "id": "stable rule template id",
+  "id": "稳定规则模板 ID",
   "scope": "instrument | portfolio",
   "purpose": "stop_loss | take_profit",
   "method": "static_pct | trailing_pct | atr_trailing | hv_log_trailing | std_trailing",
-  "params": {"hyperparameters": "numbers or strings required by the method"},
+  "params": {"hyperparameters": "该方法要求的数字或字符串"},
   "action": {"type": "sell_pct", "pct": 1.0},
   "reference": {"source": "position_cost_price"},
   "enabled": true
 }
 ```
 
-Implementation notes:
-- JSON examples use strings above only to document shape.
-- Real task payloads must use typed values.
-- Xquant task payloads contain hyperparameters, the explicit action, and
-  reference-source metadata when the reference depends on eventual holding
-  cost.
-- Xquant sends portfolio/account-level rule templates. If a rule has `id` but
-  no `symbol`, trade-xquant expands it to one local condition instance per
-  task target symbol.
-- For execution-cost-based rules, Xquant sends
-  `reference.source: "position_cost_price"` and does not send
-  `reference_price`.
-- The local condition instance id is:
-  `cond-{portfolio_id}-{symbol}-{rule_template_id}`.
-- The gateway owns runtime state in the current MVP: QMT position cost
-  references, high-water values, activation state, indicator snapshots,
-  trigger evidence, and execution audit payloads are stored in SQLite and
-  condition audit reports.
-- The gateway must reject rules whose required parameters are missing,
-  malformed, or outside safe ranges.
-- `action.type` is required.
-- `sell_pct` requires `action.pct`, and `0 < pct <= 1`.
-- `clear` may omit `action.pct` because the action type already means full
-  clear of the sellable target position.
+实现说明：
 
-## Actions
+- 上面的 JSON 示例只用于说明 shape。
+- 真实任务请求体必须使用类型化字段值。
+- Xquant 任务请求体包含超参数、明确动作，以及基准依赖最终持仓成本时的
+  基准来源元数据。
+- Xquant 发送组合或账户级规则模板。如果规则有 `id` 但没有 `symbol`，
+  trade-xquant 会把它展开为每个任务目标标的的本地条件单实例。
+- 对依赖成交成本的规则，Xquant 发送 `reference.source: "position_cost_price"`，
+  不发送 `reference_price`。
+- 本地条件单实例 ID 为：
+  `cond-{portfolio_id}-{symbol}-{rule_template_id}`。
+- 当前 MVP 中，网关拥有运行时状态：QMT 持仓成本基准、高水位值、
+  激活状态、指标快照、触发证据和执行审计请求体都存储在 SQLite
+  和条件单审计报告中。
+- gateway 必须拒绝缺失、格式错误或超出安全范围的必要参数。
+- `action.type` 必填。
+- `sell_pct` 需要 `action.pct`，且 `0 < pct <= 1`。
+- `clear` 可以省略 `action.pct`，因为动作类型已表示清空可卖目标仓位。
 
-Supported action concepts:
+## 动作
+
+支持的动作概念：
 
 `sell_pct`
-- Sell a parameterized percentage of the sellable position.
-- `action.pct` is supplied by Xquant.
+- 卖出可卖仓位的参数化百分比。
+- `action.pct` 由 Xquant 下发。
 
 `clear`
-- Clear sellable position for the target instrument or portfolio scope.
-- The exact liquidation behavior must respect QMT lot size, sellable quantity,
-  risk gates, and market restrictions.
+- 清空目标标的或组合 scope 下的可卖仓位。
+- 具体清仓行为必须遵守 QMT 整手、可卖数量、风控和市场限制。
 
-Future action concepts:
-- Portfolio-level partial de-risk.
-- Portfolio-level full liquidation.
-- Symbol whitelist or blacklist for portfolio actions.
+未来动作概念：
 
-## Instrument Stop-Loss Rules
+- 组合级部分降风险。
+- 组合级全部清仓。
+- 组合动作使用的 symbol 白名单或黑名单。
 
-### Static Percentage Stop-Loss
+## 单标的止损规则
 
-Purpose:
-- Cap loss against an instrument reference price.
+### 静态百分比止损
 
-Required task data:
-- `scope: "instrument"`.
-- `purpose: "stop_loss"`.
-- `method: "static_pct"`.
-- `reference_price`.
-- `params.stop_loss_pct`.
+目的：
+- 针对单标的基准价格限制亏损。
 
-Trigger line:
+必需任务数据：
+- `scope: "instrument"`。
+- `purpose: "stop_loss"`。
+- `method: "static_pct"`。
+- `reference_price`。
+- `params.stop_loss_pct`。
+
+触发线：
 
 ```text
 trigger_price = reference_price * (1 - params.stop_loss_pct)
 ```
 
-Trigger condition:
+触发条件：
 
 ```text
 P_t <= trigger_price
 ```
 
-Applicable scenarios:
-- Short-horizon strategies.
-- Mean-reversion or range strategies with predefined invalidation level.
-- First implementation because it is simple and auditable.
+适用场景：
 
-Risks:
-- Can be triggered by short-lived price spikes.
-- Does not adapt to current volatility.
-- May execute worse than trigger price because of gaps or poor liquidity.
+- 短周期策略。
+- 均值回归或区间策略，且有预定义 invalidation level。
+- 最适合作为第一版实现，因为简单且可审计。
 
-Validation requirements:
-- `reference_price` must be positive.
-- `params.stop_loss_pct` must be present and valid.
-- Xquant must backtest the parameter for the strategy and symbol universe.
+风险：
 
-### Fixed-Ratio Trailing Stop-Loss
+- 可能被短时价格尖刺触发。
+- 不适应当前波动率。
+- gap 或流动性差时，执行价可能劣于触发价。
 
-Purpose:
-- Move the downside protection line upward when the instrument reaches a new
-  high-water price.
+### 固定比例追踪止损
 
-Required task data:
-- `scope: "instrument"`.
-- `purpose: "stop_loss"`.
-- `method: "trailing_pct"`.
-- `reference_price`.
-- `params.trail_pct`.
+目的：
+- 当价格创新高后上移止损线，限制回撤。
 
-Trigger line:
+必需任务数据：
+- `scope: "instrument"`。
+- `purpose: "stop_loss"`。
+- `method: "trailing_pct"`。
+- `reference_price`。
+- `params.trailing_drawdown_pct`。
+
+状态：
 
 ```text
-high_water_price = max(gateway_stored_high_water_price, reference_price, P_t)
-trigger_price = high_water_price * (1 - params.trail_pct)
+P_high_t = max(reference_price, max(P_i since condition start))
 ```
 
-Trigger condition:
+触发线：
+
+```text
+trigger_price = P_high_t * (1 - params.trailing_drawdown_pct)
+```
+
+触发条件：
 
 ```text
 P_t <= trigger_price
 ```
 
-Applicable scenarios:
-- Trend-following positions.
-- Positions that need protection to improve after favorable movement.
+适用场景：
 
-Risks:
-- Tight parameters may exit during normal pullbacks.
-- If activated from entry, it can still close at a loss.
-- Gateway high-water tracking can diverge from Xquant research assumptions if
-  market data sources differ.
+- 趋势跟随。
+- 动量持仓。
+- 希望保留上行空间但限制回撤的仓位。
 
-Validation requirements:
-- Backtest with slippage, fees, gaps, and symbol liquidity.
-- Validate repeated trigger prevention and idempotency.
+风险：
 
-### ATR Trailing Stop-Loss
+- 在震荡行情中可能频繁触发。
+- 回撤百分比过小会过早退出。
+- 回撤百分比过大可能放弃大量浮盈。
 
-Purpose:
-- Adapt trailing stop distance to recent instrument volatility.
+### ATR 追踪止损
 
-Required task data:
-- `scope: "instrument"`.
-- `purpose: "stop_loss"`.
-- `method: "atr_trailing"`.
-- `params.atr_window`.
-- `params.atr_multiple`.
-- `params.bar_interval`.
+目的：
+- 使用波动率自适应的追踪止损。
 
-True range:
+必需任务数据：
+- `scope: "instrument"`。
+- `purpose: "stop_loss"`。
+- `method: "atr_trailing"`。
+- `reference_price`。
+- `params.atr_window`。
+- `params.atr_multiple`。
+- `params.bar_interval`。
+
+True range：
 
 ```text
 TR_t = max(
   H_t - L_t,
   abs(H_t - C_{t-1}),
-  abs(C_{t-1} - L_t)
+  abs(L_t - C_{t-1})
 )
 ```
 
-Trigger line:
+ATR：
 
 ```text
-trigger_price = high_water_price - params.atr_multiple * ATR_t
+ATR_t = average(TR over params.atr_window)
 ```
 
-Trigger condition:
+触发线：
 
 ```text
-P_t <= trigger_price
+trigger_price = P_high_t - params.atr_multiple * ATR_t
 ```
 
-Corrections from source:
-- The source used `P_H,t` both as rolling high-water price and current bar
-  high. This document uses `P_high_t` for rolling high-water price and `H_t`
-  for current bar high.
-- Any source value for ATR window is a parameter, not an implementation
-  default.
-
-Applicable scenarios:
-- Volatility-sensitive trend strategies.
-- Mixed symbol universes where fixed percentages are too rigid.
-
-Risks:
-- ATR measures volatility, not direction.
-- Wide ATR in volatile markets can allow larger losses.
-- ATR data quality and bar interval must be aligned with the strategy.
-
-Validation requirements:
-- Xquant must define data frequency and ATR calculation method.
-- Backtests must include volatility regime changes.
-- Stress tests must include gaps and high-volatility reversals.
-
-### HV Log-Return Trailing Stop-Loss
-
-Purpose:
-- Use return volatility to produce a percentage-style trailing line that is
-  more comparable across different price levels.
-
-Required task data:
-- `scope: "instrument"`.
-- `purpose: "stop_loss"`.
-- `method: "hv_log_trailing"`.
-- `params.hv_window`.
-- `params.hv_annualization`.
-- `params.lambda`.
-- `params.bar_interval`.
-
-Trigger line:
-
-```text
-trigger_price = high_water_price * exp(-params.lambda * HV_t)
-```
-
-Trigger condition:
+触发条件：
 
 ```text
 P_t <= trigger_price
 ```
 
-Applicable scenarios:
-- Cross-instrument stock or ETF portfolios.
-- Strategies that need percentage-consistent volatility adaptation.
+适用场景：
 
-Risks:
-- Assumes log-return volatility is a useful risk proxy.
-- Volatility can lag sudden regime changes.
-- Large `lambda` values can create very wide exits.
+- 波动率变化明显的趋势策略。
+- 固定百分比不适合不同波动水平的标的。
 
-Validation requirements:
-- Xquant must define the HV window, annualization convention, and input bars.
-- Parameter stability must be checked by symbol class and market regime.
+风险：
 
-### Standard-Deviation Trailing Stop-Loss
+- 需要可靠 bar 数据。
+- ATR 窗口和倍数必须回测决定。
+- gap、停牌、异常 bar 会影响触发线。
 
-Purpose:
-- Use absolute price-point volatility to define the trailing distance.
+### HV 对数收益追踪止损
 
-Required task data:
-- `scope: "instrument"`.
-- `purpose: "stop_loss"`.
-- `method: "std_trailing"`.
-- `params.std_window`.
-- `params.std_multiple`.
-- `params.bar_interval`.
+目的：
+- 使用历史波动率调整追踪距离。
 
-Trigger line:
+必需任务数据：
+- `scope: "instrument"`。
+- `purpose: "stop_loss"`。
+- `method: "hv_log_trailing"`。
+- `reference_price`。
+- `params.hv_window`。
+- `params.hv_annualization_factor`。
+- `params.hv_multiple`。
+
+对数收益：
 
 ```text
-trigger_price = high_water_price - params.std_multiple * sigma_P_t
+r_t = ln(P_t / P_{t-1})
 ```
 
-Trigger condition:
+历史波动率：
+
+```text
+HV_t = std(r over params.hv_window) * sqrt(params.hv_annualization_factor)
+```
+
+触发线：
+
+```text
+trigger_price = P_high_t * (1 - params.hv_multiple * HV_t)
+```
+
+触发条件：
 
 ```text
 P_t <= trigger_price
 ```
 
-Corrections from source:
-- This is not the same as HV log-return volatility.
-- It is an absolute price standard-deviation model.
+适用场景：
 
-Applicable scenarios:
-- Same-instrument strategies.
-- Futures or other fixed-point trading contexts.
-- Symbol groups with similar price scales.
+- 波动率本身是重要风险尺度的组合。
+- 希望不同标的按相对波动率调整回撤线。
 
-Risks:
-- Not naturally comparable across high-price and low-price instruments.
-- Can distort percentage drawdown across symbol universes.
+风险：
 
-Validation requirements:
-- Xquant must only enable it where absolute point movement is meaningful.
-- Backtests must check price-scale sensitivity.
+- 对窗口选择敏感。
+- 短窗口可能噪声大。
+- 长窗口可能反应慢。
 
-## Portfolio Stop-Loss Rules
+### 标准差追踪止损
 
-Portfolio stop-loss rules use account or portfolio wealth instead of a single
-instrument price.
+目的：
+- 用最近价格标准差设定追踪距离。
 
-### Portfolio Static Stop-Loss
+必需任务数据：
+- `scope: "instrument"`。
+- `purpose: "stop_loss"`。
+- `method: "std_trailing"`。
+- `reference_price`。
+- `params.std_window`。
+- `params.std_multiple`。
 
-Required task data:
-- `scope: "portfolio"`.
-- `purpose: "stop_loss"`.
-- `method: "static_pct"`.
-- `reference_wealth`.
-- `params.stop_loss_pct`.
+价格标准差：
 
-Trigger line:
+```text
+sigma_P_t = std(P over params.std_window)
+```
+
+触发线：
+
+```text
+trigger_price = P_high_t - params.std_multiple * sigma_P_t
+```
+
+触发条件：
+
+```text
+P_t <= trigger_price
+```
+
+适用场景：
+
+- 简化版波动率追踪。
+- 不需要完整 ATR 计算的场景。
+
+风险：
+
+- 对价格尺度敏感。
+- 与百分比波动率相比，可比性较差。
+
+## 组合止损规则
+
+### 组合静态止损
+
+目的：
+- 限制账户或组合财富相对 reference wealth 的回撤。
+
+必需任务数据：
+- `scope: "portfolio"`。
+- `purpose: "stop_loss"`。
+- `method: "static_pct"`。
+- `reference_wealth`。
+- `params.stop_loss_pct`。
+- `action`。
+
+触发线：
 
 ```text
 trigger_wealth = reference_wealth * (1 - params.stop_loss_pct)
 ```
 
-Trigger condition:
+触发条件：
 
 ```text
 W_t <= trigger_wealth
 ```
 
-Applicable scenarios:
-- Account-level maximum drawdown control.
-- Portfolio-level risk cap across many positions.
+风险：
 
-Risks:
-- May force liquidation of otherwise profitable positions.
-- Wealth calculation must match Xquant's accounting basis.
+- 组合级动作会影响多个标的，执行风险高于单标的动作。
+- 需要明确定义可卖资产范围和执行顺序。
 
-Validation requirements:
-- Define account wealth source and timestamp.
-- Validate behavior for cash, frozen cash, pending orders, and unsettled trades.
+### 组合追踪止损
 
-### Portfolio Trailing Stop-Loss
+目的：
+- 保护组合财富高点后的回撤。
 
-Required task data:
-- `scope: "portfolio"`.
-- `purpose: "stop_loss"`.
-- `method: "trailing_pct"`.
-- `reference_wealth`.
-- `params.trail_pct`.
-
-Trigger line:
+状态：
 
 ```text
-high_water_wealth = max(gateway_stored_high_water_wealth, reference_wealth, W_t)
-trigger_wealth = high_water_wealth * (1 - params.trail_pct)
+W_high_t = max(reference_wealth, max(W_i since condition start))
 ```
 
-Trigger condition:
+触发线：
+
+```text
+trigger_wealth = W_high_t * (1 - params.trailing_drawdown_pct)
+```
+
+触发条件：
 
 ```text
 W_t <= trigger_wealth
 ```
 
-Applicable scenarios:
-- Lock account-level gains after portfolio wealth makes new highs.
-- Trend or rotation portfolios where drawdown should trail wealth.
+风险：
 
-Risks:
-- Can trigger broad liquidation during temporary mark-to-market drawdowns.
-- Local portfolio valuation can diverge from Xquant.
+- 需要可靠账户净值或组合财富快照。
+- 触发后可能需要组合级批量执行。
 
-Validation requirements:
-- Define action granularity: partial de-risk, full liquidation, or target reset.
+### 组合 ATR、HV 和标准差止损
 
-### Portfolio ATR, HV, And Standard-Deviation Stop-Loss
+这些规则把单标的价格序列替换为组合财富序列。
 
-Use the same method families as instrument rules, replacing price series with
-wealth series:
+示例：
 
 ```text
-atr_trailing:
-trigger_wealth = high_water_wealth - params.atr_multiple * ATR_W_t
-
-hv_log_trailing:
-trigger_wealth = high_water_wealth * exp(-params.lambda * HV_W_t)
-
-std_trailing:
-trigger_wealth = high_water_wealth - params.std_multiple * sigma_W_t
+trigger_wealth = W_high_t - params.atr_multiple * ATR_W_t
+trigger_wealth = W_high_t * (1 - params.hv_multiple * HV_W_t)
+trigger_wealth = W_high_t - params.std_multiple * sigma_W_t
 ```
 
-Required task data follows the same parameter model:
-- `params.atr_window`.
-- `params.atr_multiple`.
-- `params.hv_window`.
-- `params.hv_annualization`.
-- `params.lambda`.
-- `params.std_window`.
-- `params.std_multiple`.
+当前 MVP 不实现 portfolio scope。后续实现前需要先明确：
 
-Corrections from source:
-- The source text says account trailing stop-loss has three subtypes, but then
-  lists four. This document treats them as four method families.
+- 组合财富数据来源。
+- 可卖范围。
+- 多标的执行顺序。
+- 部分降风险与全部清仓的动作契约。
 
-## Instrument Take-Profit Rules
+## 单标的止盈规则
 
-### Static Percentage Take-Profit
+### 静态百分比止盈
 
-Purpose:
-- Exit or reduce an instrument position after a configured profit target.
+目的：
+- 当价格达到基准价格上方的目标收益时退出或部分退出。
 
-Required task data:
-- `scope: "instrument"`.
-- `purpose: "take_profit"`.
-- `method: "static_pct"`.
-- `reference_price`.
-- `params.take_profit_pct`.
+必需任务数据：
+- `scope: "instrument"`。
+- `purpose: "take_profit"`。
+- `method: "static_pct"`。
+- `reference_price`。
+- `params.take_profit_pct`。
+- `action`。
 
-Trigger line:
+触发线：
 
 ```text
 trigger_price = reference_price * (1 + params.take_profit_pct)
 ```
 
-Trigger condition:
+触发条件：
 
 ```text
 P_t >= trigger_price
 ```
 
-Applicable scenarios:
-- Range-bound or mean-reversion systems.
-- Strategies that need fixed reward-risk planning.
+风险：
 
-Risks:
-- Can exit too early in strong trend markets.
-- Fixed targets can reduce upside if the entry signal has momentum edge.
+- 可能过早止盈，错过趋势延续。
+- 需要通过 Xquant 侧研究决定是否分批止盈。
 
-Validation requirements:
-- Xquant must validate reward-risk and expected value after costs.
-- Backtests must compare fixed take-profit against trailing exits.
+### 固定比例追踪止盈
 
-### Fixed-Ratio Trailing Take-Profit
+目的：
+- 价格达到激活盈利门槛后，使用高水位回撤锁定收益。
 
-Purpose:
-- Let profits run, then exit after a configured pullback from high-water price.
+必需任务数据：
+- `scope: "instrument"`。
+- `purpose: "take_profit"`。
+- `method: "trailing_pct"`。
+- `reference_price`。
+- `params.activation_profit_pct`。
+- `params.trailing_drawdown_pct`。
+- `action`。
 
-Required task data:
-- `scope: "instrument"`.
-- `purpose: "take_profit"`.
-- `method: "trailing_pct"`.
-- `reference_price` or `reference.source: "position_cost_price"`.
-- `params.trail_pct`.
-- One activation gate: `params.activation_profit_pct` or
-  `params.activation_price`.
-
-`reference_price` may be omitted when the rule uses
-`reference.source: "position_cost_price"`. In that case the gateway fills it
-from the latest QMT aggregate holding cost after execution, then derives the
-activation price locally.
-
-Trigger line after activation:
+激活条件：
 
 ```text
-high_water_price = max(gateway_stored_high_water_price, reference_price, P_t)
-trigger_price = high_water_price * (1 - params.trail_pct)
+P_t >= reference_price * (1 + params.activation_profit_pct)
 ```
 
-Trigger condition after activation:
+激活后状态：
 
 ```text
-P_t <= trigger_price
+P_high_t = max(P_i since activation)
 ```
 
-Correction from source:
-- The formula is mathematically similar to trailing stop-loss. The difference
-  is not the formula; it is the purpose and activation semantics.
-- Without an activation gate, trailing take-profit degenerates into a trailing
-  stop-loss-like rule.
-
-Applicable scenarios:
-- Trend-following positions.
-- Strategies where capturing larger winners matters more than fixed targets.
-
-Risks:
-- Gives back part of the high-water profit.
-- Can underperform fixed take-profit in choppy markets.
-
-Validation requirements:
-- Xquant must define the activation rule.
-- Backtests must report high-water giveback, realized reward-risk, and
-  transaction costs.
-
-### ATR, HV, And Standard-Deviation Trailing Take-Profit
-
-These mirror the trailing stop-loss families but use `purpose:
-"take_profit"` and require activation semantics.
+触发线：
 
 ```text
-atr_trailing:
-trigger_price = high_water_price - params.atr_multiple * ATR_t
-
-hv_log_trailing:
-trigger_price = high_water_price * exp(-params.lambda * HV_t)
-
-std_trailing:
-trigger_price = high_water_price - params.std_multiple * sigma_P_t
+trigger_price = P_high_t * (1 - params.trailing_drawdown_pct)
 ```
 
-Required task data follows the same parameter model:
-- Activation gate supplied as a hyperparameter.
-- Method-specific volatility parameters.
-- `params.bar_interval`.
+触发条件：
 
-Gateway runtime state stores activation, high-water, indicator snapshots, and
-trigger evidence. These fields are not parsed from current Xquant task
-payloads.
+```text
+activated == true and P_t <= trigger_price
+```
 
-Applicable scenarios:
-- Trend strategies.
-- Volatility-adaptive profit protection.
+风险：
 
-Risks:
-- High volatility widens exits and can return more profit before triggering.
-- Low volatility tightens exits and may leave a trend early.
+- 激活门槛过低时，规则会接近追踪止损。
+- 激活门槛过高时，可能永远不触发。
 
-Validation requirements:
-- Compare against static take-profit and fixed-ratio trailing take-profit.
-- Verify behavior across low-volatility, high-volatility, and reversal regimes.
+### ATR、HV 和标准差追踪止盈
 
-## Portfolio Take-Profit Rules
+这些方法与对应追踪止损使用相同指标，但必须带有止盈
+激活门槛。
 
-Portfolio take-profit rules use account or portfolio wealth.
+示例：
 
-### Portfolio Static Take-Profit
+```text
+activated = P_t >= reference_price * (1 + params.activation_profit_pct)
+trigger_price = P_high_t - params.atr_multiple * ATR_t
+trigger_price = P_high_t * (1 - params.hv_multiple * HV_t)
+trigger_price = P_high_t - params.std_multiple * sigma_P_t
+```
 
-Required task data:
-- `scope: "portfolio"`.
-- `purpose: "take_profit"`.
-- `method: "static_pct"`.
-- `reference_wealth`.
-- `params.take_profit_pct`.
+触发条件：
 
-Trigger line:
+```text
+activated == true and P_t <= trigger_price
+```
+
+## 组合止盈规则
+
+### 组合静态止盈
+
+目的：
+- 当组合财富达到基准财富上方的目标收益时执行动作。
+
+触发线：
 
 ```text
 trigger_wealth = reference_wealth * (1 + params.take_profit_pct)
 ```
 
-Trigger condition:
+触发条件：
 
 ```text
 W_t >= trigger_wealth
 ```
 
-Applicable scenarios:
-- Account-level target-return management.
-- Strategies with explicit portfolio reward-risk target.
+### 组合追踪止盈
 
-Risks:
-- Can force broad de-risking while individual positions still have edge.
-- Requires consistent wealth accounting.
+目的：
+- 组合财富达到激活收益后，通过高水位回撤锁定收益。
 
-### Portfolio Trailing Take-Profit
-
-Required task data:
-- `scope: "portfolio"`.
-- `purpose: "take_profit"`.
-- `method: "trailing_pct"`, `atr_trailing`, `hv_log_trailing`, or
-  `std_trailing`.
-- `reference_wealth`.
-- Activation gate supplied as a hyperparameter.
-- Method-specific parameters.
-
-Trigger families:
+激活条件：
 
 ```text
-trailing_pct:
-trigger_wealth = high_water_wealth * (1 - params.trail_pct)
-
-atr_trailing:
-trigger_wealth = high_water_wealth - params.atr_multiple * ATR_W_t
-
-hv_log_trailing:
-trigger_wealth = high_water_wealth * exp(-params.lambda * HV_W_t)
-
-std_trailing:
-trigger_wealth = high_water_wealth - params.std_multiple * sigma_W_t
+W_t >= reference_wealth * (1 + params.activation_profit_pct)
 ```
 
-Applicable scenarios:
-- Portfolio-level profit protection.
-- Trend or rotation portfolios with account-level high-water management.
-
-Risks:
-- Wealth drawdown can be caused by one large position or broad market move;
-  action policy must distinguish these cases if needed.
-- Portfolio liquidation can create turnover and tax/cost impact.
-
-Validation requirements:
-- Validate action policy against account exposure, concentration, and liquidity.
-- Verify that account-level rules have priority over instrument-level rules
-  when both trigger.
-
-## Reward-Risk Parameterization
-
-Static instrument reward-risk:
+触发线：
 
 ```text
-reward_risk = params.take_profit_pct / params.stop_loss_pct
+trigger_wealth = W_high_t * (1 - params.trailing_drawdown_pct)
 ```
 
-Static portfolio reward-risk:
+触发条件：
 
 ```text
-portfolio_reward_risk =
-  params.take_profit_pct / params.stop_loss_pct
+activated == true and W_t <= trigger_wealth
 ```
 
-Development requirements:
-- Minimum reward-risk thresholds are Xquant parameters.
-- The gateway must not hardcode any minimum reward-risk value.
-- If Xquant sends a `params.min_reward_risk`, the gateway may validate that
-  the supplied stop-loss and take-profit parameters satisfy it.
+当前 MVP 不实现 portfolio scope。
 
-Expected value must be validated by Xquant:
+## 盈亏比参数化
+
+如果 Xquant 需要把止损和止盈成对下发，应由 Xquant 侧保证盈亏比关系。
+
+网关可以校验：
 
 ```text
-expected_value =
-  win_rate * average_profit
-  - loss_rate * average_loss
-  - transaction_costs
-  - slippage_costs
+take_profit_distance / stop_loss_distance >= params.min_reward_risk_ratio
 ```
 
-Corrections from source:
-- Numeric ranges and minimum ratios in the source are research candidates,
-  not gateway defaults.
-- Strategy horizon labels such as short, medium, and long are Xquant research
-  classifications, not gateway constants.
+但 `min_reward_risk_ratio` 必须由 Xquant 下发，不能在网关硬编码。
 
-## Applicability Summary
+## 适用性摘要
 
-Static percentage rules:
-- Best for simple, auditable exits.
-- Best for range, mean-reversion, or fixed reward-risk strategies.
-- Risk: not volatility adaptive.
+`static_pct`
+- 优点：简单、可审计、容易解释。
+- 风险：不适应波动率。
+- MVP 状态：已实现。
 
-Fixed-ratio trailing rules:
-- Best for trend-following and high-water protection.
-- Risk: sensitive to pullback parameter and activation logic.
+`trailing_pct`
+- 优点：能保护高水位后的回撤。
+- 风险：参数过紧会频繁触发。
+- MVP 状态：已实现。
 
-ATR trailing rules:
-- Best for volatility-adaptive exits using recent price or wealth ranges.
-- Risk: ATR does not predict direction and can lag regime changes.
+`atr_trailing`
+- 优点：波动率自适应，适合趋势类规则。
+- 风险：依赖历史 bar。
+- MVP 状态：引擎和模拟 adapter 已实现，真实 QMT K 线未接入。
 
-HV log-return rules:
-- Best for cross-instrument or cross-account percentage-consistent volatility
-  adaptation.
-- Risk: depends on return-volatility assumptions and annualization convention.
+`hv_log_trailing`
+- 优点：跨标的相对波动率更可比。
+- 风险：对窗口和年化因子敏感。
+- MVP 状态：引擎和模拟 adapter 已实现，真实 QMT K 线未接入。
 
-Standard-deviation trailing rules:
-- Best for fixed-point or same-price-scale strategies.
-- Risk: not naturally comparable across very different price levels.
+`std_trailing`
+- 优点：实现简单。
+- 风险：价格尺度敏感。
+- MVP 状态：引擎和模拟 adapter 已实现，真实 QMT K 线未接入。
 
-Portfolio rules:
-- Best for account-level drawdown and profit protection.
-- Risk: can override otherwise healthy individual positions and increase
-  turnover.
+## 执行风险
 
-## Execution Risks
+所有条件单动作都必须经过与普通任务一致的执行链路：
 
-Every conditional rule must account for:
+- 当前账户和持仓刷新。
+- 价格刷新。
+- 订单计划生成。
+- 风控校验。
+- real-order 双安全门。
+- QMT 下单。
+- 本地审计。
+- Xquant 条件单结果上报。
 
-- Trigger price is not guaranteed execution price.
-- Market orders can slip during volatility.
-- Stop-limit-like behavior can avoid bad prices but may not fill.
-- A-share limit-up or limit-down states can prevent execution.
-- Sellable quantity may be less than position quantity.
-- QMT callback and query data can arrive with latency.
-- Local gateway state can diverge from Xquant state.
-- Repeated triggers must be idempotent.
-- Partial fills need reconciliation.
-- Account-level actions need concentration and liquidity checks.
+条件单触发不等于立即无条件下单。任何风控或 QMT 失败都必须写入审计结果。
 
-## Verification Requirements
+## 验证要求
 
-Xquant-side validation before production:
-- Historical backtest.
-- Out-of-sample test.
-- Walk-forward or rolling validation.
-- Slippage and transaction-cost model.
-- Gap and limit-up/limit-down stress test.
-- Low-liquidity stress test.
-- Volatility-regime split.
-- Parameter sensitivity analysis.
-- Comparison against no-condition baseline.
-- Comparison among static, trailing, ATR, HV, and standard-deviation exits.
+测试应覆盖：
 
-Gateway-side validation before production:
-- Schema validation for every required parameter.
-- Reject unsupported `scope`, `purpose`, or `method`.
-- Reject missing or invalid required reference values.
-- Validate locally stored high-water state when present; high-water is gateway
-  runtime state in the current MVP.
-- Reject impossible action percentages.
-- Store every condition state transition.
-- Store trigger evidence, including latest price or wealth and trigger line.
-- Prevent duplicate submissions for terminal condition orders.
-- Verify interaction with existing `RiskControl`.
-- Verify real-order gate behavior.
+- 参数缺失。
+- 参数类型错误。
+- 参数范围错误。
+- 基准价格来源。
+- 高水位更新。
+- 激活状态。
+- 每种 method 的触发与未触发。
+- `sell_pct` 与 `clear`。
+- 试运行执行结果。
+- 模拟已提交订单结果。
+- 条件单结果审计请求体。
+- bar 数据缺失或不足。
+- 真实 QMT 模式下基于 bar 数据规则的评估错误。
 
-## Source Corrections Applied
+## 已应用的来源修正
 
-The Feishu document was normalized with these corrections:
+整理飞书来源时采用这些修正：
 
-- `P_SL,fix`, `P_SL,f`, and similar variants are standardized as
-  `trigger_price` or method-specific names.
-- `k_sl`, `k_sl,f`, and `k_f` are standardized as
-  `params.stop_loss_pct`.
-- In fixed-ratio trailing stop-loss, the source text says one percentage but
-  calculates with another. This document removes the example value and keeps
-  only `params.trail_pct`.
-- ATR current-bar high/low symbols are separated from rolling high-water
-  symbols.
-- ATR window and all volatility windows are parameters, not fixed constants.
-- The source says account trailing stop-loss has three subtypes but lists
-  four. This document treats them as four method families.
-- The standard-deviation trailing model is separated from HV log-return
-  volatility because it uses absolute point movement.
-- The duplicated phrase `机械机械化交易` is normalized to `机械化交易` in the
-  conceptual description.
-- All parameter recommendation numbers are treated as Xquant research inputs,
-  not gateway defaults.
+- 不把文档中的示例数值当作默认值。
+- 不使用含糊的 `N` 作为 API 参数名。
+- 追踪止损和追踪止盈按不同业务目的处理。
+- 追踪止盈必须有激活门槛。
+- 基准价格依赖成交持仓成本时，由本地 QMT 持仓刷新后确定。
 
-## Implementation Guidance
+## 实现指导
 
-For trade-xquant:
+实现时遵循：
 
-- Implement only methods explicitly supported by code.
-- Unsupported methods must fail closed with a clear error.
-- All numeric trading thresholds must come from the task payload.
-- The gateway owns condition runtime state in the current MVP.
-- High-water values, activation state, indicator snapshots, trigger evidence,
-  and execution audit payloads are SQLite/audit data, not Xquant task inputs.
-- Real QMT historical bars are not wired yet. Bar-based ATR/HV/std methods are
-  currently production-blocked in real QMT mode by per-order evaluation errors.
-- Condition-triggered execution must report the triggering rule, the Xquant
-  hyperparameter snapshot, the gateway market-derived state snapshot, and the
-  execution result back to Xquant for audit.
-- The gateway should report enough evidence for Xquant to audit why a
-  condition triggered.
-
-For Xquant:
-
-- Determine parameter values by research and backtesting.
-- Send concrete values in each trading task.
-- Send explicit actions. `sell_pct` must include a safe `pct`; `clear` may
-  omit `pct`.
-- Own portfolio-level policy decisions and account-level priority rules.
-- Treat high-water, activation state, indicator snapshots, trigger evidence,
-  and execution audit as gateway runtime/audit outputs in the current task
-  contract.
+- Xquant 负责研究、回测和参数配置。
+- trade-xquant 负责执行、状态维护、校验和审计。
+- SQLite 保存运行时状态。
+- 条件单结果上报必须幂等。
+- 上报失败不能导致重复交易。
+- 真实交易前必须先通过模拟运行和试运行验证。
