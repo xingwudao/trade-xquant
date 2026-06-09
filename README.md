@@ -590,6 +590,7 @@ python -m compileall trade_xquant hello.py
 - `docs/architecture.md`
 - `docs/configuration.md`
 - `docs/operations.md`
+- `docs/daemon-order-lifecycle.md`
 - `docs/xquant-api-contract.md`
 - `docs/qmt-runtime-notes.md`
 - `docs/qmt-miniqmt-setup-and-hello-validation.md`
