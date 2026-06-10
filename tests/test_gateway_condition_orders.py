@@ -30,6 +30,40 @@ def settings_for(tmp_path, task_file=None, risk: RiskConfig | None = None) -> Se
     )
 
 
+def real_order_settings_for(tmp_path, task_file=None, risk: RiskConfig | None = None) -> Settings:
+    settings = settings_for(tmp_path, task_file=task_file, risk=risk)
+    settings.runtime.broker_adapter = "qmt"
+    settings.runtime.allow_real_order = True
+    settings.runtime.mock_submit_dry_run_orders = False
+    return settings
+
+
+def freeze_gateway_now(monkeypatch, value: datetime) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return value.replace(tzinfo=None)
+            return value.astimezone(tz)
+
+    monkeypatch.setattr("trade_xquant.daemon.datetime", FrozenDateTime)
+
+
+def freeze_gateway_now_sequence(monkeypatch, values: list[datetime]) -> None:
+    remaining = list(values)
+    last = remaining[-1]
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = remaining.pop(0) if remaining else last
+            if tz is None:
+                return value.replace(tzinfo=None)
+            return value.astimezone(tz)
+
+    monkeypatch.setattr("trade_xquant.daemon.datetime", FrozenDateTime)
+
+
 def test_gateway_poll_once_reads_local_task_file_and_arms_condition_orders(tmp_path) -> None:
     task_file = tmp_path / "tasks.json"
     task_file.write_text(
@@ -1015,6 +1049,225 @@ def test_gateway_persists_submitted_condition_task_result_for_sync(tmp_path) -> 
     assert condition_task.mode == "real"
     assert condition_task.targets[0].target_weight == 0
     assert service.storage.get_condition_order("cond-real-submit").status == "submitted"
+
+
+def test_gateway_condition_outside_trading_session_defers_without_terminal_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 10, 9, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(real_order_settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-session-defer",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                reference_price=1.0,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker(price=0.94)
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [
+        {
+            "condition_id": "cond-session-defer",
+            "status": "pending_execution",
+            "error": "real order outside trading session",
+        }
+    ]
+    assert broker.submitted_orders == []
+    assert service.storage.get_condition_order("cond-session-defer").status == "pending_execution"
+    assert service.storage.load_task_result_payload("condition:task-1:cond-session-defer") is None
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT event_type, payload_json
+            FROM condition_order_events
+            WHERE condition_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("cond-session-defer",),
+        ).fetchone()
+    assert row["event_type"] == "deferred"
+    assert json.loads(row["payload_json"]) == {
+        "reason": "real order outside trading session",
+        "stage": "risk_validation",
+    }
+
+
+def test_gateway_pending_execution_rearms_and_rechecks_latest_price(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 10, 9, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(real_order_settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-session-recheck",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                reference_price=1.0,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker(price=0.94)
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    assert service.condition_poll_once() == [
+        {
+            "condition_id": "cond-session-recheck",
+            "status": "pending_execution",
+            "error": "real order outside trading session",
+        }
+    ]
+
+    broker.price = 0.97
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 10, 9, 30, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert service.condition_poll_once() == []
+    assert broker.submitted_orders == []
+    assert service.storage.get_condition_order("cond-session-recheck").status == "armed"
+    state = service.storage.get_condition_market_state("cond-session-recheck")
+    assert state is not None
+    assert state["latest_price"] == 0.97
+
+
+def test_gateway_pending_execution_submits_when_latest_price_still_triggers(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 10, 9, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(real_order_settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-session-submit",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                reference_price=1.0,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker(price=0.94)
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    assert service.condition_poll_once() == [
+        {
+            "condition_id": "cond-session-submit",
+            "status": "pending_execution",
+            "error": "real order outside trading session",
+        }
+    ]
+
+    broker.price = 0.93
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 10, 9, 30, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert service.condition_poll_once() == [
+        {"condition_id": "cond-session-submit", "status": "submitted"}
+    ]
+    assert len(broker.submitted_orders) == 1
+    assert broker.submitted_orders[0].price == 0.93
+    assert service.storage.get_condition_order("cond-session-submit").status == "submitted"
+    payload = service.storage.load_task_result_payload("condition:task-1:cond-session-submit")
+    assert payload is not None
+    assert payload["status"] == "submitted"
+
+
+def test_gateway_condition_refreshes_session_time_before_real_validation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now_sequence(
+        monkeypatch,
+        [
+            datetime(2026, 6, 10, 14, 57, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
+            datetime(2026, 6, 10, 14, 58, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        ],
+    )
+    service = GatewayService(real_order_settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-session-boundary",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker(price=1.1)
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    assert service.condition_poll_once() == [
+        {
+            "condition_id": "cond-session-boundary",
+            "status": "pending_execution",
+            "error": "real order outside trading session",
+        }
+    ]
+    assert broker.submitted_orders == []
+    assert service.storage.get_condition_order("cond-session-boundary").status == "pending_execution"
 
 
 class AuditXquant:

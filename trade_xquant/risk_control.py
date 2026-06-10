@@ -50,7 +50,7 @@ class RiskControl:
             if self._is_simulated_broker():
                 return
             self._validate_real_order_enabled()
-            if not self._is_trading_session(current.astimezone(tz)):
+            if not self.is_trading_session(current.astimezone(tz)):
                 raise RiskError("real order outside trading session")
 
     def _is_simulated_broker(self) -> bool:
@@ -62,8 +62,11 @@ class RiskControl:
         if os.getenv("TRADE_XQUANT_ENABLE_REAL_ORDER") != "1":
             raise RiskError("real order disabled by environment")
 
-    def _is_trading_session(self, now: datetime) -> bool:
+    def is_trading_session(self, now: datetime) -> bool:
         if now.weekday() >= 5:
             return False
         hm = now.hour * 100 + now.minute
         return 930 <= hm <= 1130 or 1300 <= hm <= 1457
+
+    def _is_trading_session(self, now: datetime) -> bool:
+        return self.is_trading_session(now)

@@ -461,6 +461,12 @@ daemon 会按 `runtime.order_sync_interval_seconds` 周期同步
 这些订单会继续可同步，不会被隐藏。condition task retry 的结果通过
 condition result path 上报。
 
+条件单在真实模式下如果已触发，但当前不在有效交易 session，
+daemon 会把本地条件单标记为 `pending_execution`。此时不会向 QMT
+提交委托，也不会把条件任务写成终态失败。进入有效交易 session 后，
+daemon 会把它恢复为 `armed`，重新取最新价格并重新验证条件；仍满足
+条件才下单，不再满足则继续等待下一次触发。
+
 建议使用受控终端、Windows 服务包装器或进程管理器运行，并保留 `logs/`。
 
 ## 查看本地状态

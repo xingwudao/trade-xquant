@@ -189,6 +189,19 @@ class GatewayService:
 
     def condition_poll_once(self) -> list[dict[str, object]]:
         self.storage.initialize()
+        now = datetime.now(ZoneInfo(self.settings.risk.timezone))
+        if self.risk.is_trading_session(now):
+            for condition_id in self.storage.rearm_pending_execution_condition_orders(
+                account_id=self.settings.qmt.account_id
+            ):
+                self.storage.record_condition_event(
+                    condition_id,
+                    "rearmed",
+                    {
+                        "reason": "trading session opened",
+                        "now": now.isoformat(),
+                    },
+                )
         active_orders = self.storage.list_active_condition_orders()
         pending_reference_orders = self.storage.list_pending_reference_condition_orders(
             account_id=self.settings.qmt.account_id
@@ -211,7 +224,6 @@ class GatewayService:
                 return []
         symbols = sorted({order.symbol for order in active_orders})
         prices = self._condition_prices(symbols)
-        now = datetime.now(ZoneInfo(self.settings.risk.timezone))
         triggered_plans = ConditionEngine(self.storage, market_data=self.qmt).evaluate(
             account,
             positions,
@@ -228,9 +240,35 @@ class GatewayService:
                 self.storage.update_condition_order_status(condition_id, "triggered")
                 if triggered.plan.turnover_amount > remaining_turnover_amount + 1e-9:
                     raise RiskError("condition turnover exceeds remaining threshold")
-                self.risk.validate(triggered.task, account, triggered.plan, now=now, known_symbols=set(prices))
+                validation_now = datetime.now(ZoneInfo(self.settings.risk.timezone))
+                self.risk.validate(
+                    triggered.task,
+                    account,
+                    triggered.plan,
+                    now=validation_now,
+                    known_symbols=set(prices),
+                )
                 remaining_turnover_amount -= triggered.plan.turnover_amount
             except Exception as exc:  # noqa: BLE001 - risk-blocked triggers still need audit
+                if _is_outside_trading_session_error(exc):
+                    logger.info("condition order deferred until trading session: %s", condition_id)
+                    self.storage.update_condition_order_status(condition_id, "pending_execution")
+                    self.storage.record_condition_event(
+                        condition_id,
+                        "deferred",
+                        {
+                            "reason": str(exc),
+                            "stage": "risk_validation",
+                        },
+                    )
+                    results.append(
+                        {
+                            "condition_id": condition_id,
+                            "status": "pending_execution",
+                            "error": str(exc),
+                        }
+                    )
+                    continue
                 logger.exception("condition order blocked by risk: %s", condition_id)
                 result = self._failed_condition_execution_result(
                     triggered,
@@ -1672,6 +1710,10 @@ def _condition_activation_price(order: ConditionOrder) -> float | None:
         return float(order.reference_price) * (1 + float(activation_profit_pct))
     except (TypeError, ValueError):
         return None
+
+
+def _is_outside_trading_session_error(exc: Exception) -> bool:
+    return isinstance(exc, RiskError) and str(exc) == "real order outside trading session"
 
 
 def _derive_synced_status(
