@@ -366,6 +366,37 @@ class Storage:
             ).fetchall()
         return [self._condition_order_from_row(row) for row in rows]
 
+    def rearm_pending_execution_condition_orders(
+        self,
+        account_id: str | None = None,
+    ) -> list[str]:
+        account_filter = " AND account_id=?" if account_id else ""
+        params: tuple[str, ...] = (account_id,) if account_id else ()
+        now = utc_now()
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT condition_id
+                FROM condition_orders
+                WHERE enabled=1
+                  AND status='pending_execution'
+                  {account_filter}
+                ORDER BY created_at, condition_id
+                """,
+                params,
+            ).fetchall()
+            condition_ids = [str(row["condition_id"]) for row in rows]
+            for condition_id in condition_ids:
+                conn.execute(
+                    """
+                    UPDATE condition_orders
+                    SET status='armed', updated_at=?
+                    WHERE condition_id=?
+                    """,
+                    (now, condition_id),
+                )
+        return condition_ids
+
     def get_condition_order(self, condition_id: str) -> ConditionOrder:
         with self._connection() as conn:
             row = conn.execute(

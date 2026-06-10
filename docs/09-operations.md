@@ -129,6 +129,11 @@ QMT 后向 Xquant 发送 heartbeat。QMT 可查询时，heartbeat 会刷新 Xqua
 daemon 也是正式运行推荐入口。它会持续同步条件单、已提交订单、
 成交结果和终态结果补报。
 
+真实条件单如果在非有效交易 session 触发，网关会记录为
+`pending_execution`，不向 QMT 提交委托，也不写终态失败结果。
+进入有效交易 session 后，daemon 会恢复为 `armed`，重新取最新价格
+并重验条件。仍满足条件才会下单；不满足则继续等待后续触发。
+
 ## 查看本地状态
 
 ```bash
@@ -170,7 +175,8 @@ trade-xquant poll-once --config config.yaml
 
 网关仍会阻止以下真实下单：
 
-- 非交易时段。
+- 非交易时段提交委托。条件单触发会进入 `pending_execution`，
+  到有效交易 session 后重验。
 - 任务过期。
 - 终态任务重复执行。
 - 价格未知。

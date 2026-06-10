@@ -41,6 +41,7 @@ CONDITION_PARAM_ALIASES = {
 ConditionStatus = Literal[
     "received",
     "pending_reference",
+    "pending_execution",
     "armed",
     "triggered",
     "submitting",
