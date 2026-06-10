@@ -240,7 +240,14 @@ class GatewayService:
                 self.storage.update_condition_order_status(condition_id, "triggered")
                 if triggered.plan.turnover_amount > remaining_turnover_amount + 1e-9:
                     raise RiskError("condition turnover exceeds remaining threshold")
-                self.risk.validate(triggered.task, account, triggered.plan, now=now, known_symbols=set(prices))
+                validation_now = datetime.now(ZoneInfo(self.settings.risk.timezone))
+                self.risk.validate(
+                    triggered.task,
+                    account,
+                    triggered.plan,
+                    now=validation_now,
+                    known_symbols=set(prices),
+                )
                 remaining_turnover_amount -= triggered.plan.turnover_amount
             except Exception as exc:  # noqa: BLE001 - risk-blocked triggers still need audit
                 if _is_outside_trading_session_error(exc):
