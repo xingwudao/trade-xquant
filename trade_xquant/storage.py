@@ -753,6 +753,35 @@ class Storage:
                 (status, now, task_id),
             )
 
+    def update_task_status(self, task_id: str, status: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
+                (status, utc_now(), task_id),
+            )
+
+    def list_pending_execution_tasks(self, account_id: str | None = None) -> list[RebalanceTask]:
+        account_filter = " AND account_id=?" if account_id else ""
+        params: tuple[str, ...] = (account_id,) if account_id else ()
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT raw_json
+                FROM tasks
+                WHERE status='pending_execution'
+                  AND task_id NOT LIKE 'condition:%'
+                  {account_filter}
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM task_results
+                    WHERE task_results.task_id = tasks.task_id
+                  )
+                ORDER BY updated_at ASC, task_id ASC
+                """,
+                params,
+            ).fetchall()
+        return [RebalanceTask.model_validate_json(row["raw_json"]) for row in rows]
+
     def is_terminal_task(self, task_id: str) -> bool:
         with self._connection() as conn:
             row = conn.execute(

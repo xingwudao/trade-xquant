@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import closing
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -50,6 +52,78 @@ class FakeXquant:
     def heartbeat(self, account_id: str, **payload) -> dict:
         self.heartbeats.append({"account_id": account_id, **payload})
         return {"ok": True}
+
+
+def freeze_gateway_now(monkeypatch, value: datetime) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return value.replace(tzinfo=None)
+            return value.astimezone(tz)
+
+    monkeypatch.setattr("trade_xquant.daemon.datetime", FrozenDateTime)
+
+
+def real_order_settings(tmp_path) -> Settings:
+    return Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="qmt",
+            allow_real_order=True,
+            db_path=str(tmp_path / "audit.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(max_single_order_amount=100_000),
+    )
+
+
+def real_task(account_id: str = "acct", *, expires_at: str | None = None) -> RebalanceTask:
+    return RebalanceTask.model_validate(
+        {
+            "task_id": "task-real-pending-session",
+            "portfolio_id": "prod",
+            "account_id": account_id,
+            "mode": "real",
+            "created_at": "2026-06-11T08:00:00+08:00",
+            "expires_at": expires_at,
+            "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+        }
+    )
+
+
+class RealOrderBroker:
+    events = []
+
+    def __init__(self) -> None:
+        self.submitted_orders = []
+
+    def connect(self) -> None:
+        return None
+
+    def get_account_snapshot(self) -> AccountSnapshot:
+        return AccountSnapshot(account_id="acct", total_asset=100_000, cash=100_000)
+
+    def get_positions(self) -> list[Position]:
+        return []
+
+    def get_prices(self, symbols: list[str]) -> dict[str, float]:
+        return {symbol: 1.0 for symbol in symbols}
+
+    def place_order(self, order):
+        self.submitted_orders.append(order)
+        return {
+            "task_id": order.task_id,
+            "order_id": "1",
+            "broker_order_id": "MOCK-000001",
+            "stock_code": order.symbol,
+            "side": order.side,
+            "quantity": order.quantity,
+            "price": order.price,
+            "amount": order.amount,
+            "status": "accepted",
+        }
 
 
 def test_gateway_poll_once_can_use_mock_broker_without_qmt(tmp_path) -> None:
@@ -102,6 +176,116 @@ def test_gateway_poll_once_uses_task_endpoint_even_when_product_code_is_configur
     assert result == [{"task_id": "task-1", "status": "dry_run_success"}]
     assert fake_xquant.plans
     assert fake_xquant.results == [("task-1", "dry_run_success", 0, 0, 0)]
+
+
+def test_gateway_real_task_outside_trading_session_defers_without_terminal_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 11, 8, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(real_order_settings(tmp_path))
+    fake_xquant = FakeXquant()
+    fake_xquant.fetch_pending_tasks = lambda account_id: [real_task(account_id)]  # type: ignore[method-assign]
+    broker = RealOrderBroker()
+    service.xquant = fake_xquant  # type: ignore[assignment]
+    service.qmt = broker  # type: ignore[assignment]
+
+    result = service.poll_once()
+
+    assert result == [
+        {
+            "task_id": "task-real-pending-session",
+            "status": "pending_execution",
+            "error": "real order outside trading session",
+        }
+    ]
+    assert broker.submitted_orders == []
+    assert fake_xquant.results == []
+    assert service.storage.load_task_result_payload("task-real-pending-session") is None
+    with closing(service.storage._connect()) as conn:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE task_id=?",
+            ("task-real-pending-session",),
+        ).fetchone()
+    assert row["status"] == "pending_execution"
+
+
+def test_gateway_retries_pending_execution_task_when_trading_session_opens(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    service = GatewayService(real_order_settings(tmp_path))
+    fake_xquant = FakeXquant()
+    broker = RealOrderBroker()
+    service.xquant = fake_xquant  # type: ignore[assignment]
+    service.qmt = broker  # type: ignore[assignment]
+
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 11, 8, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    fake_xquant.fetch_pending_tasks = lambda account_id: [real_task(account_id)]  # type: ignore[method-assign]
+    assert service.poll_once()[0]["status"] == "pending_execution"
+
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 11, 9, 30, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    fake_xquant.fetch_pending_tasks = lambda account_id: []  # type: ignore[method-assign]
+
+    result = service.poll_once()
+
+    assert result == [{"task_id": "task-real-pending-session", "status": "submitted"}]
+    assert len(broker.submitted_orders) == 1
+    assert fake_xquant.results == [("task-real-pending-session", "submitted", 1, 0, 0)]
+    assert service.storage.load_task_result_payload("task-real-pending-session")["status"] == "submitted"
+
+
+def test_gateway_pending_execution_task_fails_when_expired_before_session_opens(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    service = GatewayService(real_order_settings(tmp_path))
+    fake_xquant = FakeXquant()
+    broker = RealOrderBroker()
+    service.xquant = fake_xquant  # type: ignore[assignment]
+    service.qmt = broker  # type: ignore[assignment]
+
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 11, 8, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    fake_xquant.fetch_pending_tasks = lambda account_id: [  # type: ignore[method-assign]
+        real_task(account_id, expires_at="2026-06-11T09:45:00+08:00")
+    ]
+    assert service.poll_once()[0]["status"] == "pending_execution"
+
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 11, 10, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    fake_xquant.fetch_pending_tasks = lambda account_id: []  # type: ignore[method-assign]
+
+    result = service.poll_once()
+
+    assert result == [
+        {
+            "task_id": "task-real-pending-session",
+            "status": "failed",
+            "error": "task expired",
+        }
+    ]
+    assert broker.submitted_orders == []
+    assert fake_xquant.results == [("task-real-pending-session", "failed", 0, 0, 0)]
+    payload = service.storage.load_task_result_payload("task-real-pending-session")
+    assert payload["status"] == "failed"
+    assert payload["errors"] == ["task expired"]
 
 
 def test_daemon_loop_sends_heartbeat_with_holdings_when_no_tasks(tmp_path, monkeypatch) -> None:

@@ -118,6 +118,10 @@ class GatewayService:
                     "xquant.product_code is ignored; poll_once uses trading-gateway tasks"
                 )
             tasks = self.xquant.fetch_pending_tasks(self.settings.qmt.account_id)
+        tasks = _merge_tasks(
+            self.storage.list_pending_execution_tasks(self.settings.qmt.account_id),
+            tasks,
+        )
         if task_id:
             tasks = [task for task in tasks if task.task_id == task_id]
         results: list[dict[str, object]] = []
@@ -140,7 +144,14 @@ class GatewayService:
                 condition_orders = extract_condition_orders(task)
                 prices = self.qmt.get_prices([target.symbol for target in task.targets] + [p.symbol for p in positions])
                 plan = self.portfolio.build_plan(task, account, positions, prices)
-                self.risk.validate(task, account, plan, known_symbols=set(prices))
+                validation_now = datetime.now(ZoneInfo(self.settings.risk.timezone))
+                self.risk.validate(
+                    task,
+                    account,
+                    plan,
+                    now=validation_now,
+                    known_symbols=set(prices),
+                )
                 self.storage.record_plan(plan)
                 if should_report_gateway:
                     self.xquant.report_plan(task.task_id, plan.model_dump(mode="json"))
@@ -161,6 +172,17 @@ class GatewayService:
                     self.xquant.report_result(task.task_id, status, result)
                 results.append({"task_id": task.task_id, "status": status})
             except Exception as exc:  # noqa: BLE001 - each task must be audited
+                if _is_outside_trading_session_error(exc):
+                    logger.info("task deferred until trading session: %s", task.task_id)
+                    self.storage.update_task_status(task.task_id, "pending_execution")
+                    results.append(
+                        {
+                            "task_id": task.task_id,
+                            "status": "pending_execution",
+                            "error": str(exc),
+                        }
+                    )
+                    continue
                 logger.exception("task failed: %s", task.task_id)
                 failure = ExecutionResult(
                     task_id=task.task_id,
@@ -1714,6 +1736,18 @@ def _condition_activation_price(order: ConditionOrder) -> float | None:
 
 def _is_outside_trading_session_error(exc: Exception) -> bool:
     return isinstance(exc, RiskError) and str(exc) == "real order outside trading session"
+
+
+def _merge_tasks(*task_groups: list[RebalanceTask]) -> list[RebalanceTask]:
+    tasks: list[RebalanceTask] = []
+    seen: set[str] = set()
+    for task_group in task_groups:
+        for task in task_group:
+            if task.task_id in seen:
+                continue
+            tasks.append(task)
+            seen.add(task.task_id)
+    return tasks
 
 
 def _derive_synced_status(
