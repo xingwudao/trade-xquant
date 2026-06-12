@@ -1235,6 +1235,68 @@ def test_gateway_condition_outside_session_filters_evaluated_real_orders(
     assert service.storage.load_task_result_payload("condition:task-real:cond-real-same-symbol") is None
 
 
+def test_gateway_condition_outside_session_refilters_after_reference_refresh(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 10, 9, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(real_order_settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-dry-pending-reference",
+                task_id="task-dry",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                status="pending_reference",
+                reference_price=None,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+                raw={"reference": {"source": "position_cost_price"}},
+            ),
+            ConditionOrder(
+                condition_id="cond-real-active-after-refresh",
+                task_id="task-real",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                reference_price=1.0,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    broker = SelectivePriceBroker({"513100.SH": 0.9})
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [
+        {"condition_id": "cond-dry-pending-reference", "status": "dry_run_success"}
+    ]
+    assert service.storage.get_condition_order("cond-dry-pending-reference").status == "submitted"
+    assert service.storage.get_condition_order("cond-real-active-after-refresh").status == "armed"
+    assert (
+        service.storage.load_task_result_payload(
+            "condition:task-real:cond-real-active-after-refresh"
+        )
+        is None
+    )
+
+
 def test_gateway_pending_execution_rearms_and_rechecks_latest_price(
     tmp_path,
     monkeypatch,

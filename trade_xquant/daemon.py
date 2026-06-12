@@ -243,16 +243,10 @@ class GatewayService:
             account_id=self.settings.qmt.account_id
         )
         if not is_trading_session:
-            active_orders = [
-                order
-                for order in active_orders
-                if not self._should_defer_condition_order_until_session(order)
-            ]
-            pending_reference_orders = [
-                order
-                for order in pending_reference_orders
-                if not self._should_defer_condition_order_until_session(order)
-            ]
+            active_orders = self._condition_orders_allowed_for_session(active_orders)
+            pending_reference_orders = self._condition_orders_allowed_for_session(
+                pending_reference_orders
+            )
         if not active_orders and not pending_reference_orders:
             logger.info("no active condition orders")
             return []
@@ -266,6 +260,8 @@ class GatewayService:
                 {position.symbol: position for position in positions},
             )
             active_orders = self.storage.list_active_condition_orders()
+            if not is_trading_session:
+                active_orders = self._condition_orders_allowed_for_session(active_orders)
             if not active_orders:
                 logger.info("no active condition orders after reference refresh")
                 return []
@@ -407,6 +403,16 @@ class GatewayService:
 
     def _should_defer_condition_order_until_session(self, order: ConditionOrder) -> bool:
         return order.mode == "real" and not self._is_simulated_real_order_mode()
+
+    def _condition_orders_allowed_for_session(
+        self,
+        orders: list[ConditionOrder],
+    ) -> list[ConditionOrder]:
+        return [
+            order
+            for order in orders
+            if not self._should_defer_condition_order_until_session(order)
+        ]
 
     def _is_simulated_real_order_mode(self) -> bool:
         return (
