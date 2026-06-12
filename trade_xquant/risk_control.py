@@ -56,6 +56,9 @@ class RiskControl:
     def _is_simulated_broker(self) -> bool:
         return self.settings.runtime.broker_adapter == "mock" and self.settings.runtime.simulate_real_orders
 
+    def validate_real_order_enabled(self) -> None:
+        self._validate_real_order_enabled()
+
     def _validate_real_order_enabled(self) -> None:
         if not self.settings.runtime.allow_real_order:
             raise RiskError("real order disabled by config")

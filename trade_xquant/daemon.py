@@ -143,6 +143,7 @@ class GatewayService:
                 self.storage.claim_task(task)
                 session_now = datetime.now(ZoneInfo(self.settings.risk.timezone))
                 if self._should_defer_real_order_until_session(task, session_now):
+                    self.risk.validate_real_order_enabled()
                     logger.info("task deferred until trading session: %s", task.task_id)
                     self.storage.update_task_status(task.task_id, "pending_execution")
                     results.append(
@@ -275,6 +276,7 @@ class GatewayService:
             positions,
             prices,
             now=now,
+            orders=active_orders,
         )
         results: list[dict[str, object]] = []
         remaining_turnover_amount = account.total_asset * self.settings.risk.max_turnover_ratio
@@ -1534,7 +1536,6 @@ class GatewayService:
         price_symbols = sorted(
             {position.symbol for position in positions}
             | {order.symbol for order in result.planned_orders}
-            | ({target.symbol for target in task.targets} if task else set())
         )
         prices: dict[str, float] = dict(fallback_prices or {})
         if price_symbols:
