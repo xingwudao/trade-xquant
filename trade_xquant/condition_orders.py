@@ -127,12 +127,14 @@ class ConditionEngine:
         positions: list[Position],
         prices: dict[str, float],
         now: datetime,
+        orders: list[ConditionOrder] | None = None,
     ) -> list[TriggeredConditionPlan]:
         position_map = {position.symbol: position for position in positions}
         planned_symbols: set[str] = set()
         normalized_prices = {normalize_symbol(symbol): price for symbol, price in prices.items()}
         triggered: list[TriggeredConditionPlan] = []
-        for order in self.storage.list_active_condition_orders():
+        active_orders = orders if orders is not None else self.storage.list_active_condition_orders()
+        for order in active_orders:
             if order.account_id != account.account_id:
                 continue
             if order.expires_at is not None and order.expires_at <= now:

@@ -1051,7 +1051,85 @@ def test_gateway_persists_submitted_condition_task_result_for_sync(tmp_path) -> 
     assert service.storage.get_condition_order("cond-real-submit").status == "submitted"
 
 
-def test_gateway_condition_outside_trading_session_defers_without_terminal_result(
+def test_gateway_dry_run_condition_evaluates_outside_trading_session(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 12, 8, 47, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-dry-preopen",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker()
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [{"condition_id": "cond-dry-preopen", "status": "dry_run_success"}]
+    assert len(broker.submitted_orders) == 1
+    assert service.storage.get_condition_order("cond-dry-preopen").status == "submitted"
+
+
+def test_gateway_simulated_real_condition_evaluates_outside_trading_session(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 12, 8, 47, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    settings = settings_for(tmp_path)
+    settings.runtime.simulate_real_orders = True
+    service = GatewayService(settings)
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-sim-real-preopen",
+                task_id="task-1",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="take_profit",
+                method="static_pct",
+                reference_price=1.0,
+                params={"take_profit_pct": 0.1},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            )
+        ]
+    )
+    broker = PositionBroker()
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [{"condition_id": "cond-sim-real-preopen", "status": "submitted"}]
+    assert len(broker.submitted_orders) == 1
+    assert service.storage.get_condition_order("cond-sim-real-preopen").status == "submitted"
+
+
+def test_gateway_condition_outside_trading_session_skips_price_lookup(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1079,21 +1157,16 @@ def test_gateway_condition_outside_trading_session_defers_without_terminal_resul
             )
         ]
     )
-    broker = PositionBroker(price=0.94)
+    broker = PriceFailingPositionBroker()
     service.qmt = broker  # type: ignore[assignment]
     service.xquant = AuditXquant()  # type: ignore[assignment]
 
     result = service.condition_poll_once()
 
-    assert result == [
-        {
-            "condition_id": "cond-session-defer",
-            "status": "pending_execution",
-            "error": "real order outside trading session",
-        }
-    ]
+    assert result == []
+    assert broker.price_calls == []
     assert broker.submitted_orders == []
-    assert service.storage.get_condition_order("cond-session-defer").status == "pending_execution"
+    assert service.storage.get_condition_order("cond-session-defer").status == "armed"
     assert service.storage.load_task_result_payload("condition:task-1:cond-session-defer") is None
     with closing(service.storage._connect()) as conn:
         row = conn.execute(
@@ -1106,11 +1179,122 @@ def test_gateway_condition_outside_trading_session_defers_without_terminal_resul
             """,
             ("cond-session-defer",),
         ).fetchone()
-    assert row["event_type"] == "deferred"
-    assert json.loads(row["payload_json"]) == {
-        "reason": "real order outside trading session",
-        "stage": "risk_validation",
-    }
+    assert row is None
+
+
+def test_gateway_condition_outside_session_filters_evaluated_real_orders(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 10, 9, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(real_order_settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-dry-same-symbol",
+                task_id="task-dry",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                reference_price=1.0,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+            ConditionOrder(
+                condition_id="cond-real-same-symbol",
+                task_id="task-real",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                reference_price=1.0,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    broker = SelectivePriceBroker({"513100.SH": 0.9})
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [{"condition_id": "cond-dry-same-symbol", "status": "dry_run_success"}]
+    assert service.storage.get_condition_order("cond-dry-same-symbol").status == "submitted"
+    assert service.storage.get_condition_order("cond-real-same-symbol").status == "armed"
+    assert service.storage.load_task_result_payload("condition:task-real:cond-real-same-symbol") is None
+
+
+def test_gateway_condition_outside_session_refilters_after_reference_refresh(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 10, 9, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(real_order_settings_for(tmp_path))
+    service.storage.initialize()
+    service.storage.upsert_condition_orders(
+        [
+            ConditionOrder(
+                condition_id="cond-dry-pending-reference",
+                task_id="task-dry",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="dry_run",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                status="pending_reference",
+                reference_price=None,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+                raw={"reference": {"source": "position_cost_price"}},
+            ),
+            ConditionOrder(
+                condition_id="cond-real-active-after-refresh",
+                task_id="task-real",
+                portfolio_id="prod",
+                account_id="acct",
+                mode="real",
+                symbol="513100.SH",
+                purpose="stop_loss",
+                method="static_pct",
+                reference_price=1.0,
+                params={"stop_loss_pct": 0.05},
+                action=ConditionAction(type="sell_pct", pct=1.0),
+            ),
+        ]
+    )
+    broker = SelectivePriceBroker({"513100.SH": 0.9})
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = AuditXquant()  # type: ignore[assignment]
+
+    result = service.condition_poll_once()
+
+    assert result == [
+        {"condition_id": "cond-dry-pending-reference", "status": "dry_run_success"}
+    ]
+    assert service.storage.get_condition_order("cond-dry-pending-reference").status == "submitted"
+    assert service.storage.get_condition_order("cond-real-active-after-refresh").status == "armed"
+    assert (
+        service.storage.load_task_result_payload(
+            "condition:task-real:cond-real-active-after-refresh"
+        )
+        is None
+    )
 
 
 def test_gateway_pending_execution_rearms_and_rechecks_latest_price(
@@ -1135,6 +1319,7 @@ def test_gateway_pending_execution_rearms_and_rechecks_latest_price(
                 symbol="513100.SH",
                 purpose="stop_loss",
                 method="static_pct",
+                status="pending_execution",
                 reference_price=1.0,
                 params={"stop_loss_pct": 0.05},
                 action=ConditionAction(type="sell_pct", pct=1.0),
@@ -1145,13 +1330,8 @@ def test_gateway_pending_execution_rearms_and_rechecks_latest_price(
     service.qmt = broker  # type: ignore[assignment]
     service.xquant = AuditXquant()  # type: ignore[assignment]
 
-    assert service.condition_poll_once() == [
-        {
-            "condition_id": "cond-session-recheck",
-            "status": "pending_execution",
-            "error": "real order outside trading session",
-        }
-    ]
+    assert service.condition_poll_once() == []
+    assert service.storage.get_condition_order("cond-session-recheck").status == "pending_execution"
 
     broker.price = 0.97
     freeze_gateway_now(
@@ -1189,6 +1369,7 @@ def test_gateway_pending_execution_submits_when_latest_price_still_triggers(
                 symbol="513100.SH",
                 purpose="stop_loss",
                 method="static_pct",
+                status="pending_execution",
                 reference_price=1.0,
                 params={"stop_loss_pct": 0.05},
                 action=ConditionAction(type="sell_pct", pct=1.0),
@@ -1199,13 +1380,8 @@ def test_gateway_pending_execution_submits_when_latest_price_still_triggers(
     service.qmt = broker  # type: ignore[assignment]
     service.xquant = AuditXquant()  # type: ignore[assignment]
 
-    assert service.condition_poll_once() == [
-        {
-            "condition_id": "cond-session-submit",
-            "status": "pending_execution",
-            "error": "real order outside trading session",
-        }
-    ]
+    assert service.condition_poll_once() == []
+    assert service.storage.get_condition_order("cond-session-submit").status == "pending_execution"
 
     broker.price = 0.93
     freeze_gateway_now(
@@ -1577,6 +1753,16 @@ class PositionBroker:
                 timestamp=datetime(2026, 6, 3, tzinfo=tz),
             ),
         ]
+
+
+class PriceFailingPositionBroker(PositionBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.price_calls: list[list[str]] = []
+
+    def get_prices(self, symbols: list[str]) -> dict[str, float]:
+        self.price_calls.append(symbols)
+        raise RuntimeError("cannot fetch valid price for 513100.SH")
 
 
 class SelectivePriceBroker(PositionBroker):

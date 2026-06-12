@@ -461,12 +461,16 @@ daemon 会按 `runtime.order_sync_interval_seconds` 周期同步
 这些订单会继续可同步，不会被隐藏。condition task retry 的结果通过
 condition result path 上报。
 
-普通交易任务或条件单在真实模式下如果当前不在有效交易 session，
-daemon 会把本地任务标记为 `pending_execution`。此时不会向 QMT
-提交委托，也不会把任务写成终态失败。进入有效交易 session 后，
-daemon 会重新取账户、持仓和最新价格，重新生成计划并重新风控。
-普通任务仍有效则执行；已过期或其他不可恢复风控错误会转为 `failed`。
-条件单会先恢复为 `armed` 并重新验证触发条件，仍满足条件才下单。
+普通真实交易任务如果当前不在有效交易 session，daemon 会先把本地任务
+标记为 `pending_execution`，不会取实时价、不会向 QMT 提交委托，
+也不会把任务写成终态失败。进入有效交易 session 后，daemon 会重新取
+账户、持仓和最新价格，重新生成计划并重新风控。任务仍有效则执行；
+已过期或其他不可恢复风控错误会转为 `failed`。
+
+真实 QMT 条件单在非有效交易 session 不轮询实时价格，也不会触发下单链路。
+dry-run 和 mock simulated-real 条件单不受真实交易 session 限制。
+如果真实 QMT 条件单已经处于 `pending_execution`，进入有效交易 session
+后会先恢复为 `armed` 并重新验证触发条件，仍满足条件才下单。
 
 建议使用受控终端、Windows 服务包装器或进程管理器运行，并保留 `logs/`。
 
@@ -526,8 +530,8 @@ trade-xquant poll-once --config config.yaml --task-id replace-with-task-id --ver
 即使两个安全门都打开，网关仍会阻止以下情况：
 
 - 任务不是 `real` mode。
-- 当前不在 A 股交易时段时暂不提交委托，任务会进入
-  `pending_execution`，到有效交易 session 后重验。
+- 当前不在 A 股交易时段时暂不提交委托，普通真实任务会进入
+  `pending_execution`，到有效交易 session 后重新取价并重验。
 - 任务已过期。
 - 本地已记录该任务为终态。
 - 账户 ID 不匹配。
