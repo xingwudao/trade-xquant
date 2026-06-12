@@ -163,6 +163,8 @@ constraints.condition_orders[]
 
 `armed`
 - 条件单已经布防，等待价格触发。
+- 真实 QMT 条件单在非有效交易 session 内不会轮询实时价格，也不会触发下单链路。
+- dry-run 和 mock simulated-real 条件单不受真实交易 session 限制。
 
 `triggered`
 - 本轮价格已经满足触发条件，网关正在准备执行。

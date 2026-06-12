@@ -129,11 +129,15 @@ QMT 后向 Xquant 发送 heartbeat。QMT 可查询时，heartbeat 会刷新 Xqua
 daemon 也是正式运行推荐入口。它会持续同步条件单、已提交订单、
 成交结果和终态结果补报。
 
-真实普通任务或条件单如果在非有效交易 session 到达执行点，网关会记录为
-`pending_execution`，不向 QMT 提交委托，也不写终态失败结果。
-进入有效交易 session 后，daemon 会重新取账户、持仓和最新价格。
-普通任务会重新生成计划并风控；已过期或其他不可恢复风控错误会转为
-`failed`。条件单会恢复为 `armed`，重新验证触发条件；仍满足条件才下单，
+真实普通任务如果在非有效交易 session 到达执行点，网关会记录为
+`pending_execution`，不取实时价，不向 QMT 提交委托，也不写终态失败结果。
+进入有效交易 session 后，daemon 会重新取账户、持仓和最新价格，
+重新生成计划并风控；已过期或其他不可恢复风控错误会转为 `failed`。
+
+真实 QMT 条件单在非有效交易 session 不轮询实时价，也不会触发下单链路。
+dry-run 和 mock simulated-real 条件单不受真实交易 session 限制。
+如果真实 QMT 条件单已经处于 `pending_execution`，进入有效交易 session
+后会恢复为 `armed`，重新验证触发条件；仍满足条件才下单，
 不满足则继续等待后续触发。
 
 ## 查看本地状态
@@ -177,8 +181,9 @@ trade-xquant poll-once --config config.yaml
 
 网关仍会阻止以下真实下单：
 
-- 非交易时段提交委托。普通任务和条件单会进入 `pending_execution`，
-  到有效交易 session 后重新取价并重验。
+- 非交易时段提交委托。普通真实任务会进入 `pending_execution`，
+  到有效交易 session 后重新取价并重验；真实 QMT 条件单会保持等待，
+  不取价触发。
 - 任务过期。
 - 终态任务重复执行。
 - 价格未知。

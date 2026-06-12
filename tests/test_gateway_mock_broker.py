@@ -126,6 +126,16 @@ class RealOrderBroker:
         }
 
 
+class PriceFailingRealOrderBroker(RealOrderBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.price_calls: list[list[str]] = []
+
+    def get_prices(self, symbols: list[str]) -> dict[str, float]:
+        self.price_calls.append(symbols)
+        raise RuntimeError("cannot fetch valid price for 513100.SH")
+
+
 def test_gateway_poll_once_can_use_mock_broker_without_qmt(tmp_path) -> None:
     settings = Settings(
         xquant=XquantConfig(base_url="http://xquant/api/v1"),
@@ -212,6 +222,37 @@ def test_gateway_real_task_outside_trading_session_defers_without_terminal_resul
             ("task-real-pending-session",),
         ).fetchone()
     assert row["status"] == "pending_execution"
+
+
+def test_gateway_real_task_outside_session_defers_before_fetching_prices(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 12, 8, 47, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(real_order_settings(tmp_path))
+    fake_xquant = FakeXquant()
+    fake_xquant.fetch_pending_tasks = lambda account_id: [real_task(account_id)]  # type: ignore[method-assign]
+    broker = PriceFailingRealOrderBroker()
+    service.xquant = fake_xquant  # type: ignore[assignment]
+    service.qmt = broker  # type: ignore[assignment]
+
+    result = service.poll_once()
+
+    assert result == [
+        {
+            "task_id": "task-real-pending-session",
+            "status": "pending_execution",
+            "error": "real order outside trading session",
+        }
+    ]
+    assert broker.price_calls == []
+    assert broker.submitted_orders == []
+    assert fake_xquant.results == []
+    assert service.storage.load_task_result_payload("task-real-pending-session") is None
 
 
 def test_gateway_retries_pending_execution_task_when_trading_session_opens(

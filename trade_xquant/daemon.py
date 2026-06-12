@@ -141,6 +141,18 @@ class GatewayService:
             prices: dict[str, float] = {}
             try:
                 self.storage.claim_task(task)
+                session_now = datetime.now(ZoneInfo(self.settings.risk.timezone))
+                if self._should_defer_real_order_until_session(task, session_now):
+                    logger.info("task deferred until trading session: %s", task.task_id)
+                    self.storage.update_task_status(task.task_id, "pending_execution")
+                    results.append(
+                        {
+                            "task_id": task.task_id,
+                            "status": "pending_execution",
+                            "error": "real order outside trading session",
+                        }
+                    )
+                    continue
                 condition_orders = extract_condition_orders(task)
                 prices = self.qmt.get_prices([target.symbol for target in task.targets] + [p.symbol for p in positions])
                 plan = self.portfolio.build_plan(task, account, positions, prices)
@@ -212,7 +224,8 @@ class GatewayService:
     def condition_poll_once(self) -> list[dict[str, object]]:
         self.storage.initialize()
         now = datetime.now(ZoneInfo(self.settings.risk.timezone))
-        if self.risk.is_trading_session(now):
+        is_trading_session = self.risk.is_trading_session(now)
+        if is_trading_session:
             for condition_id in self.storage.rearm_pending_execution_condition_orders(
                 account_id=self.settings.qmt.account_id
             ):
@@ -228,6 +241,17 @@ class GatewayService:
         pending_reference_orders = self.storage.list_pending_reference_condition_orders(
             account_id=self.settings.qmt.account_id
         )
+        if not is_trading_session:
+            active_orders = [
+                order
+                for order in active_orders
+                if not self._should_defer_condition_order_until_session(order)
+            ]
+            pending_reference_orders = [
+                order
+                for order in pending_reference_orders
+                if not self._should_defer_condition_order_until_session(order)
+            ]
         if not active_orders and not pending_reference_orders:
             logger.info("no active condition orders")
             return []
@@ -367,6 +391,26 @@ class GatewayService:
                 self.storage.record_condition_event(condition_id, "failed", {"error": str(exc)})
                 results.append({"condition_id": condition_id, "status": "failed", "error": str(exc)})
         return results
+
+    def _should_defer_real_order_until_session(
+        self,
+        task: RebalanceTask,
+        now: datetime,
+    ) -> bool:
+        return (
+            task.mode == "real"
+            and not self._is_simulated_real_order_mode()
+            and not self.risk.is_trading_session(now)
+        )
+
+    def _should_defer_condition_order_until_session(self, order: ConditionOrder) -> bool:
+        return order.mode == "real" and not self._is_simulated_real_order_mode()
+
+    def _is_simulated_real_order_mode(self) -> bool:
+        return (
+            self.settings.runtime.broker_adapter == "mock"
+            and self.settings.runtime.simulate_real_orders
+        )
 
     def _condition_prices(self, symbols: list[str]) -> dict[str, float]:
         prices: dict[str, float] = {}
