@@ -161,10 +161,20 @@ constraints.condition_orders[]
 
 本地条件单的主要运行状态：
 
+`pending_reference`
+- 条件单已经落库，但还在等待运行时基准价，例如依赖
+  `reference.source: "position_cost_price"` 的成交成本。
+- dry-run 和 mock simulated-real 条件单可以在非有效交易 session 内刷新
+  reference。
+- 真实 QMT 条件单在非有效交易 session 内不会刷新 reference，也不会进入
+  后续价格轮询和触发评估。
+
 `armed`
 - 条件单已经布防，等待价格触发。
 - 真实 QMT 条件单在非有效交易 session 内不会轮询实时价格，也不会触发下单链路。
 - dry-run 和 mock simulated-real 条件单不受真实交易 session 限制。
+- 如果同一轮还有可执行的 dry-run 条件单，真实 QMT 条件单仍会被过滤，
+  不会因为 reference refresh 后重新读取本地状态而被带入触发评估。
 
 `triggered`
 - 本轮价格已经满足触发条件，网关正在准备执行。

@@ -28,6 +28,36 @@ trade-xquant login --config config.yaml --phone replace-with-phone --send-otp
 后续命令在 `xquant.api_token` 为空时自动读取该文件。
 `XQUANT_API_TOKEN` 仍有最高优先级。
 
+如果 daemon 日志出现：
+
+```text
+Xquant API error 401: {"detail":"invalid_bearer_token"}
+```
+
+说明当前 Bearer token 已过期、被吊销，或 `XQUANT_API_TOKEN`
+环境变量仍覆盖了新的 token 文件。恢复步骤：
+
+1. 停止 daemon。
+2. 在 PowerShell 检查并清理旧环境变量：
+
+```powershell
+Remove-Item Env:\XQUANT_API_TOKEN
+```
+
+3. 重新登录并写入新的 `<config directory>/xquant-token.json`：
+
+```powershell
+trade-xquant login --config config.yaml --phone replace-with-phone --send-otp
+```
+
+4. 先验证 heartbeat：
+
+```powershell
+trade-xquant heartbeat --config config.yaml
+```
+
+5. 确认不再返回 401 后重启 daemon。
+
 ## 注册账户
 
 ```bash
@@ -129,13 +159,17 @@ QMT 后向 Xquant 发送 heartbeat。QMT 可查询时，heartbeat 会刷新 Xqua
 daemon 也是正式运行推荐入口。它会持续同步条件单、已提交订单、
 成交结果和终态结果补报。
 
-真实普通任务如果在非有效交易 session 到达执行点，网关会记录为
-`pending_execution`，不取实时价，不向 QMT 提交委托，也不写终态失败结果。
-进入有效交易 session 后，daemon 会重新取账户、持仓和最新价格，
-重新生成计划并风控；已过期或其他不可恢复风控错误会转为 `failed`。
+真实普通任务如果在非有效交易 session 到达执行点，网关会先检查真实下单
+双安全门。安全门未打开时会立即写终态 `failed` 并上报；安全门已打开时
+记录为 `pending_execution`，不取实时价，不向 QMT 提交委托，
+也不写终态失败结果。进入有效交易 session 后，daemon 会重新取账户、
+持仓和最新价格，重新生成计划并风控；已过期或其他不可恢复风控错误
+会转为 `failed`。
 
 真实 QMT 条件单在非有效交易 session 不轮询实时价，也不会触发下单链路。
-dry-run 和 mock simulated-real 条件单不受真实交易 session 限制。
+这同时适用于 `armed` 和 `pending_reference` 条件单；如果同一轮还有
+dry-run 条件单，过滤结果会贯穿 reference refresh 和触发评估。dry-run
+和 mock simulated-real 条件单不受真实交易 session 限制。
 如果真实 QMT 条件单已经处于 `pending_execution`，进入有效交易 session
 后会恢复为 `armed`，重新验证触发条件；仍满足条件才下单，
 不满足则继续等待后续触发。
@@ -181,9 +215,9 @@ trade-xquant poll-once --config config.yaml
 
 网关仍会阻止以下真实下单：
 
-- 非交易时段提交委托。普通真实任务会进入 `pending_execution`，
-  到有效交易 session 后重新取价并重验；真实 QMT 条件单会保持等待，
-  不取价触发。
+- 非交易时段提交委托。安全门已打开的普通真实任务会进入
+  `pending_execution`，到有效交易 session 后重新取价并重验；
+  安全门未打开时仍终态失败。真实 QMT 条件单会保持等待，不取价触发。
 - 任务过期。
 - 终态任务重复执行。
 - 价格未知。

@@ -20,6 +20,7 @@ daemon 需要自动完成三类同步：
 
 ```yaml
 runtime:
+  condition_poll_interval_seconds: 3
   order_sync_interval_seconds: 30
   submitted_order_timeout_seconds: 180
   max_rebalance_retries: 3
@@ -33,6 +34,8 @@ runtime:
   控制已提交但未终态订单的超时时间，默认 `180` 秒。
 - `runtime.max_rebalance_retries`
   控制同一任务最多自动重试次数，默认 `3` 次。
+- `runtime.condition_poll_interval_seconds`
+  控制条件单触发检查频率，默认 `3` 秒。
 
 ## 主循环职责
 
@@ -45,6 +48,37 @@ daemon 循环中会周期性执行：
 
 如果 Xquant 没有新交易任务，daemon 仍会继续同步条件单、
 已提交订单、成交结果和 heartbeat。
+
+## 非交易 session 的真实执行
+
+真实普通任务和真实 QMT 条件单都不能在有效交易 session 外向 QMT
+提交委托，但两者的等待方式不同。
+
+普通真实任务：
+
+- 到达执行点后先检查真实下单双安全门。
+- 如果 `runtime.allow_real_order` 未开启，或缺少
+  `TRADE_XQUANT_ENABLE_REAL_ORDER=1`，任务立即终态 `failed` 并上报。
+- 如果双安全门已打开但当前不在有效交易 session，任务进入
+  `pending_execution`。
+- 进入 `pending_execution` 前不取实时价格、不生成订单计划、不提交 QMT
+  委托，也不写终态任务结果。
+- 进入有效交易 session 后，daemon 会重新取账户、持仓和最新价格，
+  重新生成计划并重新风控。任务仍有效才执行；已过期或其他不可恢复
+  风控错误会转为 `failed`。
+
+真实 QMT 条件单：
+
+- 非有效交易 session 内，`armed` 条件单不轮询实时价、不触发下单链路。
+- 非有效交易 session 内，`pending_reference` 条件单不刷新成交成本基准。
+- 如果同一轮有 dry-run 条件单保持可执行，daemon 仍只把过滤后的条件单
+  传入 reference refresh、价格查询和触发评估。
+- dry-run 条件单和 `runtime.broker_adapter: "mock"` 且
+  `runtime.simulate_real_orders: true` 的 simulated-real 条件单不受真实
+  交易 session 限制。
+- 如果真实 QMT 条件单已处于 `pending_execution`，进入有效交易 session
+  后先恢复为 `armed`，再重新验证触发条件；仍满足条件才下单，
+  不满足则继续等待。
 
 ## 订单状态同步
 
@@ -93,6 +127,9 @@ daemon 必须避免重复活跃委托和隐藏实时委托。
 - Xquant 上报失败不能影响本地实时委托继续同步。
 - 重试部分下单成功、部分失败时，已接受的实时委托必须继续同步。
 - 已撤单尝试不应阻止后续重试成交后进入 `success`。
+- 非交易 session 延后不能绕过真实下单双安全门。
+- 非交易 session 过滤后的条件单列表不能在 reference refresh 后被
+  未过滤的本地查询覆盖。
 
 `retry_count` 只在实际进入撤单后重试流程时增加。单纯的预检查
 失败或风控阻止不应消耗重试预算。
@@ -121,6 +158,10 @@ daemon 会把计划和结果上报给 Xquant：
 - 超时后遵守同样的撤单、风控和重试安全规则。
 - 重试结果必须走条件单结果接口。
 - 条件单结果上报失败时，需要保持可补报状态。
+- 真实 QMT 条件单在有效交易 session 外保持等待，不取实时价、不刷新
+  position-cost reference、不触发下单。
+- dry-run 和 mock simulated-real 条件单仍可在有效交易 session 外触发，
+  方便测试和模拟演练。
 
 ## 运维预期
 
@@ -150,5 +191,9 @@ daemon 会把计划和结果上报给 Xquant：
 - 重试不超过 `runtime.max_rebalance_retries`。
 - 重试成功下出的实时委托会继续同步直到终态。
 - 条件单任务重试使用条件单结果接口。
+- 真实普通任务在非交易 session 只在双安全门已打开时进入
+  `pending_execution`，安全门缺失时终态失败。
+- 真实 QMT 条件单在非交易 session 不取价、不刷新 reference、不触发。
+- dry-run 和 mock simulated-real 条件单在非交易 session 仍可执行。
 - 终态生命周期结果上报失败后可以补报。
 - 全量测试通过。
