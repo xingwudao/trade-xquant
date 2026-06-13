@@ -75,6 +75,15 @@ class CachedTradingCalendarSessionGate:
                 start_date=today,
                 end_date=end_date,
             )
+            if not _payload_covers_range(payload, today, end_date):
+                self._refresh_failed_dates.add(today)
+                logger.warning(
+                    "incomplete trading calendar response: market=%s start_date=%s end_date=%s",
+                    self.market,
+                    today.isoformat(),
+                    end_date.isoformat(),
+                )
+                return
             self.storage.upsert_trading_calendar(payload)
         except XquantAdapterError as exc:
             self._refresh_failed_dates.add(today)
@@ -128,3 +137,16 @@ def parse_trading_calendar_day(payload: dict) -> TradingCalendarDay:
             for item in payload.get("sessions", [])
         ),
     )
+
+
+def _payload_covers_range(payload: dict, start_date: date, end_date: date) -> bool:
+    expected = {
+        date.fromordinal(ordinal).isoformat()
+        for ordinal in range(start_date.toordinal(), end_date.toordinal() + 1)
+    }
+    actual = {
+        str(day.get("date"))
+        for day in payload.get("days", [])
+        if isinstance(day, dict) and day.get("date")
+    }
+    return expected <= actual

@@ -194,6 +194,35 @@ def test_gateway_poll_once_can_use_mock_broker_without_qmt(tmp_path) -> None:
     assert fake_xquant.results == [("task-1", "dry_run_success", 0, 0, 0)]
 
 
+def test_gateway_poll_once_skips_calendar_refresh_for_forced_dry_run(tmp_path) -> None:
+    settings = Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="mock",
+            mock_total_asset=100_000,
+            mock_cash=100_000,
+            mock_prices={"513100.SH": 1.0},
+            db_path=str(tmp_path / "audit.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(),
+    )
+    service = GatewayService(settings)
+    service.xquant = FakeXquant()  # type: ignore[assignment]
+    refresh_calls = []
+
+    def refresh(now) -> None:
+        refresh_calls.append(now)
+
+    service._refresh_trading_calendar_cache = refresh  # type: ignore[method-assign]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-1", "status": "dry_run_success"}]
+    assert refresh_calls == []
+
+
 def test_gateway_poll_once_uses_task_endpoint_even_when_product_code_is_configured(tmp_path) -> None:
     settings = Settings(
         xquant=XquantConfig(base_url="http://xquant/api/v1", product_code="prod"),

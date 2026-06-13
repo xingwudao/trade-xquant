@@ -134,9 +134,10 @@ class GatewayService:
         if not tasks:
             logger.info("no pending tasks")
             return results
-        self._refresh_trading_calendar_cache(
-            datetime.now(ZoneInfo(self.settings.risk.timezone))
-        )
+        if self._tasks_need_trading_calendar_refresh(tasks, force_dry_run=force_dry_run):
+            self._refresh_trading_calendar_cache(
+                datetime.now(ZoneInfo(self.settings.risk.timezone))
+            )
 
         self.qmt.connect()
         account = self.qmt.get_account_snapshot()
@@ -410,6 +411,16 @@ class GatewayService:
             and not self._is_simulated_real_order_mode()
             and not self.risk.is_trading_session(now)
         )
+
+    def _tasks_need_trading_calendar_refresh(
+        self,
+        tasks: list[RebalanceTask],
+        *,
+        force_dry_run: bool,
+    ) -> bool:
+        if force_dry_run or self._is_simulated_real_order_mode():
+            return False
+        return any(task.mode == "real" for task in tasks)
 
     def _should_defer_condition_order_until_session(self, order: ConditionOrder) -> bool:
         return order.mode == "real" and not self._is_simulated_real_order_mode()
