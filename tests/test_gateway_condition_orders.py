@@ -64,6 +64,30 @@ def freeze_gateway_now_sequence(monkeypatch, values: list[datetime]) -> None:
     monkeypatch.setattr("trade_xquant.daemon.datetime", FrozenDateTime)
 
 
+def seed_calendar_day(service: GatewayService, day: str) -> None:
+    service.storage.initialize()
+    service.storage.upsert_trading_calendar(
+        {
+            "market": "CN_A",
+            "timezone": "Asia/Shanghai",
+            "start_date": day,
+            "end_date": day,
+            "calendar_version": "test-calendar",
+            "generated_at": f"{day}T00:00:00+08:00",
+            "days": [
+                {
+                    "date": day,
+                    "is_trading_day": True,
+                    "sessions": [
+                        {"name": "morning", "start": "09:30", "end": "11:30"},
+                        {"name": "afternoon", "start": "13:00", "end": "14:57"},
+                    ],
+                }
+            ],
+        }
+    )
+
+
 def test_gateway_poll_once_reads_local_task_file_and_arms_condition_orders(tmp_path) -> None:
     task_file = tmp_path / "tasks.json"
     task_file.write_text(
@@ -1140,6 +1164,7 @@ def test_gateway_condition_outside_trading_session_skips_price_lookup(
     )
     service = GatewayService(real_order_settings_for(tmp_path))
     service.storage.initialize()
+    seed_calendar_day(service, "2026-06-10")
     service.storage.upsert_condition_orders(
         [
             ConditionOrder(
@@ -1193,6 +1218,7 @@ def test_gateway_condition_outside_session_filters_evaluated_real_orders(
     )
     service = GatewayService(real_order_settings_for(tmp_path))
     service.storage.initialize()
+    seed_calendar_day(service, "2026-06-10")
     service.storage.upsert_condition_orders(
         [
             ConditionOrder(
@@ -1246,6 +1272,7 @@ def test_gateway_condition_outside_session_refilters_after_reference_refresh(
     )
     service = GatewayService(real_order_settings_for(tmp_path))
     service.storage.initialize()
+    seed_calendar_day(service, "2026-06-10")
     service.storage.upsert_condition_orders(
         [
             ConditionOrder(
@@ -1308,6 +1335,7 @@ def test_gateway_pending_execution_rearms_and_rechecks_latest_price(
     )
     service = GatewayService(real_order_settings_for(tmp_path))
     service.storage.initialize()
+    seed_calendar_day(service, "2026-06-10")
     service.storage.upsert_condition_orders(
         [
             ConditionOrder(
@@ -1358,6 +1386,7 @@ def test_gateway_pending_execution_submits_when_latest_price_still_triggers(
     )
     service = GatewayService(real_order_settings_for(tmp_path))
     service.storage.initialize()
+    seed_calendar_day(service, "2026-06-10")
     service.storage.upsert_condition_orders(
         [
             ConditionOrder(
@@ -1414,6 +1443,7 @@ def test_gateway_condition_refreshes_session_time_before_real_validation(
     )
     service = GatewayService(real_order_settings_for(tmp_path))
     service.storage.initialize()
+    seed_calendar_day(service, "2026-06-10")
     service.storage.upsert_condition_orders(
         [
             ConditionOrder(

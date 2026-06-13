@@ -1,0 +1,4 @@
+interface:
+  display_name: "Submit PR Review Loop"
+  short_description: "提交 PR 并循环处理 Codex 审核评论直到通过"
+  default_prompt: "Use $submit-pr-review-loop to commit this branch, open a PR, trigger @codex review, and fix actionable review comments until approval."

@@ -96,6 +96,57 @@ MVP 在配置了 `xquant.api_token` 时发送 `Authorization`。
 - Xquant 不应继续把已取代或终态任务作为待处理任务返回。
 - MVP 不支持的资产类别不应下发。
 
+## 交易日历
+
+`GET /api/v1/trading-gateway/trading-calendar`
+
+网关用于批量拉取交易日历并在本地缓存，实盘下单前不实时远程判断。
+
+请求参数：
+
+- `market`：必填，当前仅支持 `CN_A`。
+- `start_date`：必填，包含，格式 `YYYY-MM-DD`。
+- `end_date`：必填，包含，格式 `YYYY-MM-DD`。
+
+约束：
+
+- `start_date` 不能晚于 `end_date`。
+- 单次请求最多覆盖 370 个自然日。
+- 网关按本年度剩余日期缓存，避免跨到未发布的新年日历导致当前日期
+  无法判断。
+
+响应体：
+
+```json
+{
+  "market": "CN_A",
+  "timezone": "Asia/Shanghai",
+  "start_date": "2026-06-12",
+  "end_date": "2026-06-13",
+  "calendar_version": "cn-a-2026.06.12-sse2026r001-szse2026r001",
+  "generated_at": "2026-06-12T19:50:00+08:00",
+  "days": [
+    {
+      "date": "2026-06-12",
+      "is_trading_day": true,
+      "sessions": [
+        {"name": "morning", "start": "09:30", "end": "11:30"},
+        {"name": "afternoon", "start": "13:00", "end": "14:57"}
+      ]
+    },
+    {"date": "2026-06-13", "is_trading_day": false, "sessions": []}
+  ]
+}
+```
+
+客户端处理：
+
+- 真实交易 gate 必须同时满足 `is_trading_day=true` 和当前时间落在
+  `sessions` 任一窗口内。
+- 非交易日的 `sessions` 固定为空数组。
+- `404 trading_calendar_not_found`、刷新失败或本地缓存缺失时，网关按
+  不可交易处理，不自行猜测周末或节假日。
+
 ## 手动任务预览
 
 `POST /api/v1/trading-gateway/products/{product_code}/manual-tasks/preview`

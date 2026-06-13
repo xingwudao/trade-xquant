@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import httpx
@@ -41,6 +42,27 @@ class XquantAdapter:
         data = self._handle(response)
         raw_tasks = data.get("tasks", data if isinstance(data, list) else [])
         return [RebalanceTask.model_validate({**task, "raw": task}) for task in raw_tasks]
+
+    def fetch_trading_calendar(
+        self,
+        *,
+        market: str,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, Any]:
+        response = self.client.get(
+            self._url("/trading-gateway/trading-calendar"),
+            params={
+                "market": market,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            },
+            headers=self._headers(),
+        )
+        data = self._handle(response)
+        if not isinstance(data, dict):
+            raise XquantAdapterError("Xquant trading calendar response must be an object")
+        return data
 
     def send_otp(
         self,

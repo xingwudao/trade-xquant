@@ -65,6 +65,37 @@ def freeze_gateway_now(monkeypatch, value: datetime) -> None:
     monkeypatch.setattr("trade_xquant.daemon.datetime", FrozenDateTime)
 
 
+def seed_calendar_day(
+    service: GatewayService,
+    day: str,
+    *,
+    is_trading_day: bool = True,
+) -> None:
+    service.storage.initialize()
+    service.storage.upsert_trading_calendar(
+        {
+            "market": "CN_A",
+            "timezone": "Asia/Shanghai",
+            "start_date": day,
+            "end_date": day,
+            "calendar_version": "test-calendar",
+            "generated_at": f"{day}T00:00:00+08:00",
+            "days": [
+                {
+                    "date": day,
+                    "is_trading_day": is_trading_day,
+                    "sessions": [
+                        {"name": "morning", "start": "09:30", "end": "11:30"},
+                        {"name": "afternoon", "start": "13:00", "end": "14:57"},
+                    ]
+                    if is_trading_day
+                    else [],
+                }
+            ],
+        }
+    )
+
+
 def real_order_settings(tmp_path) -> Settings:
     return Settings(
         xquant=XquantConfig(base_url="http://xquant/api/v1"),
@@ -331,6 +362,7 @@ def test_gateway_retries_pending_execution_task_when_trading_session_opens(
     broker = RealOrderBroker()
     service.xquant = fake_xquant  # type: ignore[assignment]
     service.qmt = broker  # type: ignore[assignment]
+    seed_calendar_day(service, "2026-06-11")
 
     freeze_gateway_now(
         monkeypatch,
@@ -363,6 +395,7 @@ def test_gateway_pending_execution_task_fails_when_expired_before_session_opens(
     broker = RealOrderBroker()
     service.xquant = fake_xquant  # type: ignore[assignment]
     service.qmt = broker  # type: ignore[assignment]
+    seed_calendar_day(service, "2026-06-11")
 
     freeze_gateway_now(
         monkeypatch,
@@ -393,6 +426,36 @@ def test_gateway_pending_execution_task_fails_when_expired_before_session_opens(
     payload = service.storage.load_task_result_payload("task-real-pending-session")
     assert payload["status"] == "failed"
     assert payload["errors"] == ["task expired"]
+
+
+def test_gateway_real_task_on_non_trading_day_defers_even_at_session_time(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    freeze_gateway_now(
+        monkeypatch,
+        datetime(2026, 6, 13, 9, 30, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    service = GatewayService(real_order_settings(tmp_path))
+    fake_xquant = FakeXquant()
+    fake_xquant.fetch_pending_tasks = lambda account_id: [real_task(account_id)]  # type: ignore[method-assign]
+    broker = PriceFailingRealOrderBroker()
+    service.xquant = fake_xquant  # type: ignore[assignment]
+    service.qmt = broker  # type: ignore[assignment]
+    seed_calendar_day(service, "2026-06-13", is_trading_day=False)
+
+    result = service.poll_once()
+
+    assert result == [
+        {
+            "task_id": "task-real-pending-session",
+            "status": "pending_execution",
+            "error": "real order outside trading session",
+        }
+    ]
+    assert broker.price_calls == []
+    assert broker.submitted_orders == []
 
 
 def test_daemon_loop_sends_heartbeat_with_holdings_when_no_tasks(tmp_path, monkeypatch) -> None:
