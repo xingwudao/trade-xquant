@@ -66,6 +66,7 @@ def freeze_gateway_now_sequence(monkeypatch, values: list[datetime]) -> None:
 
 def seed_calendar_day(service: GatewayService, day: str) -> None:
     service.storage.initialize()
+    service.session_gate.refresh_days = 1
     service.storage.upsert_trading_calendar(
         {
             "market": "CN_A",

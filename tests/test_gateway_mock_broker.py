@@ -72,6 +72,7 @@ def seed_calendar_day(
     is_trading_day: bool = True,
 ) -> None:
     service.storage.initialize()
+    service.session_gate.refresh_days = 1
     service.storage.upsert_trading_calendar(
         {
             "market": "CN_A",

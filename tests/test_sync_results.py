@@ -45,6 +45,11 @@ class FakeXquant:
         self.condition_results.append((source_task_id, condition_id, payload))
 
 
+class AlwaysTradingSessionGate:
+    def is_trading_session(self, now) -> bool:
+        return True
+
+
 class FailingConditionXquant(FakeXquant):
     def report_condition_result(
         self,
@@ -1314,6 +1319,37 @@ def test_sync_submitted_orders_retries_after_timeout_cancel(tmp_path, monkeypatc
     assert len(broker.placed) == 1
     payload = service.storage.load_task_result_payload("task-1")
     assert payload["meta"]["order_lifecycle"]["retry_count"] == 1
+
+
+def test_sync_submitted_orders_refreshes_calendar_before_retry_preflight(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.allow_real_order = True
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.risk.session_gate = AlwaysTradingSessionGate()
+    refresh_calls = []
+
+    def refresh(now) -> None:
+        refresh_calls.append(now)
+
+    service._refresh_trading_calendar_cache = refresh  # type: ignore[method-assign]
+
+    result = service.sync_submitted_orders_once()
+
+    assert refresh_calls
+    assert result[-1]["task_id"] == "task-1"
+    assert broker.cancelled == ["1082169287"]
+    assert len(broker.placed) == 1
 
 
 def test_sync_submitted_orders_retries_condition_timeout_via_condition_result(

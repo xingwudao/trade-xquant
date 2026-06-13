@@ -57,6 +57,7 @@ class CachedTradingCalendarSessionGate:
         self.timezone = timezone
         self.market = market
         self.refresh_days = refresh_days
+        self._refresh_failed_dates: set[date] = set()
 
     def refresh_if_needed(self, now: datetime) -> None:
         current = self._local_now(now)
@@ -66,6 +67,7 @@ class CachedTradingCalendarSessionGate:
             date(today.year, 12, 31),
         )
         if self.storage.has_trading_calendar_range(self.market, today, end_date):
+            self._refresh_failed_dates.discard(today)
             return
         try:
             payload = self.xquant.fetch_trading_calendar(
@@ -73,7 +75,9 @@ class CachedTradingCalendarSessionGate:
                 start_date=today,
                 end_date=end_date,
             )
+            self.storage.upsert_trading_calendar(payload)
         except XquantAdapterError as exc:
+            self._refresh_failed_dates.add(today)
             logger.warning(
                 "failed to refresh trading calendar: market=%s status_code=%s error=%s",
                 self.market,
@@ -82,16 +86,19 @@ class CachedTradingCalendarSessionGate:
             )
             return
         except Exception as exc:  # noqa: BLE001 - local gate must fail closed
+            self._refresh_failed_dates.add(today)
             logger.warning(
                 "failed to refresh trading calendar: market=%s error=%s",
                 self.market,
                 exc,
             )
             return
-        self.storage.upsert_trading_calendar(payload)
+        self._refresh_failed_dates.discard(today)
 
     def is_trading_session(self, now: datetime) -> bool:
         current = self._local_now(now)
+        if current.date() in self._refresh_failed_dates:
+            return False
         calendar_day = self.storage.get_trading_calendar_day(self.market, current.date())
         if calendar_day is None or not calendar_day.is_trading_day:
             return False

@@ -1026,6 +1026,9 @@ class GatewayService:
             logger.error("cannot preflight missing task: task_id=%s", task_id)
             return {"task_id": task_id, "status": "missing_task"}
 
+        self._refresh_trading_calendar_cache(
+            datetime.now(ZoneInfo(self.settings.risk.timezone))
+        )
         account: AccountSnapshot | None = None
         positions: list[Position] | None = None
         prices: dict[str, float] | None = None
