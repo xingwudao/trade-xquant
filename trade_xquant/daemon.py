@@ -38,6 +38,7 @@ from trade_xquant.portfolio_engine import PortfolioEngine
 from trade_xquant.qmt_adapter import QmtAdapter, compact_obj
 from trade_xquant.risk_control import RiskControl, RiskError
 from trade_xquant.storage import Storage
+from trade_xquant.trading_calendar import CachedTradingCalendarSessionGate
 from trade_xquant.xquant_adapter import XquantAdapter, XquantAdapterError
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,12 @@ class GatewayService:
         else:
             raise ValueError("runtime.broker_adapter must be 'qmt' or 'mock'")
         self.portfolio = PortfolioEngine()
-        self.risk = RiskControl(settings)
+        self.session_gate = CachedTradingCalendarSessionGate(
+            storage=self.storage,
+            xquant=self.xquant,
+            timezone=settings.risk.timezone,
+        )
+        self.risk = RiskControl(settings, session_gate=self.session_gate)
 
     def poll_once(self, force_dry_run: bool = False, task_id: str | None = None) -> list[dict[str, object]]:
         self.storage.initialize()
@@ -128,6 +134,10 @@ class GatewayService:
         if not tasks:
             logger.info("no pending tasks")
             return results
+        if self._tasks_need_trading_calendar_refresh(tasks, force_dry_run=force_dry_run):
+            self._refresh_trading_calendar_cache(
+                datetime.now(ZoneInfo(self.settings.risk.timezone))
+            )
 
         self.qmt.connect()
         account = self.qmt.get_account_snapshot()
@@ -225,6 +235,7 @@ class GatewayService:
     def condition_poll_once(self) -> list[dict[str, object]]:
         self.storage.initialize()
         now = datetime.now(ZoneInfo(self.settings.risk.timezone))
+        self._refresh_trading_calendar_cache(now)
         is_trading_session = self.risk.is_trading_session(now)
         if is_trading_session:
             for condition_id in self.storage.rearm_pending_execution_condition_orders(
@@ -401,6 +412,16 @@ class GatewayService:
             and not self.risk.is_trading_session(now)
         )
 
+    def _tasks_need_trading_calendar_refresh(
+        self,
+        tasks: list[RebalanceTask],
+        *,
+        force_dry_run: bool,
+    ) -> bool:
+        if force_dry_run or self._is_simulated_real_order_mode():
+            return False
+        return any(task.mode == "real" for task in tasks)
+
     def _should_defer_condition_order_until_session(self, order: ConditionOrder) -> bool:
         return order.mode == "real" and not self._is_simulated_real_order_mode()
 
@@ -419,6 +440,15 @@ class GatewayService:
             self.settings.runtime.broker_adapter == "mock"
             and self.settings.runtime.simulate_real_orders
         )
+
+    def _refresh_trading_calendar_cache(self, now: datetime) -> None:
+        if self._is_simulated_real_order_mode():
+            return
+        self.session_gate.xquant = self.xquant
+        try:
+            self.session_gate.refresh_if_needed(now)
+        except Exception:  # noqa: BLE001 - calendar refresh failure must fail closed
+            logger.exception("failed to refresh trading calendar cache")
 
     def _condition_prices(self, symbols: list[str]) -> dict[str, float]:
         prices: dict[str, float] = {}
@@ -1007,6 +1037,9 @@ class GatewayService:
             logger.error("cannot preflight missing task: task_id=%s", task_id)
             return {"task_id": task_id, "status": "missing_task"}
 
+        self._refresh_trading_calendar_cache(
+            datetime.now(ZoneInfo(self.settings.risk.timezone))
+        )
         account: AccountSnapshot | None = None
         positions: list[Position] | None = None
         prices: dict[str, float] | None = None

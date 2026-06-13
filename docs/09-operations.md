@@ -159,6 +159,12 @@ QMT 后向 Xquant 发送 heartbeat。QMT 可查询时，heartbeat 会刷新 Xqua
 daemon 也是正式运行推荐入口。它会持续同步条件单、已提交订单、
 成交结果和终态结果补报。
 
+有效交易 session 不再只按工作日和固定时段猜测。daemon 会从 Xquant
+批量拉取 `CN_A` 交易日历，缓存到本地 SQLite，然后用本地缓存判断：
+当天必须是 `is_trading_day=true`，且当前时间落在当天 sessions 任一窗口内。
+本地缓存缺失、刷新失败或 Xquant 返回 `trading_calendar_not_found` 时，
+网关按不可交易处理，不会自行按周末或节假日推断。
+
 真实普通任务如果在非有效交易 session 到达执行点，网关会先检查真实下单
 双安全门。安全门未打开时会立即写终态 `failed` 并上报；安全门已打开时
 记录为 `pending_execution`，不取实时价，不向 QMT 提交委托，

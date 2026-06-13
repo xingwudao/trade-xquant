@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -155,6 +155,17 @@ class Storage:
                     xquant_report_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS trading_calendar_days (
+                    market TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    is_trading_day INTEGER NOT NULL,
+                    sessions_json TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    calendar_version TEXT NOT NULL,
+                    generated_at TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY (market, date)
                 );
                 """
             )
@@ -686,6 +697,84 @@ class Storage:
                 params,
             ).fetchall()
         return [row["condition_task_id"] for row in rows]
+
+    def upsert_trading_calendar(self, payload: dict[str, Any]) -> None:
+        market = str(payload["market"])
+        timezone_name = str(payload["timezone"])
+        calendar_version = str(payload["calendar_version"])
+        generated_at = str(payload["generated_at"])
+        fetched_at = utc_now()
+        with self._connection() as conn:
+            for day in payload.get("days", []):
+                conn.execute(
+                    """
+                    INSERT INTO trading_calendar_days (
+                        market, date, is_trading_day, sessions_json,
+                        timezone, calendar_version, generated_at, fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(market, date) DO UPDATE SET
+                        is_trading_day=excluded.is_trading_day,
+                        sessions_json=excluded.sessions_json,
+                        timezone=excluded.timezone,
+                        calendar_version=excluded.calendar_version,
+                        generated_at=excluded.generated_at,
+                        fetched_at=excluded.fetched_at
+                    """,
+                    (
+                        market,
+                        str(day["date"]),
+                        1 if day.get("is_trading_day") else 0,
+                        json.dumps(day.get("sessions", []), ensure_ascii=False),
+                        timezone_name,
+                        calendar_version,
+                        generated_at,
+                        fetched_at,
+                    ),
+                )
+
+    def has_trading_calendar_range(
+        self,
+        market: str,
+        start_date: date,
+        end_date: date,
+    ) -> bool:
+        expected_days = (end_date - start_date).days + 1
+        if expected_days <= 0:
+            return False
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM trading_calendar_days
+                WHERE market=?
+                  AND date>=?
+                  AND date<=?
+                """,
+                (market, start_date.isoformat(), end_date.isoformat()),
+            ).fetchone()
+        return bool(row and int(row["count"]) == expected_days)
+
+    def get_trading_calendar_day(self, market: str, day: date):
+        from trade_xquant.trading_calendar import parse_trading_calendar_day
+
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT date, is_trading_day, sessions_json
+                FROM trading_calendar_days
+                WHERE market=? AND date=?
+                """,
+                (market, day.isoformat()),
+            ).fetchone()
+        if row is None:
+            return None
+        return parse_trading_calendar_day(
+            {
+                "date": row["date"],
+                "is_trading_day": bool(row["is_trading_day"]),
+                "sessions": json.loads(row["sessions_json"]),
+            }
+        )
 
     def record_order_event(
         self,

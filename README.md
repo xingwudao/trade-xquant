@@ -473,6 +473,14 @@ daemon 会按 `runtime.order_sync_interval_seconds` 周期同步
 这些订单会继续可同步，不会被隐藏。condition task retry 的结果通过
 condition result path 上报。
 
+有效交易 session 由 Xquant 的 `CN_A` 交易日历和当天 sessions 共同决定。
+daemon 会通过
+`GET /api/v1/trading-gateway/trading-calendar` 批量拉取本年度剩余日历并
+缓存到本地 SQLite；实盘 gate 只读本地缓存，不在下单前实时远程判断。
+如果当天日历缺失、刷新失败，或 Xquant 返回 `trading_calendar_not_found`，
+网关按不可交易处理。周末或节假日即使时间落在 `09:30` 到 `11:30`、
+`13:00` 到 `14:57`，也不会被视为有效交易 session。
+
 普通真实交易任务如果当前不在有效交易 session，daemon 会先检查真实下单
 双安全门。安全门未打开时立即写终态 `failed` 并上报；安全门已打开时，
 本地任务标记为 `pending_execution`，不会取实时价、不会向 QMT 提交委托，

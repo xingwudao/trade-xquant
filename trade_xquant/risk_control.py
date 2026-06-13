@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from trade_xquant.config import Settings
 from trade_xquant.models import AccountSnapshot, OrderPlan, RebalanceTask
+from trade_xquant.trading_calendar import StaticTradingSessionGate, TradingSessionGate
 
 
 class RiskError(ValueError):
@@ -13,8 +14,13 @@ class RiskError(ValueError):
 
 
 class RiskControl:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        session_gate: TradingSessionGate | None = None,
+    ) -> None:
         self.settings = settings
+        self.session_gate = session_gate or StaticTradingSessionGate()
 
     def validate(
         self,
@@ -66,10 +72,7 @@ class RiskControl:
             raise RiskError("real order disabled by environment")
 
     def is_trading_session(self, now: datetime) -> bool:
-        if now.weekday() >= 5:
-            return False
-        hm = now.hour * 100 + now.minute
-        return 930 <= hm <= 1130 or 1300 <= hm <= 1457
+        return self.session_gate.is_trading_session(now)
 
     def _is_trading_session(self, now: datetime) -> bool:
         return self.is_trading_session(now)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import httpx
 
 import pytest
@@ -41,6 +43,49 @@ def test_fetch_pending_tasks_parses_contract() -> None:
     assert str(tasks[0].signal_as_of_date) == "2026-05-20"
     assert str(tasks[0].signal_effective_date) == "2026-05-21"
     assert tasks[0].targets[0].symbol == "513100.SH"
+
+
+def test_fetch_trading_calendar_contract() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer token"
+        assert request.url.path == "/api/v1/trading-gateway/trading-calendar"
+        assert request.url.params["market"] == "CN_A"
+        assert request.url.params["start_date"] == "2026-06-12"
+        assert request.url.params["end_date"] == "2026-06-13"
+        return httpx.Response(
+            200,
+            json={
+                "market": "CN_A",
+                "timezone": "Asia/Shanghai",
+                "start_date": "2026-06-12",
+                "end_date": "2026-06-13",
+                "calendar_version": "cn-a-2026.06.12-sse2026r001-szse2026r001",
+                "generated_at": "2026-06-12T19:50:00+08:00",
+                "days": [
+                    {
+                        "date": "2026-06-12",
+                        "is_trading_day": True,
+                        "sessions": [
+                            {"name": "morning", "start": "09:30", "end": "11:30"},
+                            {"name": "afternoon", "start": "13:00", "end": "14:57"},
+                        ],
+                    },
+                    {"date": "2026-06-13", "is_trading_day": False, "sessions": []},
+                ],
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://xquant")
+    adapter = XquantAdapter("http://xquant/api/v1", api_token="token", client=client)
+
+    calendar = adapter.fetch_trading_calendar(
+        market="CN_A",
+        start_date=date(2026, 6, 12),
+        end_date=date(2026, 6, 13),
+    )
+
+    assert calendar["market"] == "CN_A"
+    assert calendar["days"][1]["is_trading_day"] is False
 
 
 def test_report_result_posts_execution_payload() -> None:

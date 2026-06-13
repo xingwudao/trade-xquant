@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import sqlite3
 
 import pytest
@@ -140,6 +141,48 @@ def test_condition_market_state_roundtrip(tmp_path) -> None:
     assert state["market_data_source"] == "mock"
     assert state["activation_price"] is None
     assert state["state"] == {"reason": "test"}
+
+
+def test_trading_calendar_cache_roundtrip(tmp_path) -> None:
+    storage = Storage(tmp_path / "audit.db")
+    storage.initialize()
+
+    storage.upsert_trading_calendar(
+        {
+            "market": "CN_A",
+            "timezone": "Asia/Shanghai",
+            "start_date": "2026-06-12",
+            "end_date": "2026-06-13",
+            "calendar_version": "cn-a-2026.06.12-sse2026r001-szse2026r001",
+            "generated_at": "2026-06-12T19:50:00+08:00",
+            "days": [
+                {
+                    "date": "2026-06-12",
+                    "is_trading_day": True,
+                    "sessions": [
+                        {"name": "morning", "start": "09:30", "end": "11:30"},
+                        {"name": "afternoon", "start": "13:00", "end": "14:57"},
+                    ],
+                },
+                {"date": "2026-06-13", "is_trading_day": False, "sessions": []},
+            ],
+        }
+    )
+
+    assert storage.has_trading_calendar_range(
+        "CN_A",
+        date(2026, 6, 12),
+        date(2026, 6, 13),
+    )
+    trading_day = storage.get_trading_calendar_day("CN_A", date(2026, 6, 12))
+    weekend = storage.get_trading_calendar_day("CN_A", date(2026, 6, 13))
+
+    assert trading_day is not None
+    assert trading_day.is_trading_day is True
+    assert trading_day.sessions[0].start.isoformat(timespec="minutes") == "09:30"
+    assert weekend is not None
+    assert weekend.is_trading_day is False
+    assert weekend.sessions == ()
 
 
 def test_condition_market_state_upsert_updates_existing_row(tmp_path) -> None:
