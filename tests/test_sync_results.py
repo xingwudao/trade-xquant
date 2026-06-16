@@ -45,6 +45,20 @@ class FakeXquant:
         self.condition_results.append((source_task_id, condition_id, payload))
 
 
+class OrderedXquant(FakeXquant):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple] = []
+
+    def report_plan(self, task_id: str, payload: dict) -> None:
+        self.calls.append(("plan", task_id))
+        super().report_plan(task_id, payload)
+
+    def report_result(self, task_id: str, status: str, payload) -> None:
+        self.calls.append(("result", task_id, status))
+        super().report_result(task_id, status, payload)
+
+
 class AlwaysTradingSessionGate:
     def is_trading_session(self, now) -> bool:
         return True
@@ -97,6 +111,22 @@ class RuntimeFailingFirstResultXquant(FakeXquant):
         self.report_attempts += 1
         if self.report_attempts == 1:
             raise RuntimeError("network unavailable")
+        return super().report_result(task_id, status, payload)
+
+
+class FailingFirstSubmittedResultXquant(FakeXquant):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submitted_report_attempts = 0
+
+    def report_result(self, task_id: str, status: str, payload) -> None:
+        if status == "submitted":
+            self.submitted_report_attempts += 1
+            if self.submitted_report_attempts == 1:
+                raise XquantAdapterError(
+                    'Xquant API error 503: {"detail":"result_unavailable"}',
+                    status_code=503,
+                )
         return super().report_result(task_id, status, payload)
 
 
@@ -1223,6 +1253,26 @@ def test_sync_submitted_orders_marks_retry_budget_exhausted_syncable(tmp_path) -
     assert service.storage.list_syncable_task_ids(status="submitted") == ["task-1"]
 
 
+def test_sync_submitted_orders_reports_retry_budget_exhausted_after_deferral(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 0
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["xquant_synced"] is True
+    assert service.xquant.results[-1][0:2] == ("task-1", "submitted")  # type: ignore[attr-defined]
+    reported = service.xquant.results[-1][2]  # type: ignore[attr-defined]
+    assert reported["errors"] == ["retry budget exhausted"]
+    assert reported["meta"]["order_lifecycle"]["reason"] == "retry_budget_exhausted"
+
+
 def test_sync_submitted_orders_retry_budget_exhausted_does_not_cancel(tmp_path) -> None:
     broker = PendingBroker()
     service = make_service_with_result(
@@ -1428,7 +1478,7 @@ def test_sync_results_retry_fill_ignores_cancelled_original_attempt(
     assert payload["meta"]["order_lifecycle"]["cancelled_order_ids_history"] == ["1082169287"]
 
 
-def test_sync_submitted_orders_continues_after_initial_report_failure(
+def test_sync_submitted_orders_continues_after_retry_report_failure(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1447,9 +1497,10 @@ def test_sync_submitted_orders_continues_after_initial_report_failure(
 
     result = service.sync_submitted_orders_once()
 
-    assert result[0]["xquant_synced"] is False
-    assert result[0]["status_code"] == 409
+    assert result[0] == {"task_id": "task-1", "status": "submitted"}
     assert result[-1]["status"] == "submitted"
+    assert result[-1]["xquant_synced"] is False
+    assert result[-1]["status_code"] == 409
     assert broker.cancelled == ["1082169287"]
     assert len(broker.placed) == 1
     payload = service.storage.load_task_result_payload("task-1")
@@ -1457,7 +1508,7 @@ def test_sync_submitted_orders_continues_after_initial_report_failure(
     assert payload["submitted_orders"][0]["local_order_id"] == "retry-1"
 
 
-def test_sync_submitted_orders_continues_after_initial_runtime_report_failure(
+def test_sync_submitted_orders_continues_after_retry_runtime_report_failure(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1476,11 +1527,12 @@ def test_sync_submitted_orders_continues_after_initial_runtime_report_failure(
 
     result = service.sync_submitted_orders_once()
 
-    assert result[0]["xquant_synced"] is False
-    assert result[0]["status_code"] is None
-    assert result[0]["hint"] is None
-    assert result[0]["error"] == "network unavailable"
+    assert result[0] == {"task_id": "task-1", "status": "submitted"}
     assert result[-1]["status"] == "submitted"
+    assert result[-1]["xquant_synced"] is False
+    assert result[-1]["status_code"] is None
+    assert result[-1]["hint"] is None
+    assert result[-1]["error"] == "network unavailable"
     assert broker.cancelled == ["1082169287"]
     assert len(broker.placed) == 1
     payload = service.storage.load_task_result_payload("task-1")
@@ -1870,6 +1922,27 @@ def test_sync_submitted_orders_audits_cancel_failure(tmp_path) -> None:
     assert service.storage.list_syncable_task_ids(status="submitted") == ["task-1"]
 
 
+def test_sync_submitted_orders_reports_cancel_failure_after_deferral(tmp_path) -> None:
+    broker = FailingCancelBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["xquant_synced"] is True
+    assert service.xquant.results[-1][0:2] == ("task-1", "submitted")  # type: ignore[attr-defined]
+    reported = service.xquant.results[-1][2]  # type: ignore[attr-defined]
+    assert "cancel failed" in reported["errors"][0]
+    assert reported["meta"]["order_lifecycle"]["reason"] == "submitted_order_cancel_failed"
+
+
 def test_sync_submitted_orders_treats_nonzero_cancel_return_as_failure(tmp_path) -> None:
     broker = NonzeroCancelBroker()
     service = make_service_with_result(
@@ -2026,7 +2099,7 @@ def test_sync_submitted_orders_audits_retry_report_failure(tmp_path, monkeypatch
         result=submitted_result(),
         result_status="submitted",
     )
-    service.xquant = FailingSecondResultXquant()  # type: ignore[assignment]
+    service.xquant = FailingFirstSubmittedResultXquant()  # type: ignore[assignment]
     service.settings.runtime.submitted_order_timeout_seconds = 0
     service.settings.runtime.max_rebalance_retries = 1
     service.settings.runtime.simulate_real_orders = True
@@ -2162,6 +2235,33 @@ def test_sync_submitted_orders_reports_retry_plan(tmp_path, monkeypatch) -> None
 
     assert service.xquant.plans[-1][0] == "task-1"  # type: ignore[attr-defined]
     assert service.xquant.plans[-1][1]["orders"][0]["symbol"] == "513100.SH"  # type: ignore[attr-defined]
+
+
+def test_sync_submitted_orders_defers_timeout_result_until_retry_plan(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.xquant = OrderedXquant()  # type: ignore[assignment]
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    service.sync_submitted_orders_once()
+
+    assert broker.cancelled == ["1082169287"]
+    assert len(broker.placed) == 1
+    assert service.xquant.calls == [  # type: ignore[attr-defined]
+        ("plan", "task-1"),
+        ("result", "task-1", "submitted"),
+    ]
 
 
 def test_cancel_pending_submitted_orders_skips_duplicate_order_id(tmp_path) -> None:

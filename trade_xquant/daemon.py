@@ -684,12 +684,16 @@ class GatewayService:
     def sync_submitted_orders_once(self) -> list[dict[str, object]]:
         self.storage.initialize()
         partial_task_ids = self.storage.list_syncable_task_ids(status="partial")
-        results = self._sync_results_or_report_failures(status="submitted")
+        results = self._sync_results_or_report_failures(
+            status="submitted",
+            defer_timed_out_pending_reports=True,
+        )
         for partial_task_id in partial_task_ids:
             results.extend(
                 self._sync_results_or_report_failures(
                     task_id=partial_task_id,
                     status="partial",
+                    defer_timed_out_pending_reports=True,
                 )
             )
         for result_item in list(results):
@@ -720,6 +724,7 @@ class GatewayService:
             if preflight.get("status") != "ok":
                 if preflight.get("retry_blocked"):
                     preflight = self._record_retry_blocked_result(task_id, preflight)
+                    preflight = self._report_stored_task_result(task_id, preflight)
                 results.append(preflight)
                 continue
             cancelled, errors = self._cancel_pending_submitted_orders(
@@ -733,13 +738,13 @@ class GatewayService:
                 errors,
             )
             if errors:
-                results.append(
-                    self._record_cancel_failure_result(
-                        task_id,
-                        cancelled_order_ids=cancelled,
-                        cancel_errors=errors,
-                    )
+                cancel_failure = self._record_cancel_failure_result(
+                    task_id,
+                    cancelled_order_ids=cancelled,
+                    cancel_errors=errors,
                 )
+                cancel_failure = self._report_stored_task_result(task_id, cancel_failure)
+                results.append(cancel_failure)
                 continue
             if cancelled:
                 retry_result = self._retry_rebalance_task(
@@ -754,9 +759,14 @@ class GatewayService:
         self,
         task_id: str | None = None,
         status: str = "all",
+        defer_timed_out_pending_reports: bool = False,
     ) -> list[dict[str, object]]:
         try:
-            return self.sync_results(task_id=task_id, status=status)
+            return self.sync_results(
+                task_id=task_id,
+                status=status,
+                defer_timed_out_pending_reports=defer_timed_out_pending_reports,
+            )
         except GatewaySyncReportError as exc:
             return exc.results
 
@@ -814,6 +824,60 @@ class GatewayService:
         except Exception as exc:  # noqa: BLE001 - callers persist local report failures
             return exc
         return None
+
+    def _report_stored_task_result(
+        self,
+        task_id: str,
+        result_item: dict[str, object],
+    ) -> dict[str, object]:
+        payload = self.storage.load_task_result_payload(task_id) or {}
+        if not isinstance(payload, dict):
+            result_item.update(
+                {
+                    "xquant_synced": False,
+                    "error": "task result payload not found",
+                }
+            )
+            return result_item
+
+        status = str(payload.get("status") or result_item.get("status") or "submitted")
+        result = ExecutionResult.model_validate(payload)
+        report_error = self._report_execution_result(task_id, status, result)
+        meta = payload.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+            payload["meta"] = meta
+
+        if report_error is not None:
+            meta["xquant_synced"] = False
+            meta["xquant_report_error"] = str(report_error)
+            if isinstance(report_error, XquantAdapterError):
+                meta["xquant_status_code"] = report_error.status_code
+                hint = _xquant_report_error_hint(report_error)
+                if hint:
+                    meta["xquant_error_hint"] = hint
+            self.storage.mark_task_result(task_id, status, payload)
+            result_item.update(
+                {
+                    "xquant_synced": False,
+                    "status_code": report_error.status_code
+                    if isinstance(report_error, XquantAdapterError)
+                    else None,
+                    "error": str(report_error),
+                    "hint": _xquant_report_error_hint(report_error)
+                    if isinstance(report_error, XquantAdapterError)
+                    else None,
+                }
+            )
+            return result_item
+
+        meta["xquant_synced"] = True
+        meta.pop("xquant_report_error", None)
+        meta.pop("xquant_status_code", None)
+        meta.pop("xquant_error_hint", None)
+        self.storage.mark_task_result(task_id, status, payload)
+        result_item["xquant_synced"] = True
+        return result_item
 
     def _order_lifecycle_meta(self, task_id: str) -> dict[str, object]:
         lifecycle = self._stored_order_lifecycle_meta(task_id)
@@ -1331,7 +1395,12 @@ class GatewayService:
                 errors.append(f"{context.symbol} {context.side} cancel failed: {exc}")
         return cancelled, errors
 
-    def sync_results(self, task_id: str | None = None, status: str = "all") -> list[dict[str, object]]:
+    def sync_results(
+        self,
+        task_id: str | None = None,
+        status: str = "all",
+        defer_timed_out_pending_reports: bool = False,
+    ) -> list[dict[str, object]]:
         self.storage.initialize()
         syncable_task_ids = self.storage.list_syncable_task_ids(
             task_id=task_id,
@@ -1427,7 +1496,8 @@ class GatewayService:
                 if lifecycle is not None:
                     result.meta["order_lifecycle"] = lifecycle
                 self._attach_current_account_snapshot(result, self.storage.load_task(submitted_task_id))
-                self.storage.mark_task_result(submitted_task_id, synced_status, result.model_dump(mode="json"))
+                payload = result.model_dump(mode="json")
+                self.storage.mark_task_result(submitted_task_id, synced_status, payload)
                 result_item: dict[str, object] = {
                     "task_id": submitted_task_id,
                     "status": synced_status,
@@ -1449,10 +1519,18 @@ class GatewayService:
                                 if isinstance(report_error, XquantAdapterError)
                                 else None,
                             }
-                        )
+                    )
                     results.append(result_item)
                     continue
                 self._refresh_condition_orders_for_task(submitted_task_id)
+                if (
+                    defer_timed_out_pending_reports
+                    and synced_status in {"submitted", "partial"}
+                    and self._submitted_order_timed_out(submitted_task_id)
+                    and self._current_pending_synced_orders(payload, synced_orders)
+                ):
+                    results.append(result_item)
+                    continue
                 try:
                     self.xquant.report_result(submitted_task_id, synced_status, result)
                 except Exception as exc:  # noqa: BLE001 - local sync must survive report transport failures
