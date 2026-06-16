@@ -1253,6 +1253,26 @@ def test_sync_submitted_orders_marks_retry_budget_exhausted_syncable(tmp_path) -
     assert service.storage.list_syncable_task_ids(status="submitted") == ["task-1"]
 
 
+def test_sync_submitted_orders_reports_retry_budget_exhausted_after_deferral(tmp_path) -> None:
+    broker = PendingBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 0
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["xquant_synced"] is True
+    assert service.xquant.results[-1][0:2] == ("task-1", "submitted")  # type: ignore[attr-defined]
+    reported = service.xquant.results[-1][2]  # type: ignore[attr-defined]
+    assert reported["errors"] == ["retry budget exhausted"]
+    assert reported["meta"]["order_lifecycle"]["reason"] == "retry_budget_exhausted"
+
+
 def test_sync_submitted_orders_retry_budget_exhausted_does_not_cancel(tmp_path) -> None:
     broker = PendingBroker()
     service = make_service_with_result(
@@ -1900,6 +1920,27 @@ def test_sync_submitted_orders_audits_cancel_failure(tmp_path) -> None:
     assert lifecycle["cancel_errors"] == payload["errors"]
     assert lifecycle["submitted_order_ids"] == ["1082169287"]
     assert service.storage.list_syncable_task_ids(status="submitted") == ["task-1"]
+
+
+def test_sync_submitted_orders_reports_cancel_failure_after_deferral(tmp_path) -> None:
+    broker = FailingCancelBroker()
+    service = make_service_with_result(
+        tmp_path,
+        broker=broker,
+        result=submitted_result(),
+        result_status="submitted",
+    )
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["xquant_synced"] is True
+    assert service.xquant.results[-1][0:2] == ("task-1", "submitted")  # type: ignore[attr-defined]
+    reported = service.xquant.results[-1][2]  # type: ignore[attr-defined]
+    assert "cancel failed" in reported["errors"][0]
+    assert reported["meta"]["order_lifecycle"]["reason"] == "submitted_order_cancel_failed"
 
 
 def test_sync_submitted_orders_treats_nonzero_cancel_return_as_failure(tmp_path) -> None:

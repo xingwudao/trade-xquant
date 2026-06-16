@@ -724,6 +724,7 @@ class GatewayService:
             if preflight.get("status") != "ok":
                 if preflight.get("retry_blocked"):
                     preflight = self._record_retry_blocked_result(task_id, preflight)
+                    preflight = self._report_stored_task_result(task_id, preflight)
                 results.append(preflight)
                 continue
             cancelled, errors = self._cancel_pending_submitted_orders(
@@ -737,13 +738,13 @@ class GatewayService:
                 errors,
             )
             if errors:
-                results.append(
-                    self._record_cancel_failure_result(
-                        task_id,
-                        cancelled_order_ids=cancelled,
-                        cancel_errors=errors,
-                    )
+                cancel_failure = self._record_cancel_failure_result(
+                    task_id,
+                    cancelled_order_ids=cancelled,
+                    cancel_errors=errors,
                 )
+                cancel_failure = self._report_stored_task_result(task_id, cancel_failure)
+                results.append(cancel_failure)
                 continue
             if cancelled:
                 retry_result = self._retry_rebalance_task(
@@ -823,6 +824,60 @@ class GatewayService:
         except Exception as exc:  # noqa: BLE001 - callers persist local report failures
             return exc
         return None
+
+    def _report_stored_task_result(
+        self,
+        task_id: str,
+        result_item: dict[str, object],
+    ) -> dict[str, object]:
+        payload = self.storage.load_task_result_payload(task_id) or {}
+        if not isinstance(payload, dict):
+            result_item.update(
+                {
+                    "xquant_synced": False,
+                    "error": "task result payload not found",
+                }
+            )
+            return result_item
+
+        status = str(payload.get("status") or result_item.get("status") or "submitted")
+        result = ExecutionResult.model_validate(payload)
+        report_error = self._report_execution_result(task_id, status, result)
+        meta = payload.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+            payload["meta"] = meta
+
+        if report_error is not None:
+            meta["xquant_synced"] = False
+            meta["xquant_report_error"] = str(report_error)
+            if isinstance(report_error, XquantAdapterError):
+                meta["xquant_status_code"] = report_error.status_code
+                hint = _xquant_report_error_hint(report_error)
+                if hint:
+                    meta["xquant_error_hint"] = hint
+            self.storage.mark_task_result(task_id, status, payload)
+            result_item.update(
+                {
+                    "xquant_synced": False,
+                    "status_code": report_error.status_code
+                    if isinstance(report_error, XquantAdapterError)
+                    else None,
+                    "error": str(report_error),
+                    "hint": _xquant_report_error_hint(report_error)
+                    if isinstance(report_error, XquantAdapterError)
+                    else None,
+                }
+            )
+            return result_item
+
+        meta["xquant_synced"] = True
+        meta.pop("xquant_report_error", None)
+        meta.pop("xquant_status_code", None)
+        meta.pop("xquant_error_hint", None)
+        self.storage.mark_task_result(task_id, status, payload)
+        result_item["xquant_synced"] = True
+        return result_item
 
     def _order_lifecycle_meta(self, task_id: str) -> dict[str, object]:
         lifecycle = self._stored_order_lifecycle_meta(task_id)
