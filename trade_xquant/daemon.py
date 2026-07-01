@@ -1972,8 +1972,15 @@ def _task_with_portfolio_snapshot_fill_adjustments(
     if task.portfolio_snapshot is None or not isinstance(payload, dict):
         return task, {}
 
-    share_deltas, cash_delta, filled_quantities = _portfolio_snapshot_fill_state(payload)
-    if not share_deltas and abs(cash_delta) < 1e-9 and not filled_quantities:
+    share_deltas, cash_delta, filled_quantities, filled_amounts = (
+        _portfolio_snapshot_fill_state(payload)
+    )
+    if (
+        not share_deltas
+        and abs(cash_delta) < 1e-9
+        and not filled_quantities
+        and not filled_amounts
+    ):
         return task, {}
 
     account_quantities = {
@@ -2026,6 +2033,7 @@ def _task_with_portfolio_snapshot_fill_adjustments(
         "portfolio_snapshot_fill_deltas": share_deltas,
         "portfolio_snapshot_cash_delta": cash_delta,
         "portfolio_snapshot_fill_quantities": filled_quantities,
+        "portfolio_snapshot_fill_amounts": filled_amounts,
     }
     return (
         task.model_copy(
@@ -2040,7 +2048,7 @@ def _task_with_portfolio_snapshot_fill_adjustments(
 
 def _portfolio_snapshot_fill_state(
     payload: dict[str, Any],
-) -> tuple[dict[str, int], float, dict[str, int]]:
+) -> tuple[dict[str, int], float, dict[str, int], dict[str, float]]:
     meta = payload.get("meta") if isinstance(payload, dict) else {}
     if not isinstance(meta, dict):
         meta = {}
@@ -2051,6 +2059,7 @@ def _portfolio_snapshot_fill_state(
     share_deltas = _int_mapping(lifecycle.get("portfolio_snapshot_fill_deltas"))
     cash_delta = _float_value(lifecycle.get("portfolio_snapshot_cash_delta"))
     filled_quantities = _int_mapping(lifecycle.get("portfolio_snapshot_fill_quantities"))
+    filled_amounts = _float_mapping(lifecycle.get("portfolio_snapshot_fill_amounts"))
 
     submitted_orders = [
         order for order in payload.get("submitted_orders", []) if isinstance(order, dict)
@@ -2065,6 +2074,15 @@ def _portfolio_snapshot_fill_state(
         filled_quantities[order_key] = max(previous_quantity, traded_quantity)
         if incremental_quantity <= 0:
             continue
+        previous_amount = filled_amounts.get(order_key, 0.0)
+        incremental_amount, filled_amount = _summary_incremental_amount(
+            summary,
+            submitted_orders,
+            incremental_quantity,
+            traded_quantity,
+            previous_amount,
+        )
+        filled_amounts[order_key] = max(previous_amount, filled_amount)
 
         symbol = str(summary.get("symbol") or "").strip().upper()
         side = str(summary.get("side") or "").strip().lower()
@@ -2072,16 +2090,10 @@ def _portfolio_snapshot_fill_state(
             continue
         signed_quantity = incremental_quantity if side == "buy" else -incremental_quantity
         share_deltas[symbol] = share_deltas.get(symbol, 0) + signed_quantity
-        amount = _summary_incremental_amount(
-            summary,
-            submitted_orders,
-            incremental_quantity,
-            traded_quantity,
-        )
-        cash_delta += amount if side == "sell" else -amount
+        cash_delta += incremental_amount if side == "sell" else -incremental_amount
 
     share_deltas = {symbol: quantity for symbol, quantity in share_deltas.items() if quantity}
-    return share_deltas, cash_delta, filled_quantities
+    return share_deltas, cash_delta, filled_quantities, filled_amounts
 
 
 def _iter_sync_summary_orders(sync_summary: object) -> list[dict[str, Any]]:
@@ -2136,12 +2148,14 @@ def _summary_incremental_amount(
     submitted_orders: list[dict[str, Any]],
     incremental_quantity: int,
     traded_quantity: int,
-) -> float:
+    previous_amount: float,
+) -> tuple[float, float]:
     traded_amount = _float_value(summary.get("traded_amount"))
     if traded_amount > 0 and traded_quantity > 0:
-        return traded_amount * incremental_quantity / traded_quantity
+        return max(0.0, traded_amount - previous_amount), traded_amount
     price = _summary_order_price(summary, submitted_orders)
-    return incremental_quantity * price
+    incremental_amount = incremental_quantity * price
+    return incremental_amount, previous_amount + incremental_amount
 
 
 def _order_price(order: dict[str, Any]) -> float:
@@ -2186,6 +2200,18 @@ def _int_mapping(value: object) -> dict[str, int]:
     for key, raw in value.items():
         try:
             result[str(key)] = int(raw)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _float_mapping(value: object) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key, raw in value.items():
+        try:
+            result[str(key)] = float(raw)
         except (TypeError, ValueError):
             continue
     return result

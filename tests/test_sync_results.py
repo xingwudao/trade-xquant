@@ -10,7 +10,11 @@ import pytest
 
 from trade_xquant.condition_orders import ConditionAction, ConditionOrder
 from trade_xquant.config import QmtConfig, RiskConfig, RuntimeConfig, Settings, XquantConfig
-from trade_xquant.daemon import GatewayService, GatewaySyncReportError
+from trade_xquant.daemon import (
+    GatewayService,
+    GatewaySyncReportError,
+    _task_with_portfolio_snapshot_fill_adjustments,
+)
 from trade_xquant.models import (
     AccountSnapshot,
     ExecutionResult,
@@ -634,6 +638,58 @@ def snapshot_task() -> RebalanceTask:
             },
         }
     )
+
+
+def test_snapshot_fill_adjustment_tracks_incremental_trade_amount() -> None:
+    adjusted_task, lifecycle = _task_with_portfolio_snapshot_fill_adjustments(
+        snapshot_task(),
+        {
+            "submitted_orders": [
+                {
+                    "task_id": "task-1",
+                    "symbol": "513100.SH",
+                    "side": "buy",
+                    "quantity": 1000,
+                    "price": 1.0,
+                    "amount": 1000.0,
+                    "local_order_id": "1082169287",
+                }
+            ],
+            "meta": {
+                "order_lifecycle": {
+                    "portfolio_snapshot_fill_deltas": {"513100.SH": 200},
+                    "portfolio_snapshot_cash_delta": -200.0,
+                    "portfolio_snapshot_fill_quantities": {"1082169287": 200},
+                    "portfolio_snapshot_fill_amounts": {"1082169287": 200.0},
+                },
+                "sync_summary": {
+                    "filled_orders": [],
+                    "pending_orders": [
+                        {
+                            "symbol": "513100.SH",
+                            "side": "buy",
+                            "quantity": 1000,
+                            "traded_quantity": 400,
+                            "traded_amount": 460.0,
+                            "local_order_id": "1082169287",
+                            "broker_order_id": None,
+                        }
+                    ],
+                    "failed_orders": [],
+                },
+            },
+        },
+        [Position(symbol="513100.SH", quantity=400, sellable_quantity=0)],
+    )
+
+    assert adjusted_task.portfolio_snapshot is not None
+    assert adjusted_task.portfolio_snapshot.positions[0].shares == 400
+    assert adjusted_task.portfolio_snapshot.cash == 9540
+    assert adjusted_task.available_cash == 4540
+    assert lifecycle["portfolio_snapshot_fill_deltas"] == {"513100.SH": 400}
+    assert lifecycle["portfolio_snapshot_cash_delta"] == -460.0
+    assert lifecycle["portfolio_snapshot_fill_quantities"] == {"1082169287": 400}
+    assert lifecycle["portfolio_snapshot_fill_amounts"] == {"1082169287": 460.0}
 
 
 def submitted_result() -> ExecutionResult:
