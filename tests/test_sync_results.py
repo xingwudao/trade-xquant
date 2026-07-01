@@ -544,7 +544,7 @@ class SnapshotPartialFillRetryBroker(PendingBroker):
         return AccountSnapshot(
             account_id="acct",
             total_asset=10_000,
-            cash=9_600,
+            cash=9_560,
             market_value=400,
         )
 
@@ -580,8 +580,8 @@ class SnapshotPartialFillRetryBroker(PendingBroker):
                 order_id=1082169287,
                 stock_code="513100.SH",
                 quantity=400,
-                price=1.0,
-                amount=400.0,
+                price=1.1,
+                amount=440.0,
                 m_strRemark="task-1",
             )
         ]
@@ -623,11 +623,11 @@ def snapshot_task() -> RebalanceTask:
             "mode": "real",
             "created_at": "2026-05-27T09:35:00+08:00",
             "expires_at": None,
+            "available_cash": "5000.00",
             "cash_buffer_ratio": 0,
-            "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+            "targets": [{"symbol": "513100.SH", "target_weight": 0.8}],
             "portfolio_snapshot": {
                 "cash": "10000.00",
-                "available_cash": "10000.00",
                 "holdings_market_value": "0.00",
                 "total_value": "10000.00",
                 "positions": [],
@@ -1067,6 +1067,7 @@ def test_sync_results_reports_partial_when_some_orders_fill_and_some_fail(tmp_pa
                 "side": "buy",
                 "quantity": 1000,
                 "traded_quantity": 1000,
+                "traded_amount": 1000.0,
                 "local_order_id": "1082169287",
                 "broker_order_id": None,
             }
@@ -1077,6 +1078,7 @@ def test_sync_results_reports_partial_when_some_orders_fill_and_some_fail(tmp_pa
                 "side": "buy",
                 "quantity": 1000,
                 "traded_quantity": 0,
+                "traded_amount": 0.0,
                 "local_order_id": "1082169288",
                 "broker_order_id": None,
                 "error": "停牌废单",
@@ -1517,11 +1519,11 @@ def test_sync_submitted_orders_replans_snapshot_task_after_partial_fill(
 
     assert result[-1]["retry_count"] == 1
     assert broker.cancelled == ["1082169287"]
-    assert broker.placed[0].quantity == 4600
+    assert broker.placed[0].quantity == 4500
     stored = service.storage.load_task_result_payload("task-1")
     lifecycle = stored["meta"]["order_lifecycle"]
     assert lifecycle["portfolio_snapshot_fill_deltas"] == {"513100.SH": 400}
-    assert lifecycle["portfolio_snapshot_cash_delta"] == -400.0
+    assert lifecycle["portfolio_snapshot_cash_delta"] == -440.0
 
 
 def test_sync_submitted_orders_retries_condition_timeout_via_condition_result(

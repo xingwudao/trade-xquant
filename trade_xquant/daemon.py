@@ -185,8 +185,8 @@ class GatewayService:
                 self.storage.record_plan(plan)
                 if should_report_gateway:
                     self.xquant.report_plan(task.task_id, plan.model_dump(mode="json"))
-                _reserve_plan_sell_orders(sellable_reservations, plan)
                 result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
+                _reserve_submitted_sell_orders(sellable_reservations, result)
                 self._attach_current_account_snapshot(
                     result,
                     task,
@@ -1954,8 +1954,11 @@ def _positions_with_sellable_reservations(
     return adjusted
 
 
-def _reserve_plan_sell_orders(reservations: dict[str, int], plan: OrderPlan) -> None:
-    for order in plan.orders:
+def _reserve_submitted_sell_orders(
+    reservations: dict[str, int],
+    result: ExecutionResult,
+) -> None:
+    for order in result.submitted_orders:
         if order.side != "sell" or order.quantity <= 0:
             continue
         reservations[order.symbol] = reservations.get(order.symbol, 0) + order.quantity
@@ -2011,6 +2014,7 @@ def _task_with_portfolio_snapshot_fill_adjustments(
         task.portfolio_snapshot.available_cash,
         cash_delta,
     )
+    top_level_available_cash = _adjust_snapshot_money(task.available_cash, cash_delta)
     snapshot = task.portfolio_snapshot.model_copy(
         update={
             "cash": cash,
@@ -2023,7 +2027,15 @@ def _task_with_portfolio_snapshot_fill_adjustments(
         "portfolio_snapshot_cash_delta": cash_delta,
         "portfolio_snapshot_fill_quantities": filled_quantities,
     }
-    return task.model_copy(update={"portfolio_snapshot": snapshot}), extra_lifecycle
+    return (
+        task.model_copy(
+            update={
+                "available_cash": top_level_available_cash,
+                "portfolio_snapshot": snapshot,
+            }
+        ),
+        extra_lifecycle,
+    )
 
 
 def _portfolio_snapshot_fill_state(
@@ -2060,8 +2072,12 @@ def _portfolio_snapshot_fill_state(
             continue
         signed_quantity = incremental_quantity if side == "buy" else -incremental_quantity
         share_deltas[symbol] = share_deltas.get(symbol, 0) + signed_quantity
-        price = _summary_order_price(summary, submitted_orders)
-        amount = incremental_quantity * price
+        amount = _summary_incremental_amount(
+            summary,
+            submitted_orders,
+            incremental_quantity,
+            traded_quantity,
+        )
         cash_delta += amount if side == "sell" else -amount
 
     share_deltas = {symbol: quantity for symbol, quantity in share_deltas.items() if quantity}
@@ -2113,6 +2129,19 @@ def _summary_order_price(
         ):
             return _order_price(order)
     return 0.0
+
+
+def _summary_incremental_amount(
+    summary: dict[str, Any],
+    submitted_orders: list[dict[str, Any]],
+    incremental_quantity: int,
+    traded_quantity: int,
+) -> float:
+    traded_amount = _float_value(summary.get("traded_amount"))
+    if traded_amount > 0 and traded_quantity > 0:
+        return traded_amount * incremental_quantity / traded_quantity
+    price = _summary_order_price(summary, submitted_orders)
+    return incremental_quantity * price
 
 
 def _order_price(order: dict[str, Any]) -> float:
@@ -2249,10 +2278,17 @@ def _summarize_synced_orders(
             traded_quantity,
             sum(_payload_int(payload, "quantity", "traded_volume", "m_nVolumeTraded") for payload in trade_rows),
         )
+        traded_amount = _trade_rows_amount(trade_rows)
+        if traded_amount <= 0 and traded_quantity > 0:
+            traded_amount = traded_quantity * submitted.price
         if traded_quantity > 0:
             any_filled = True
 
-        order_summary = _submitted_order_summary(submitted, traded_quantity=traded_quantity)
+        order_summary = _submitted_order_summary(
+            submitted,
+            traded_quantity=traded_quantity,
+            traded_amount=traded_amount,
+        )
         if failed_rows:
             reason = _failure_reason(failed_rows[0])
             errors.append(f"{submitted.symbol} {submitted.side} failed: {reason}")
@@ -2298,12 +2334,30 @@ def _summarize_synced_orders(
     )
 
 
-def _submitted_order_summary(submitted_order, *, traded_quantity: int) -> dict[str, Any]:
+def _trade_rows_amount(trade_rows: list[dict[str, Any]]) -> float:
+    amount = 0.0
+    for trade in trade_rows:
+        trade_amount = _payload_float(trade, "amount", "trade_amount", "m_dTradeAmount")
+        if trade_amount <= 0:
+            quantity = _payload_int(trade, "quantity", "traded_volume", "m_nVolumeTraded")
+            price = _payload_float(trade, "price", "traded_price", "m_dTradePrice")
+            trade_amount = quantity * price
+        amount += trade_amount
+    return amount
+
+
+def _submitted_order_summary(
+    submitted_order,
+    *,
+    traded_quantity: int,
+    traded_amount: float,
+) -> dict[str, Any]:
     return {
         "symbol": submitted_order.symbol,
         "side": submitted_order.side,
         "quantity": submitted_order.quantity,
         "traded_quantity": traded_quantity,
+        "traded_amount": traded_amount,
         "local_order_id": submitted_order.local_order_id,
         "broker_order_id": submitted_order.broker_order_id,
     }
@@ -2441,6 +2495,18 @@ def _payload_int(payload: dict[str, Any], *keys: str) -> int:
         except (TypeError, ValueError):
             continue
     return 0
+
+
+def _payload_float(payload: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = payload.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
 
 
 def _is_failed_order(payload: dict[str, Any]) -> bool:
