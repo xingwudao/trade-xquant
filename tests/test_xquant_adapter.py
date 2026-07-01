@@ -45,6 +45,56 @@ def test_fetch_pending_tasks_parses_contract() -> None:
     assert tasks[0].targets[0].symbol == "513100.SH"
 
 
+def test_fetch_pending_tasks_parses_portfolio_snapshot_contract() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/trading-gateway/tasks"
+        return httpx.Response(
+            200,
+            json={
+                "tasks": [
+                    {
+                        "task_id": "rebalance_1",
+                        "portfolio_id": "demo",
+                        "account_id": "acct",
+                        "mode": "dry_run",
+                        "created_at": "2026-05-27T09:35:00+08:00",
+                        "expires_at": None,
+                        "available_cash": "49000.00",
+                        "portfolio_snapshot": {
+                            "cash": "50000.00",
+                            "available_cash": "49000.00",
+                            "holdings_market_value": "1200.00",
+                            "total_value": "51200.00",
+                            "positions": [
+                                {
+                                    "symbol": "513100.SS",
+                                    "shares": "2400",
+                                    "reference_price": "0.50",
+                                    "market_value": "1200.00",
+                                }
+                            ],
+                            "tracked_symbols": ["513100.SS"],
+                            "as_of": "2026-05-28T09:31:00+08:00",
+                            "source": "server_partition",
+                        },
+                        "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+                    }
+                ]
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://xquant")
+    adapter = XquantAdapter("http://xquant/api/v1", client=client)
+
+    task = adapter.fetch_pending_tasks(account_id="acct")[0]
+
+    assert task.available_cash == 49_000
+    assert task.portfolio_snapshot is not None
+    assert float(task.portfolio_snapshot.cash) == 50_000
+    assert task.portfolio_snapshot.positions[0].symbol == "513100.SH"
+    assert float(task.portfolio_snapshot.positions[0].shares) == 2400
+
+
 def test_fetch_trading_calendar_contract() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"] == "Bearer token"

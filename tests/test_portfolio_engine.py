@@ -44,6 +44,257 @@ def test_rebalance_uses_100_share_lots_and_cash_buffer() -> None:
     assert plan.turnover_ratio <= 0.8
 
 
+def test_rebalance_uses_portfolio_snapshot_instead_of_account_holdings() -> None:
+    account = AccountSnapshot(account_id="acct", total_asset=200_000, cash=160_000)
+    task = make_task(
+        cash_buffer_ratio=0,
+        targets=[TargetPosition(symbol="510300.SH", target_weight=0.5)],
+        constraints={
+            "max_turnover_ratio": 1.0,
+            "max_single_order_amount": 100_000,
+            "min_order_amount": 0,
+        },
+        available_cash="40000.00",
+        portfolio_snapshot={
+            "cash": "40000.00",
+            "available_cash": "40000.00",
+            "holdings_market_value": "4000.00",
+            "total_value": "44000.00",
+            "positions": [
+                {
+                    "symbol": "510300.SH",
+                    "shares": "1000",
+                    "reference_price": "4.00",
+                    "market_value": "4000.00",
+                }
+            ],
+        },
+    )
+
+    plan = PortfolioEngine().build_plan(
+        task,
+        account,
+        holdings=[Position(symbol="513100.SH", quantity=10_000, sellable_quantity=10_000)],
+        prices={"510300.SH": 4.0, "513100.SH": 2.0},
+    )
+
+    assert [(order.symbol, order.side, order.quantity, order.amount) for order in plan.orders] == [
+        ("510300.SH", "buy", 4500, 18_000)
+    ]
+    assert plan.total_asset == 44_000
+
+
+def test_snapshot_cash_can_be_derived_from_total_value() -> None:
+    account = AccountSnapshot(account_id="acct", total_asset=200_000, cash=160_000)
+    task = make_task(
+        cash_buffer_ratio=0,
+        targets=[TargetPosition(symbol="510300.SH", target_weight=0.5)],
+        constraints={
+            "max_turnover_ratio": 1.0,
+            "max_single_order_amount": 100_000,
+            "min_order_amount": 0,
+        },
+        portfolio_snapshot={
+            "available_cash": "40000.00",
+            "holdings_market_value": "4000.00",
+            "total_value": "44000.00",
+            "positions": [
+                {
+                    "symbol": "510300.SH",
+                    "shares": "1000",
+                    "reference_price": "4.00",
+                    "market_value": "4000.00",
+                }
+            ],
+        },
+    )
+
+    plan = PortfolioEngine().build_plan(
+        task,
+        account,
+        holdings=[Position(symbol="510300.SH", quantity=1000, sellable_quantity=1000)],
+        prices={"510300.SH": 4.0},
+    )
+
+    assert [(order.symbol, order.side, order.quantity, order.amount) for order in plan.orders] == [
+        ("510300.SH", "buy", 4500, 18_000)
+    ]
+    assert plan.total_asset == 44_000
+
+
+def test_snapshot_cash_derivation_rejects_missing_position_values() -> None:
+    account = AccountSnapshot(account_id="acct", total_asset=200_000, cash=160_000)
+    task = make_task(
+        cash_buffer_ratio=0,
+        targets=[TargetPosition(symbol="510300.SH", target_weight=0.5)],
+        constraints={
+            "max_turnover_ratio": 1.0,
+            "max_single_order_amount": 100_000,
+            "min_order_amount": 0,
+        },
+        portfolio_snapshot={
+            "available_cash": "40000.00",
+            "total_value": "44000.00",
+            "positions": [
+                {
+                    "symbol": "510300.SH",
+                    "shares": "1000",
+                    "reference_price": "4.00",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(PortfolioError, match="holdings_market_value is required"):
+        PortfolioEngine().build_plan(
+            task,
+            account,
+            holdings=[Position(symbol="510300.SH", quantity=1000, sellable_quantity=1000)],
+            prices={"510300.SH": 4.0},
+        )
+
+
+def test_snapshot_without_cash_or_total_value_is_rejected() -> None:
+    account = AccountSnapshot(account_id="acct", total_asset=200_000, cash=160_000)
+    task = make_task(
+        cash_buffer_ratio=0,
+        targets=[TargetPosition(symbol="510300.SH", target_weight=0.5)],
+        constraints={
+            "max_turnover_ratio": 1.0,
+            "max_single_order_amount": 100_000,
+            "min_order_amount": 0,
+        },
+        portfolio_snapshot={
+            "available_cash": "40000.00",
+            "positions": [],
+        },
+    )
+
+    with pytest.raises(PortfolioError, match="portfolio_snapshot cash is required"):
+        PortfolioEngine().build_plan(
+            task,
+            account,
+            holdings=[],
+            prices={"510300.SH": 4.0},
+        )
+
+
+def test_rebalance_snapshot_sell_does_not_use_other_partition_shares() -> None:
+    account = AccountSnapshot(account_id="acct", total_asset=100_000, cash=0)
+    task = make_task(
+        targets=[TargetPosition(symbol="510300.SH", target_weight=0)],
+        constraints={
+            "max_turnover_ratio": 1.0,
+            "max_single_order_amount": 100_000,
+            "min_order_amount": 0,
+        },
+        portfolio_snapshot={
+            "cash": "0.00",
+            "available_cash": "0.00",
+            "holdings_market_value": "4000.00",
+            "total_value": "4000.00",
+            "positions": [
+                {
+                    "symbol": "510300.SH",
+                    "shares": "1000",
+                    "reference_price": "4.00",
+                    "market_value": "4000.00",
+                }
+            ],
+        },
+    )
+
+    plan = PortfolioEngine().build_plan(
+        task,
+        account,
+        holdings=[Position(symbol="510300.SH", quantity=5000, sellable_quantity=5000)],
+        prices={"510300.SH": 4.0},
+    )
+
+    assert [(order.symbol, order.side, order.quantity, order.amount) for order in plan.orders] == [
+        ("510300.SH", "sell", 1000, 4000)
+    ]
+
+
+def test_empty_targets_sell_snapshot_positions_to_cash() -> None:
+    account = AccountSnapshot(account_id="acct", total_asset=100_000, cash=0)
+    task = make_task(
+        targets=[],
+        constraints={
+            "max_turnover_ratio": 1.0,
+            "max_single_order_amount": 100_000,
+            "min_order_amount": 0,
+        },
+        portfolio_snapshot={
+            "cash": "0.00",
+            "available_cash": "0.00",
+            "holdings_market_value": "4000.00",
+            "total_value": "4000.00",
+            "positions": [
+                {
+                    "symbol": "510300.SH",
+                    "shares": "1000",
+                    "reference_price": "4.00",
+                    "market_value": "4000.00",
+                }
+            ],
+        },
+    )
+
+    plan = PortfolioEngine().build_plan(
+        task,
+        account,
+        holdings=[Position(symbol="510300.SH", quantity=1000, sellable_quantity=1000)],
+        prices={"510300.SH": 4.0},
+    )
+
+    assert [(order.symbol, order.side, order.quantity, order.amount) for order in plan.orders] == [
+        ("510300.SH", "sell", 1000, 4000)
+    ]
+
+
+def test_empty_targets_without_snapshot_are_rejected() -> None:
+    with pytest.raises(ValueError, match="empty targets require portfolio_snapshot"):
+        make_task(
+            targets=[],
+            constraints={
+                "max_turnover_ratio": 1.0,
+                "max_single_order_amount": 100_000,
+                "min_order_amount": 0,
+            },
+        )
+
+
+def test_available_cash_cap_preserves_cash_buffer() -> None:
+    account = AccountSnapshot(account_id="acct", total_asset=100_000, cash=100_000)
+    task = make_task(
+        cash_buffer_ratio=0.002,
+        targets=[TargetPosition(symbol="513100.SH", target_weight=1.0)],
+        constraints={
+            "max_turnover_ratio": 1.0,
+            "max_single_order_amount": 100_000,
+            "min_order_amount": 0,
+        },
+        available_cash="100000.00",
+        portfolio_snapshot={
+            "cash": "100000.00",
+            "available_cash": "100000.00",
+            "holdings_market_value": "0.00",
+            "total_value": "100000.00",
+            "positions": [],
+        },
+    )
+
+    plan = PortfolioEngine().build_plan(
+        task,
+        account,
+        holdings=[],
+        prices={"513100.SH": 1.0},
+    )
+
+    assert plan.total_buy_amount == 99_800
+
+
 def test_sell_does_not_exceed_sellable_quantity() -> None:
     account = AccountSnapshot(account_id="acct", total_asset=100_000, cash=10_000)
     holdings = [Position(symbol="513100.SH", quantity=10_000, sellable_quantity=300)]

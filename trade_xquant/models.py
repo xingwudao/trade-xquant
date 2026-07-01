@@ -4,7 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 TaskMode = Literal["dry_run", "real"]
@@ -29,6 +29,37 @@ class TaskConstraints(BaseModel):
     condition_orders: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class PortfolioSnapshotPosition(BaseModel):
+    symbol: str
+    shares: Decimal = Field(ge=0)
+    name: str | None = None
+    reference_price: Decimal | None = Field(default=None, ge=0)
+    market_value: Decimal | None = Field(default=None, ge=0)
+    weight: Decimal | None = Field(default=None, ge=0)
+    target_weight: Decimal | None = Field(default=None, ge=0)
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return normalize_symbol(value)
+
+
+class PortfolioSnapshot(BaseModel):
+    cash: Decimal | None = Field(default=None, ge=0)
+    available_cash: Decimal | None = Field(default=None, ge=0)
+    holdings_market_value: Decimal | None = Field(default=None, ge=0)
+    total_value: Decimal | None = Field(default=None, ge=0)
+    positions: list[PortfolioSnapshotPosition] = Field(default_factory=list)
+    tracked_symbols: list[str] = Field(default_factory=list)
+    as_of: datetime | None = None
+    source: str = "server_partition"
+
+    @field_validator("tracked_symbols")
+    @classmethod
+    def normalize_tracked_symbols(cls, value: list[str]) -> list[str]:
+        return [normalize_symbol(symbol) for symbol in value]
+
+
 class RebalanceTask(BaseModel):
     task_id: str
     portfolio_id: str
@@ -38,17 +69,18 @@ class RebalanceTask(BaseModel):
     signal_effective_date: date | None = None
     created_at: datetime
     expires_at: datetime | None = None
+    available_cash: Decimal | None = Field(default=None, ge=0)
+    portfolio_snapshot: PortfolioSnapshot | None = None
     cash_buffer_ratio: float = Field(default=0.002, ge=0, le=1)
     targets: list[TargetPosition]
     constraints: TaskConstraints = Field(default_factory=TaskConstraints)
     raw: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("targets")
-    @classmethod
-    def require_targets(cls, value: list[TargetPosition]) -> list[TargetPosition]:
-        if not value:
-            raise ValueError("targets must not be empty")
-        return value
+    @model_validator(mode="after")
+    def require_snapshot_for_empty_targets(self) -> RebalanceTask:
+        if not self.targets and self.portfolio_snapshot is None:
+            raise ValueError("empty targets require portfolio_snapshot")
+        return self
 
 
 class AccountSnapshot(BaseModel):
