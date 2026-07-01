@@ -165,7 +165,7 @@ class GatewayService:
                     )
                     continue
                 condition_orders = extract_condition_orders(task)
-                prices = self.qmt.get_prices([target.symbol for target in task.targets] + [p.symbol for p in positions])
+                prices = self.qmt.get_prices(_task_price_symbols(task, positions))
                 plan = self.portfolio.build_plan(task, account, positions, prices)
                 validation_now = datetime.now(ZoneInfo(self.settings.risk.timezone))
                 self.risk.validate(
@@ -1112,10 +1112,7 @@ class GatewayService:
             self.qmt.connect()
             account = self.qmt.get_account_snapshot()
             positions = self.qmt.get_positions()
-            symbols = [target.symbol for target in task.targets] + [
-                position.symbol for position in positions
-            ]
-            prices = self.qmt.get_prices(symbols)
+            prices = self.qmt.get_prices(_task_price_symbols(task, positions))
             plan = self.portfolio.build_plan(task, account, positions, prices)
             self.risk.validate(task, account, plan, known_symbols=set(prices))
         except Exception as exc:  # noqa: BLE001 - pre-cancel guard must be audited
@@ -1209,10 +1206,7 @@ class GatewayService:
             self.qmt.connect()
             account = self.qmt.get_account_snapshot()
             positions = self.qmt.get_positions()
-            symbols = [target.symbol for target in task.targets] + [
-                position.symbol for position in positions
-            ]
-            prices = self.qmt.get_prices(symbols)
+            prices = self.qmt.get_prices(_task_price_symbols(task, positions))
             plan = self.portfolio.build_plan(task, account, positions, prices)
             lifecycle = self._retry_lifecycle_meta(
                 task_id,
@@ -1910,6 +1904,15 @@ def _merge_tasks(*task_groups: list[RebalanceTask]) -> list[RebalanceTask]:
             tasks.append(task)
             seen.add(task.task_id)
     return tasks
+
+
+def _task_price_symbols(task: RebalanceTask, positions: list[Position]) -> list[str]:
+    symbols = {target.symbol for target in task.targets}
+    if task.portfolio_snapshot is not None:
+        symbols.update(position.symbol for position in task.portfolio_snapshot.positions)
+    else:
+        symbols.update(position.symbol for position in positions)
+    return sorted(symbols)
 
 
 def _derive_synced_status(

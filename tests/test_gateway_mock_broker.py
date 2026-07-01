@@ -249,6 +249,155 @@ def test_gateway_poll_once_uses_task_endpoint_even_when_product_code_is_configur
     assert fake_xquant.results == [("task-1", "dry_run_success", 0, 0, 0)]
 
 
+def test_gateway_prices_include_portfolio_snapshot_positions(tmp_path) -> None:
+    settings = Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="mock",
+            db_path=str(tmp_path / "audit.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(),
+    )
+    service = GatewayService(settings)
+    fake_xquant = FakeXquant()
+
+    def fetch_pending_tasks(account_id: str):
+        return [
+            RebalanceTask.model_validate(
+                {
+                    "task_id": "task-1",
+                    "portfolio_id": "prod",
+                    "account_id": account_id,
+                    "mode": "dry_run",
+                    "created_at": "2026-05-27T09:35:00+08:00",
+                    "expires_at": None,
+                    "cash_buffer_ratio": 0,
+                    "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+                    "portfolio_snapshot": {
+                        "cash": "40000.00",
+                        "available_cash": "40000.00",
+                        "holdings_market_value": "1000.00",
+                        "total_value": "41000.00",
+                        "positions": [
+                            {
+                                "symbol": "510300.SH",
+                                "shares": "1000",
+                                "reference_price": "1.00",
+                                "market_value": "1000.00",
+                            }
+                        ],
+                    },
+                }
+            )
+        ]
+
+    class SnapshotOnlyBroker:
+        def __init__(self) -> None:
+            self.price_calls: list[list[str]] = []
+
+        def connect(self) -> None:
+            return None
+
+        def get_account_snapshot(self) -> AccountSnapshot:
+            return AccountSnapshot(account_id="acct", total_asset=100_000, cash=100_000)
+
+        def get_positions(self) -> list[Position]:
+            return []
+
+        def get_prices(self, symbols: list[str]) -> dict[str, float]:
+            self.price_calls.append(symbols)
+            return {symbol: 1.0 for symbol in symbols}
+
+    broker = SnapshotOnlyBroker()
+    fake_xquant.fetch_pending_tasks = fetch_pending_tasks  # type: ignore[method-assign]
+    service.xquant = fake_xquant  # type: ignore[assignment]
+    service.qmt = broker  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-1", "status": "dry_run_success"}]
+    assert set(broker.price_calls[0]) == {"510300.SH", "513100.SH"}
+
+
+def test_gateway_snapshot_task_does_not_price_unrelated_account_positions(tmp_path) -> None:
+    settings = Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="mock",
+            db_path=str(tmp_path / "audit.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(),
+    )
+    service = GatewayService(settings)
+    fake_xquant = FakeXquant()
+
+    def fetch_pending_tasks(account_id: str):
+        return [
+            RebalanceTask.model_validate(
+                {
+                    "task_id": "task-1",
+                    "portfolio_id": "prod",
+                    "account_id": account_id,
+                    "mode": "dry_run",
+                    "created_at": "2026-05-27T09:35:00+08:00",
+                    "expires_at": None,
+                    "cash_buffer_ratio": 0,
+                    "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+                    "portfolio_snapshot": {
+                        "cash": "40000.00",
+                        "available_cash": "40000.00",
+                        "holdings_market_value": "1000.00",
+                        "total_value": "41000.00",
+                        "positions": [
+                            {
+                                "symbol": "510300.SH",
+                                "shares": "1000",
+                                "reference_price": "1.00",
+                                "market_value": "1000.00",
+                            }
+                        ],
+                    },
+                }
+            )
+        ]
+
+    class BrokerWithUnrelatedHolding:
+        def __init__(self) -> None:
+            self.price_calls: list[list[str]] = []
+
+        def connect(self) -> None:
+            return None
+
+        def get_account_snapshot(self) -> AccountSnapshot:
+            return AccountSnapshot(account_id="acct", total_asset=100_000, cash=50_000)
+
+        def get_positions(self) -> list[Position]:
+            return [
+                Position(symbol="510300.SH", quantity=1000, sellable_quantity=1000),
+                Position(symbol="999999.SH", quantity=1000, sellable_quantity=1000),
+            ]
+
+        def get_prices(self, symbols: list[str]) -> dict[str, float]:
+            self.price_calls.append(symbols)
+            if "999999.SH" in symbols:
+                raise RuntimeError("cannot fetch valid price for 999999.SH")
+            return {symbol: 1.0 for symbol in symbols}
+
+    broker = BrokerWithUnrelatedHolding()
+    fake_xquant.fetch_pending_tasks = fetch_pending_tasks  # type: ignore[method-assign]
+    service.xquant = fake_xquant  # type: ignore[assignment]
+    service.qmt = broker  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [{"task_id": "task-1", "status": "dry_run_success"}]
+    assert set(broker.price_calls[0]) == {"510300.SH", "513100.SH"}
+
+
 def test_gateway_real_task_outside_trading_session_defers_without_terminal_result(
     tmp_path,
     monkeypatch,

@@ -20,15 +20,19 @@ class PortfolioEngine:
         target_sum = sum(target.target_weight for target in task.targets)
         if target_sum > 1 + 1e-9:
             raise PortfolioError("target weights cannot exceed 1")
-        if account.total_asset <= 0:
-            raise PortfolioError("total_asset must be positive")
+        if not task.targets and task.portfolio_snapshot is None:
+            raise PortfolioError("empty targets require portfolio_snapshot")
 
         target_weights = {target.symbol: target.target_weight for target in task.targets}
-        positions = {position.symbol: position for position in holdings}
+        positions = self._positions_for_task(task, holdings)
         symbols = set(target_weights) | set(positions)
         for symbol in symbols:
             if symbol not in prices or prices[symbol] <= 0:
                 raise PortfolioError(f"missing or invalid price for {symbol}")
+
+        account = self._account_for_task(task, account, positions, prices)
+        if account.total_asset <= 0:
+            raise PortfolioError("total_asset must be positive")
 
         min_amount = task.constraints.min_order_amount
         if min_amount is None:
@@ -48,13 +52,19 @@ class PortfolioEngine:
 
         for symbol in sorted(symbols):
             price = prices[symbol]
-            current_qty = positions.get(symbol, Position(symbol=symbol, quantity=0, sellable_quantity=0)).quantity
+            current_qty = positions.get(
+                symbol,
+                Position(symbol=symbol, quantity=0, sellable_quantity=0),
+            ).quantity
             current_value = current_qty * price
             desired_value = account.total_asset * target_weights.get(symbol, 0.0)
             diff_value = desired_value - current_value
             if diff_value >= 0:
                 continue
-            quantity = min(positions[symbol].sellable_quantity, self._floor_lot(abs(diff_value) / price))
+            quantity = min(
+                positions[symbol].sellable_quantity,
+                self._floor_lot(abs(diff_value) / price),
+            )
             if quantity <= 0:
                 continue
             amount = quantity * price
@@ -78,16 +88,17 @@ class PortfolioEngine:
             if turnover_budget is not None:
                 turnover_budget -= amount
 
-        available_cash = account.cash + sell_cash
-        available_cash -= account.total_asset * task.cash_buffer_ratio
-        available_cash = max(0.0, available_cash)
+        available_cash = self._available_cash_after_sales(task, account, sell_cash)
         if turnover_budget is not None:
             available_cash = min(available_cash, max(0.0, turnover_budget))
 
         buy_candidates: list[tuple[str, float, float]] = []
         for symbol in sorted(target_weights):
             price = prices[symbol]
-            current_qty = positions.get(symbol, Position(symbol=symbol, quantity=0, sellable_quantity=0)).quantity
+            current_qty = positions.get(
+                symbol,
+                Position(symbol=symbol, quantity=0, sellable_quantity=0),
+            ).quantity
             current_value = current_qty * price
             desired_value = account.total_asset * target_weights[symbol]
             diff_value = desired_value - current_value
@@ -139,3 +150,121 @@ class PortfolioEngine:
 
     def _floor_lot(self, shares: float) -> int:
         return int(shares // self.lot_size) * self.lot_size
+
+    def _positions_for_task(
+        self,
+        task: RebalanceTask,
+        holdings: list[Position],
+    ) -> dict[str, Position]:
+        account_positions = {position.symbol: position for position in holdings}
+        if task.portfolio_snapshot is None:
+            return account_positions
+
+        quantities: dict[str, int] = {}
+        market_values: dict[str, float] = {}
+        for snapshot_position in task.portfolio_snapshot.positions:
+            quantity = int(snapshot_position.shares)
+            if quantity <= 0:
+                continue
+            symbol = snapshot_position.symbol
+            quantities[symbol] = quantities.get(symbol, 0) + quantity
+            if snapshot_position.market_value is not None:
+                market_values[symbol] = market_values.get(symbol, 0.0) + float(
+                    snapshot_position.market_value
+                )
+
+        positions: dict[str, Position] = {}
+        for symbol, quantity in quantities.items():
+            account_position = account_positions.get(symbol)
+            sellable_quantity = 0
+            cost_price = None
+            if account_position is not None:
+                sellable_quantity = min(quantity, account_position.sellable_quantity)
+                cost_price = account_position.cost_price
+            positions[symbol] = Position(
+                symbol=symbol,
+                quantity=quantity,
+                sellable_quantity=sellable_quantity,
+                market_value=market_values.get(symbol, 0.0),
+                cost_price=cost_price,
+            )
+        return positions
+
+    def _account_for_task(
+        self,
+        task: RebalanceTask,
+        account: AccountSnapshot,
+        positions: dict[str, Position],
+        prices: dict[str, float],
+    ) -> AccountSnapshot:
+        if task.portfolio_snapshot is None:
+            return account
+
+        market_value = sum(
+            position.quantity * prices[position.symbol] for position in positions.values()
+        )
+        cash = self._snapshot_cash(task, market_value)
+        return AccountSnapshot(
+            account_id=account.account_id,
+            cash=cash,
+            market_value=market_value,
+            total_asset=cash + market_value,
+            frozen_cash=account.frozen_cash,
+        )
+
+    def _snapshot_cash(self, task: RebalanceTask, market_value: float) -> float:
+        if task.portfolio_snapshot is None:
+            raise PortfolioError("portfolio_snapshot is required")
+        if task.portfolio_snapshot.cash is not None:
+            return float(task.portfolio_snapshot.cash)
+        if task.portfolio_snapshot.total_value is None:
+            raise PortfolioError("portfolio_snapshot cash is required")
+
+        holdings_market_value = self._snapshot_holdings_market_value(task, market_value)
+        cash = float(task.portfolio_snapshot.total_value) - holdings_market_value
+        if cash < -1e-9:
+            raise PortfolioError("portfolio_snapshot cash cannot be negative")
+        return max(0.0, cash)
+
+    def _snapshot_holdings_market_value(
+        self,
+        task: RebalanceTask,
+        market_value: float,
+    ) -> float:
+        if task.portfolio_snapshot is None:
+            raise PortfolioError("portfolio_snapshot is required")
+        if task.portfolio_snapshot.holdings_market_value is not None:
+            return float(task.portfolio_snapshot.holdings_market_value)
+        position_values = [
+            float(position.market_value)
+            for position in task.portfolio_snapshot.positions
+            if position.market_value is not None
+        ]
+        if len(position_values) == len(task.portfolio_snapshot.positions):
+            return sum(position_values)
+        return market_value
+
+    def _available_cash_after_sales(
+        self,
+        task: RebalanceTask,
+        account: AccountSnapshot,
+        sell_cash: float,
+    ) -> float:
+        available_cash_limit = self._available_cash_limit(task)
+        if available_cash_limit is None:
+            available_cash = account.cash + sell_cash
+            available_cash -= account.total_asset * task.cash_buffer_ratio
+            return max(0.0, available_cash)
+        available_cash = min(available_cash_limit, account.cash) + sell_cash
+        available_cash -= account.total_asset * task.cash_buffer_ratio
+        return max(0.0, available_cash)
+
+    def _available_cash_limit(self, task: RebalanceTask) -> float | None:
+        if (
+            task.portfolio_snapshot is not None
+            and task.portfolio_snapshot.available_cash is not None
+        ):
+            return float(task.portfolio_snapshot.available_cash)
+        if task.available_cash is not None:
+            return float(task.available_cash)
+        return None
