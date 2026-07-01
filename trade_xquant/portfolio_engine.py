@@ -220,7 +220,7 @@ class PortfolioEngine:
         if task.portfolio_snapshot.total_value is None:
             raise PortfolioError("portfolio_snapshot cash is required")
 
-        holdings_market_value = self._snapshot_holdings_market_value(task, market_value)
+        holdings_market_value = self._snapshot_holdings_market_value(task)
         cash = float(task.portfolio_snapshot.total_value) - holdings_market_value
         if cash < -1e-9:
             raise PortfolioError("portfolio_snapshot cash cannot be negative")
@@ -229,20 +229,24 @@ class PortfolioEngine:
     def _snapshot_holdings_market_value(
         self,
         task: RebalanceTask,
-        market_value: float,
     ) -> float:
         if task.portfolio_snapshot is None:
             raise PortfolioError("portfolio_snapshot is required")
         if task.portfolio_snapshot.holdings_market_value is not None:
             return float(task.portfolio_snapshot.holdings_market_value)
+        positions = [
+            position
+            for position in task.portfolio_snapshot.positions
+            if int(position.shares) > 0
+        ]
         position_values = [
             float(position.market_value)
-            for position in task.portfolio_snapshot.positions
+            for position in positions
             if position.market_value is not None
         ]
-        if len(position_values) == len(task.portfolio_snapshot.positions):
+        if len(position_values) == len(positions):
             return sum(position_values)
-        return market_value
+        raise PortfolioError("portfolio_snapshot holdings_market_value is required")
 
     def _available_cash_after_sales(
         self,

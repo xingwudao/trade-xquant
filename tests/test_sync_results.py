@@ -539,6 +539,54 @@ class FailingRetryPlacementBroker(PendingBroker):
         raise RuntimeError(f"cannot place {order.symbol}")
 
 
+class SnapshotPartialFillRetryBroker(PendingBroker):
+    def get_account_snapshot(self):
+        return AccountSnapshot(
+            account_id="acct",
+            total_asset=10_000,
+            cash=9_600,
+            market_value=400,
+        )
+
+    def get_positions(self):
+        return [
+            Position(
+                symbol="513100.SH",
+                quantity=400,
+                sellable_quantity=0,
+                market_value=400,
+                cost_price=1.0,
+            )
+        ]
+
+    def get_prices(self, symbols):
+        return {symbol: 1.0 for symbol in symbols}
+
+    def get_orders(self):
+        return [
+            SimpleNamespace(
+                order_id=1082169287,
+                stock_code="513100.SH",
+                order_status=50,
+                traded_volume=400,
+                price=1.0,
+                m_strRemark="task-1",
+            )
+        ]
+
+    def get_trades(self):
+        return [
+            SimpleNamespace(
+                order_id=1082169287,
+                stock_code="513100.SH",
+                quantity=400,
+                price=1.0,
+                amount=400.0,
+                m_strRemark="task-1",
+            )
+        ]
+
+
 def submitted_order_with_id(order_id: str | None, *, status: str = "submitted") -> SubmittedOrder:
     return SubmittedOrder(
         task_id="task-1",
@@ -562,6 +610,28 @@ def task() -> RebalanceTask:
             "created_at": "2026-05-27T09:35:00+08:00",
             "expires_at": None,
             "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+        }
+    )
+
+
+def snapshot_task() -> RebalanceTask:
+    return RebalanceTask.model_validate(
+        {
+            "task_id": "task-1",
+            "portfolio_id": "prod",
+            "account_id": "acct",
+            "mode": "real",
+            "created_at": "2026-05-27T09:35:00+08:00",
+            "expires_at": None,
+            "cash_buffer_ratio": 0,
+            "targets": [{"symbol": "513100.SH", "target_weight": 0.5}],
+            "portfolio_snapshot": {
+                "cash": "10000.00",
+                "available_cash": "10000.00",
+                "holdings_market_value": "0.00",
+                "total_value": "10000.00",
+                "positions": [],
+            },
         }
     )
 
@@ -1400,6 +1470,58 @@ def test_sync_submitted_orders_refreshes_calendar_before_retry_preflight(
     assert result[-1]["task_id"] == "task-1"
     assert broker.cancelled == ["1082169287"]
     assert len(broker.placed) == 1
+
+
+def test_sync_submitted_orders_replans_snapshot_task_after_partial_fill(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRADE_XQUANT_ENABLE_REAL_ORDER", "1")
+    broker = SnapshotPartialFillRetryBroker()
+    settings = Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="mock",
+            db_path=str(tmp_path / "audit.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(),
+    )
+    service = GatewayService(settings)
+    service.qmt = broker  # type: ignore[assignment]
+    service.xquant = FakeXquant()  # type: ignore[assignment]
+    service.storage.initialize()
+    task_payload = snapshot_task()
+    result_payload = submitted_result()
+    service.storage.record_task_received(task_payload, status="submitted")
+    service.storage.record_plan(
+        OrderPlan(
+            task_id=result_payload.task_id,
+            account_id="acct",
+            total_asset=10_000,
+            turnover_amount=1000,
+            turnover_ratio=0.1,
+            orders=result_payload.planned_orders,
+        )
+    )
+    service.storage.record_execution_result(result_payload)
+    payload = result_payload.model_dump(mode="json")
+    payload["status"] = "submitted"
+    service.storage.mark_task_result(result_payload.task_id, "submitted", payload)
+    service.settings.runtime.submitted_order_timeout_seconds = 0
+    service.settings.runtime.max_rebalance_retries = 1
+    service.settings.runtime.simulate_real_orders = True
+
+    result = service.sync_submitted_orders_once()
+
+    assert result[-1]["retry_count"] == 1
+    assert broker.cancelled == ["1082169287"]
+    assert broker.placed[0].quantity == 4600
+    stored = service.storage.load_task_result_payload("task-1")
+    lifecycle = stored["meta"]["order_lifecycle"]
+    assert lifecycle["portfolio_snapshot_fill_deltas"] == {"513100.SH": 400}
+    assert lifecycle["portfolio_snapshot_cash_delta"] == -400.0
 
 
 def test_sync_submitted_orders_retries_condition_timeout_via_condition_result(

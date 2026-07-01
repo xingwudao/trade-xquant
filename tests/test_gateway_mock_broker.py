@@ -286,6 +286,10 @@ def test_gateway_prices_include_portfolio_snapshot_positions(tmp_path) -> None:
                                 "shares": "1000",
                                 "reference_price": "1.00",
                                 "market_value": "1000.00",
+                            },
+                            {
+                                "symbol": "000001.SZ",
+                                "shares": "0",
                             }
                         ],
                     },
@@ -396,6 +400,83 @@ def test_gateway_snapshot_task_does_not_price_unrelated_account_positions(tmp_pa
 
     assert result == [{"task_id": "task-1", "status": "dry_run_success"}]
     assert set(broker.price_calls[0]) == {"510300.SH", "513100.SH"}
+
+
+def test_gateway_reserves_sellable_shares_between_snapshot_tasks(tmp_path) -> None:
+    settings = Settings(
+        xquant=XquantConfig(base_url="http://xquant/api/v1"),
+        qmt=QmtConfig(userdata_mini_path="C:/QMT/userdata_mini", account_id="acct"),
+        runtime=RuntimeConfig(
+            broker_adapter="mock",
+            db_path=str(tmp_path / "audit.db"),
+            log_path=str(tmp_path / "gateway.jsonl"),
+        ),
+        risk=RiskConfig(max_turnover_ratio=1.0),
+    )
+    service = GatewayService(settings)
+    fake_xquant = FakeXquant()
+
+    def snapshot_sell_task(task_id: str, account_id: str) -> RebalanceTask:
+        return RebalanceTask.model_validate(
+            {
+                "task_id": task_id,
+                "portfolio_id": "prod",
+                "account_id": account_id,
+                "mode": "dry_run",
+                "created_at": "2026-05-27T09:35:00+08:00",
+                "expires_at": None,
+                "cash_buffer_ratio": 0,
+                "targets": [{"symbol": "510300.SH", "target_weight": 0}],
+                "constraints": {
+                    "max_turnover_ratio": 1.0,
+                    "max_single_order_amount": 100_000,
+                    "min_order_amount": 0,
+                },
+                "portfolio_snapshot": {
+                    "cash": "0.00",
+                    "available_cash": "0.00",
+                    "holdings_market_value": "1000.00",
+                    "total_value": "1000.00",
+                    "positions": [
+                        {
+                            "symbol": "510300.SH",
+                            "shares": "1000",
+                            "reference_price": "1.00",
+                            "market_value": "1000.00",
+                        }
+                    ],
+                },
+            }
+        )
+
+    class SharedSellableBroker:
+        def connect(self) -> None:
+            return None
+
+        def get_account_snapshot(self) -> AccountSnapshot:
+            return AccountSnapshot(account_id="acct", total_asset=1_000, cash=0)
+
+        def get_positions(self) -> list[Position]:
+            return [Position(symbol="510300.SH", quantity=1000, sellable_quantity=1000)]
+
+        def get_prices(self, symbols: list[str]) -> dict[str, float]:
+            return {symbol: 1.0 for symbol in symbols}
+
+    fake_xquant.fetch_pending_tasks = lambda account_id: [  # type: ignore[method-assign]
+        snapshot_sell_task("task-1", account_id),
+        snapshot_sell_task("task-2", account_id),
+    ]
+    service.xquant = fake_xquant  # type: ignore[assignment]
+    service.qmt = SharedSellableBroker()  # type: ignore[assignment]
+
+    result = service.poll_once(force_dry_run=True)
+
+    assert result == [
+        {"task_id": "task-1", "status": "dry_run_success"},
+        {"task_id": "task-2", "status": "dry_run_success"},
+    ]
+    assert fake_xquant.plans[0]["orders"][0]["quantity"] == 1000
+    assert fake_xquant.plans[1]["orders"] == []
 
 
 def test_gateway_real_task_outside_trading_session_defers_without_terminal_result(

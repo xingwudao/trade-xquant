@@ -122,6 +122,38 @@ def test_snapshot_cash_can_be_derived_from_total_value() -> None:
     assert plan.total_asset == 44_000
 
 
+def test_snapshot_cash_derivation_rejects_missing_position_values() -> None:
+    account = AccountSnapshot(account_id="acct", total_asset=200_000, cash=160_000)
+    task = make_task(
+        cash_buffer_ratio=0,
+        targets=[TargetPosition(symbol="510300.SH", target_weight=0.5)],
+        constraints={
+            "max_turnover_ratio": 1.0,
+            "max_single_order_amount": 100_000,
+            "min_order_amount": 0,
+        },
+        portfolio_snapshot={
+            "available_cash": "40000.00",
+            "total_value": "44000.00",
+            "positions": [
+                {
+                    "symbol": "510300.SH",
+                    "shares": "1000",
+                    "reference_price": "4.00",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(PortfolioError, match="holdings_market_value is required"):
+        PortfolioEngine().build_plan(
+            task,
+            account,
+            holdings=[Position(symbol="510300.SH", quantity=1000, sellable_quantity=1000)],
+            prices={"510300.SH": 4.0},
+        )
+
+
 def test_snapshot_without_cash_or_total_value_is_rejected() -> None:
     account = AccountSnapshot(account_id="acct", total_asset=200_000, cash=160_000)
     task = make_task(

@@ -5,6 +5,7 @@ import math
 import socket
 import time
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -28,6 +29,7 @@ from trade_xquant.models import (
     AccountSnapshot,
     ExecutionResult,
     OrderPlan,
+    PortfolioSnapshotPosition,
     Position,
     RebalanceTask,
     SubmittedOrder,
@@ -142,6 +144,7 @@ class GatewayService:
         self.qmt.connect()
         account = self.qmt.get_account_snapshot()
         positions = self.qmt.get_positions()
+        sellable_reservations: dict[str, int] = {}
         for task in tasks:
             if self.storage.is_terminal_task(task.task_id):
                 logger.info("skip terminal task: %s", task.task_id)
@@ -165,8 +168,12 @@ class GatewayService:
                     )
                     continue
                 condition_orders = extract_condition_orders(task)
-                prices = self.qmt.get_prices(_task_price_symbols(task, positions))
-                plan = self.portfolio.build_plan(task, account, positions, prices)
+                planning_positions = _positions_with_sellable_reservations(
+                    positions,
+                    sellable_reservations,
+                )
+                prices = self.qmt.get_prices(_task_price_symbols(task, planning_positions))
+                plan = self.portfolio.build_plan(task, account, planning_positions, prices)
                 validation_now = datetime.now(ZoneInfo(self.settings.risk.timezone))
                 self.risk.validate(
                     task,
@@ -178,6 +185,7 @@ class GatewayService:
                 self.storage.record_plan(plan)
                 if should_report_gateway:
                     self.xquant.report_plan(task.task_id, plan.model_dump(mode="json"))
+                _reserve_plan_sell_orders(sellable_reservations, plan)
                 result = ExecutionEngine(self.qmt, self.settings.runtime).execute(plan, task.mode)
                 self._attach_current_account_snapshot(
                     result,
@@ -1071,6 +1079,9 @@ class GatewayService:
             retry_count=retry_count,
             cancelled_order_ids=[],
             reason=str(blocked.get("reason") or "retry_preflight_failed"),
+            extra_lifecycle=blocked.get("extra_lifecycle")
+            if isinstance(blocked.get("extra_lifecycle"), dict)
+            else None,
         )
         error = blocked.get("error")
         if error:
@@ -1108,13 +1119,19 @@ class GatewayService:
         positions: list[Position] | None = None
         prices: dict[str, float] | None = None
         plan: OrderPlan | None = None
+        lifecycle_extra: dict[str, object] = {}
         try:
             self.qmt.connect()
             account = self.qmt.get_account_snapshot()
             positions = self.qmt.get_positions()
-            prices = self.qmt.get_prices(_task_price_symbols(task, positions))
-            plan = self.portfolio.build_plan(task, account, positions, prices)
-            self.risk.validate(task, account, plan, known_symbols=set(prices))
+            task_for_plan, lifecycle_extra = _task_with_portfolio_snapshot_fill_adjustments(
+                task,
+                self.storage.load_task_result_payload(task_id),
+                positions,
+            )
+            prices = self.qmt.get_prices(_task_price_symbols(task_for_plan, positions))
+            plan = self.portfolio.build_plan(task_for_plan, account, positions, prices)
+            self.risk.validate(task_for_plan, account, plan, known_symbols=set(prices))
         except Exception as exc:  # noqa: BLE001 - pre-cancel guard must be audited
             logger.exception("retry preflight failed before cancellation: task_id=%s", task_id)
             return {
@@ -1124,6 +1141,7 @@ class GatewayService:
                 "retry_count": retry_count,
                 "reason": "retry_preflight_failed",
                 "error": str(exc),
+                "extra_lifecycle": lifecycle_extra,
             }
         return {"task_id": task_id, "status": "ok"}
 
@@ -1202,19 +1220,26 @@ class GatewayService:
         positions: list[Position] | None = None
         prices: dict[str, float] | None = None
         plan: OrderPlan | None = None
+        lifecycle_extra: dict[str, object] = {}
         try:
             self.qmt.connect()
             account = self.qmt.get_account_snapshot()
             positions = self.qmt.get_positions()
-            prices = self.qmt.get_prices(_task_price_symbols(task, positions))
-            plan = self.portfolio.build_plan(task, account, positions, prices)
+            task_for_plan, lifecycle_extra = _task_with_portfolio_snapshot_fill_adjustments(
+                task,
+                self.storage.load_task_result_payload(task_id),
+                positions,
+            )
+            prices = self.qmt.get_prices(_task_price_symbols(task_for_plan, positions))
+            plan = self.portfolio.build_plan(task_for_plan, account, positions, prices)
             lifecycle = self._retry_lifecycle_meta(
                 task_id,
                 retry_count=next_retry_count,
                 cancelled_order_ids=cancelled_order_ids,
                 reason=reason,
+                extra_lifecycle=lifecycle_extra,
             )
-            self.risk.validate(task, account, plan, known_symbols=set(prices))
+            self.risk.validate(task_for_plan, account, plan, known_symbols=set(prices))
             self.storage.record_plan(plan)
             self.xquant.report_plan(task_id, plan.model_dump(mode="json"))
             if not plan.orders:
@@ -1255,6 +1280,7 @@ class GatewayService:
                 fallback_account=account,
                 fallback_positions=positions,
                 fallback_prices=prices,
+                extra_lifecycle=lifecycle_extra,
             )
         report_error = self._report_execution_result(task_id, status, result)
         if report_error is not None:
@@ -1906,10 +1932,258 @@ def _merge_tasks(*task_groups: list[RebalanceTask]) -> list[RebalanceTask]:
     return tasks
 
 
+def _positions_with_sellable_reservations(
+    positions: list[Position],
+    reservations: dict[str, int],
+) -> list[Position]:
+    if not reservations:
+        return positions
+    adjusted: list[Position] = []
+    for position in positions:
+        reserved = reservations.get(position.symbol, 0)
+        if reserved <= 0:
+            adjusted.append(position)
+            continue
+        adjusted.append(
+            position.model_copy(
+                update={
+                    "sellable_quantity": max(0, position.sellable_quantity - reserved),
+                }
+            )
+        )
+    return adjusted
+
+
+def _reserve_plan_sell_orders(reservations: dict[str, int], plan: OrderPlan) -> None:
+    for order in plan.orders:
+        if order.side != "sell" or order.quantity <= 0:
+            continue
+        reservations[order.symbol] = reservations.get(order.symbol, 0) + order.quantity
+
+
+def _task_with_portfolio_snapshot_fill_adjustments(
+    task: RebalanceTask,
+    payload: dict[str, Any] | None,
+    account_positions: list[Position],
+) -> tuple[RebalanceTask, dict[str, object]]:
+    if task.portfolio_snapshot is None or not isinstance(payload, dict):
+        return task, {}
+
+    share_deltas, cash_delta, filled_quantities = _portfolio_snapshot_fill_state(payload)
+    if not share_deltas and abs(cash_delta) < 1e-9 and not filled_quantities:
+        return task, {}
+
+    account_quantities = {
+        position.symbol: max(0, position.quantity) for position in account_positions
+    }
+    adjusted_positions: list[PortfolioSnapshotPosition] = []
+    adjusted_symbols: set[str] = set()
+    for snapshot_position in task.portfolio_snapshot.positions:
+        shares = int(snapshot_position.shares) + share_deltas.get(
+            snapshot_position.symbol,
+            0,
+        )
+        shares = max(0, shares)
+        if snapshot_position.symbol in account_quantities:
+            shares = min(shares, account_quantities[snapshot_position.symbol])
+        adjusted_positions.append(
+            snapshot_position.model_copy(update={"shares": Decimal(shares)})
+        )
+        adjusted_symbols.add(snapshot_position.symbol)
+
+    for symbol, delta in sorted(share_deltas.items()):
+        if symbol in adjusted_symbols or delta <= 0:
+            continue
+        shares = delta
+        if symbol not in account_quantities:
+            continue
+        shares = min(shares, account_quantities[symbol])
+        if shares <= 0:
+            continue
+        adjusted_positions.append(
+            PortfolioSnapshotPosition(symbol=symbol, shares=Decimal(shares))
+        )
+
+    cash = _adjust_snapshot_money(task.portfolio_snapshot.cash, cash_delta)
+    if cash is None and abs(cash_delta) >= 1e-9:
+        cash = _adjust_snapshot_money(_derive_snapshot_cash(task), cash_delta)
+    available_cash = _adjust_snapshot_money(
+        task.portfolio_snapshot.available_cash,
+        cash_delta,
+    )
+    snapshot = task.portfolio_snapshot.model_copy(
+        update={
+            "cash": cash,
+            "available_cash": available_cash,
+            "positions": adjusted_positions,
+        }
+    )
+    extra_lifecycle: dict[str, object] = {
+        "portfolio_snapshot_fill_deltas": share_deltas,
+        "portfolio_snapshot_cash_delta": cash_delta,
+        "portfolio_snapshot_fill_quantities": filled_quantities,
+    }
+    return task.model_copy(update={"portfolio_snapshot": snapshot}), extra_lifecycle
+
+
+def _portfolio_snapshot_fill_state(
+    payload: dict[str, Any],
+) -> tuple[dict[str, int], float, dict[str, int]]:
+    meta = payload.get("meta") if isinstance(payload, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+    lifecycle = meta.get("order_lifecycle")
+    if not isinstance(lifecycle, dict):
+        lifecycle = {}
+
+    share_deltas = _int_mapping(lifecycle.get("portfolio_snapshot_fill_deltas"))
+    cash_delta = _float_value(lifecycle.get("portfolio_snapshot_cash_delta"))
+    filled_quantities = _int_mapping(lifecycle.get("portfolio_snapshot_fill_quantities"))
+
+    submitted_orders = [
+        order for order in payload.get("submitted_orders", []) if isinstance(order, dict)
+    ]
+    for summary in _iter_sync_summary_orders(meta.get("sync_summary")):
+        order_key = _summary_order_key(summary)
+        traded_quantity = _int_value(summary.get("traded_quantity"))
+        if not order_key or traded_quantity <= 0:
+            continue
+        previous_quantity = filled_quantities.get(order_key, 0)
+        incremental_quantity = max(0, traded_quantity - previous_quantity)
+        filled_quantities[order_key] = max(previous_quantity, traded_quantity)
+        if incremental_quantity <= 0:
+            continue
+
+        symbol = str(summary.get("symbol") or "").strip().upper()
+        side = str(summary.get("side") or "").strip().lower()
+        if not symbol or side not in {"buy", "sell"}:
+            continue
+        signed_quantity = incremental_quantity if side == "buy" else -incremental_quantity
+        share_deltas[symbol] = share_deltas.get(symbol, 0) + signed_quantity
+        price = _summary_order_price(summary, submitted_orders)
+        amount = incremental_quantity * price
+        cash_delta += amount if side == "sell" else -amount
+
+    share_deltas = {symbol: quantity for symbol, quantity in share_deltas.items() if quantity}
+    return share_deltas, cash_delta, filled_quantities
+
+
+def _iter_sync_summary_orders(sync_summary: object) -> list[dict[str, Any]]:
+    if not isinstance(sync_summary, dict):
+        return []
+    orders: list[dict[str, Any]] = []
+    for key in ("filled_orders", "pending_orders", "failed_orders"):
+        values = sync_summary.get(key)
+        if not isinstance(values, list):
+            continue
+        orders.extend(value for value in values if isinstance(value, dict))
+    return orders
+
+
+def _summary_order_key(summary: dict[str, Any]) -> str | None:
+    for key in ("local_order_id", "broker_order_id"):
+        value = summary.get(key)
+        if value not in (None, ""):
+            return str(value)
+    symbol = summary.get("symbol")
+    side = summary.get("side")
+    quantity = summary.get("quantity")
+    if symbol and side and quantity not in (None, ""):
+        return f"{symbol}:{side}:{quantity}"
+    return None
+
+
+def _summary_order_price(
+    summary: dict[str, Any],
+    submitted_orders: list[dict[str, Any]],
+) -> float:
+    order_key = _summary_order_key(summary)
+    for order in submitted_orders:
+        order_ids = {
+            str(value)
+            for value in (order.get("local_order_id"), order.get("broker_order_id"))
+            if value not in (None, "")
+        }
+        if order_key and order_key in order_ids:
+            return _order_price(order)
+    for order in submitted_orders:
+        if (
+            order.get("symbol") == summary.get("symbol")
+            and order.get("side") == summary.get("side")
+        ):
+            return _order_price(order)
+    return 0.0
+
+
+def _order_price(order: dict[str, Any]) -> float:
+    price = _float_value(order.get("price"))
+    if price > 0:
+        return price
+    amount = _float_value(order.get("amount"))
+    quantity = _int_value(order.get("quantity"))
+    if amount > 0 and quantity > 0:
+        return amount / quantity
+    return 0.0
+
+
+def _derive_snapshot_cash(task: RebalanceTask) -> Decimal | None:
+    snapshot = task.portfolio_snapshot
+    if snapshot is None or snapshot.total_value is None:
+        return None
+    holdings_value = snapshot.holdings_market_value
+    if holdings_value is None:
+        values = [
+            position.market_value
+            for position in snapshot.positions
+            if int(position.shares) > 0
+        ]
+        if any(value is None for value in values):
+            return None
+        holdings_value = sum(values, Decimal("0"))
+    cash = snapshot.total_value - holdings_value
+    return max(Decimal("0"), cash)
+
+
+def _adjust_snapshot_money(value: Decimal | None, delta: float) -> Decimal | None:
+    if value is None:
+        return None
+    return max(Decimal("0"), value + Decimal(str(delta)))
+
+
+def _int_mapping(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, raw in value.items():
+        try:
+            result[str(key)] = int(raw)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _int_value(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_value(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _task_price_symbols(task: RebalanceTask, positions: list[Position]) -> list[str]:
     symbols = {target.symbol for target in task.targets}
     if task.portfolio_snapshot is not None:
-        symbols.update(position.symbol for position in task.portfolio_snapshot.positions)
+        symbols.update(
+            position.symbol
+            for position in task.portfolio_snapshot.positions
+            if position.shares > 0
+        )
     else:
         symbols.update(position.symbol for position in positions)
     return sorted(symbols)
